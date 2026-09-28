@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Telega
+GenericName=Мессенджер
+Comment=Клиент Telegram
+Exec=@EXEC@
+TryExec=@EXEC@
+Icon=telega
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=telegram;telega;чат;мессенджер;
+StartupNotify=true
+StartupWMClass=telega

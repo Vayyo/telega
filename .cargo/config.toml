@@ -1,0 +1,3 @@
+[env]
+# TDLib built from source (third_party/td → third_party/tdlib).
+LOCAL_TDLIB_PATH = { value = "third_party/tdlib", relative = true }

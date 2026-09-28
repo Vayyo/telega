@@ -1,0 +1,48 @@
+[package]
+name = "telega"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arboard = { version = "3", features = ["wayland-data-control"] }
+argon2 = "0.5"
+base64 = "0.23"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+cpal = "0.18"
+dirs = "6"
+ffmpeg-next = "9"
+flate2 = "1"
+getrandom = "0.3"
+iced = { version = "0.14", features = ["advanced", "image", "tokio"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+mlua = { version = "0.12", features = ["luau", "serde"] }
+notify-rust = "4"
+open = "5"
+parking_lot = "0.12"
+qrcode = { version = "0.14", default-features = false }
+rfd = "0.17"
+rlottie = { version = "=0.5.4", default-features = false, features = ["vendor-telegram"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tdlib-rs = { version = "1.4", features = ["local-tdlib"] }
+tiny-skia = "0.11"
+wgpu = { version = "27", default-features = false }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.3"
+zbus = "5"
+
+[build-dependencies]
+tdlib-rs = { version = "1.4", features = ["local-tdlib"] }
+
+[dev-dependencies]
+iced_runtime = "0.14"
+
+# TDLib 1.8.67 (member tags) is newer than the one tdlib-rs ships: the crate
+# is vendored with the new API schema and links the TDLib built into
+# third_party/tdlib (scripts/build-tdlib.sh builds it).
+[patch.crates-io]
+tdlib-rs = { path = "vendor/tdlib-rs" }
