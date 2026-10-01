@@ -22,15 +22,15 @@ pub(super) fn renderer() -> iced::Renderer {
 
 /// Sends a pointer click to the actual widget tree without running TDLib tasks.
 pub(super) fn click(app: &mut App, window: WinId, position: iced::Point) -> Vec<Msg> {
+    click_sized(app, window, SIZE, position)
+}
+
+/// A real pointer click at a scene's size (also used for narrow layouts).
+fn click_sized(app: &mut App, window: WinId, size: Size, position: iced::Point) -> Vec<Msg> {
     let mut renderer = renderer();
     let mut messages = Vec::new();
     {
-        let mut ui = UserInterface::build(
-            app.view(window),
-            Size::new(1000.0, 700.0),
-            Cache::default(),
-            &mut renderer,
-        );
+        let mut ui = UserInterface::build(app.view(window), size, Cache::default(), &mut renderer);
         for event in [
             mouse::Event::ButtonPressed(mouse::Button::Left),
             mouse::Event::ButtonReleased(mouse::Button::Left),
@@ -237,8 +237,9 @@ pub(super) fn photo(app: &mut App, peer: avatars::Peer, file_id: i32, from: [u8;
     });
     img.save(&path).unwrap();
     let _ = app.set_avatar(peer, Some(&local_file(file_id, &path)));
-    let decoded = avatars::decode(&path.to_string_lossy());
-    let _ = app.update(Msg::AvatarDecoded(file_id, decoded));
+    let decoded = avatars::decode_cached(&path.to_string_lossy());
+    let client_id = app.session.client_id;
+    let _ = app.update(Msg::AvatarDecoded(client_id, file_id, decoded));
 }
 
 /// Logged-in app with a handful of chats.
@@ -640,6 +641,166 @@ fn sandbox_tabs() {
 
 #[test]
 #[ignore = "writes sandbox screenshots; run explicitly"]
+fn sandbox_main_header() {
+    let mut app = world();
+    let window = app.main_window;
+    app.settings.accounts.push(crate::settings::Account {
+        slot: 1,
+        user_id: Some(1001),
+        name: "Другой аккаунт".into(),
+        ..Default::default()
+    });
+    photo(
+        &mut app,
+        avatars::Peer::User(ME),
+        9010,
+        [60, 160, 200],
+        [35, 80, 130],
+    );
+    for chat in [2, 3, 4, 1] {
+        let _ = app.update(Msg::Pane(window, PaneMsg::SelectChat(chat)));
+    }
+    let _ = app.update(Msg::TogglePin(2));
+    group(&mut app);
+    println!("{}", scene("main-header", &mut app).display());
+
+    let opened = click(&mut app, window, iced::Point::new(21.0, 19.0));
+    assert!(opened.iter().any(|m| matches!(m, Msg::ToggleAccounts)));
+    assert!(app.session.accounts_open);
+    println!("{}", scene("main-header-accounts", &mut app).display());
+
+    let logout = click(&mut app, window, iced::Point::new(92.0, 88.0));
+    assert!(logout.iter().any(|m| matches!(m, Msg::LogOut)));
+    assert!(!app.session.accounts_open && app.session.confirm_logout);
+    println!("{}", scene("main-header-confirm", &mut app).display());
+
+    let cancel = click(&mut app, window, iced::Point::new(94.0, 105.0));
+    assert!(
+        cancel
+            .iter()
+            .any(|m| matches!(m, Msg::ConfirmLogOut(false)))
+    );
+    assert_eq!(app.session.auth, Auth::Ready);
+    assert!(!app.session.confirm_logout);
+    let _ = click(&mut app, window, iced::Point::new(21.0, 19.0));
+    let outside = click(&mut app, window, iced::Point::new(720.0, 400.0));
+    assert!(
+        outside
+            .iter()
+            .any(|m| matches!(m, Msg::DismissAccountPopup))
+    );
+    assert!(!app.session.accounts_open);
+    let _ = click(&mut app, window, iced::Point::new(21.0, 19.0));
+    let _ = click(&mut app, window, iced::Point::new(92.0, 88.0));
+    let outside = click(&mut app, window, iced::Point::new(720.0, 400.0));
+    assert!(
+        outside
+            .iter()
+            .any(|m| matches!(m, Msg::DismissAccountPopup))
+    );
+    assert_eq!(app.session.auth, Auth::Ready);
+    assert!(!app.session.confirm_logout);
+    let _ = click(&mut app, window, iced::Point::new(21.0, 19.0));
+    let _ = app.update(Msg::Key(
+        window,
+        keyboard::Key::Named(keyboard::key::Named::Escape),
+        keyboard::Modifiers::empty(),
+    ));
+    assert!(!app.session.accounts_open);
+
+    let narrow = Size::new(360.0, 700.0);
+    println!(
+        "{}",
+        scene_sized("main-header-narrow", &mut app, narrow).display()
+    );
+    let opened = click_sized(&mut app, window, narrow, iced::Point::new(21.0, 19.0));
+    assert!(opened.iter().any(|m| matches!(m, Msg::ToggleAccounts)));
+    println!(
+        "{}",
+        scene_sized("main-header-narrow-accounts", &mut app, narrow).display()
+    );
+    let tab = click_sized(&mut app, window, narrow, iced::Point::new(155.0, 19.0));
+    assert!(tab.iter().any(|m| matches!(m, Msg::SelectTab(2))));
+    assert!(!app.session.accounts_open && !app.session.confirm_logout);
+    assert_eq!(app.session.panes[&window].chat_id, Some(2));
+
+    let _ = app.update(Msg::ShowArchive(window, true));
+    let _ = app.update(Msg::ToggleArchiveSettings(window, true));
+    assert!(app.session.panes[&window].list.archive_settings.is_some());
+    println!(
+        "{}",
+        scene_sized("main-header-narrow-archive-settings", &mut app, narrow).display()
+    );
+    let tab = click_sized(&mut app, window, narrow, iced::Point::new(155.0, 19.0));
+    assert!(tab.iter().any(|m| matches!(m, Msg::SelectTab(2))));
+    assert!(app.session.panes[&window].list.archive_settings.is_none());
+    assert!(app.session.panes[&window].list.archive);
+    assert_eq!(app.session.panes[&window].chat_id, Some(2));
+    println!(
+        "{}",
+        scene("main-header-archive-chat-again", &mut app).display()
+    );
+    let settings = click_sized(&mut app, window, narrow, iced::Point::new(60.0, 19.0));
+    assert!(settings.iter().any(|m| matches!(m, Msg::OpenSettings)));
+    assert!(app.session.settings_open && !app.session.accounts_open);
+    let tab = click_sized(&mut app, window, narrow, iced::Point::new(155.0, 19.0));
+    assert!(tab.iter().any(|m| matches!(m, Msg::SelectTab(2))));
+    assert!(!app.session.settings_open);
+    assert_eq!(app.session.panes[&window].chat_id, Some(2));
+    let trash = click(&mut app, window, iced::Point::new(99.0, 19.0));
+    assert!(trash.iter().any(|m| matches!(m, Msg::CloseAllTabs)));
+    assert_eq!(app.session.tabs.chats, [2]);
+    let _ = click(&mut app, window, iced::Point::new(21.0, 19.0));
+    let _ = click(&mut app, window, iced::Point::new(92.0, 88.0));
+    let yes = click(&mut app, window, iced::Point::new(35.0, 103.0));
+    assert!(yes.iter().any(|m| matches!(m, Msg::ConfirmLogOut(true))));
+    assert_eq!(app.session.auth, Auth::LoggingOut);
+}
+
+#[test]
+#[ignore = "writes sandbox screenshots; run explicitly"]
+fn sandbox_inactive_account_portraits() {
+    let _shared = crate::paths::AVATARS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut app = world();
+    app.settings.accounts.push(crate::settings::Account {
+        slot: 1,
+        user_id: Some(1001),
+        name: "Second Account".into(),
+        ..Default::default()
+    });
+    photo(
+        &mut app,
+        avatars::Peer::User(ME),
+        9912,
+        [250, 20, 180],
+        [210, 50, 155],
+    );
+
+    // One TDLib client runs at a time. Recreate its session without polling
+    // the close task; the first owner's portrait must outlive that session.
+    let _ = app.switch_account(1);
+    assert_eq!(app.after_close(), 1);
+    app.session = Session::new(0, app.main_window, 1);
+    app.session.auth = Auth::Ready;
+    app.session.my_id = Some(1001);
+    photo(
+        &mut app,
+        avatars::Peer::User(1001),
+        9913,
+        [35, 180, 215],
+        [10, 85, 160],
+    );
+    let _ = app.update(Msg::ToggleAccounts);
+    println!(
+        "{}",
+        scene("inactive-account-portraits", &mut app).display()
+    );
+}
+
+#[test]
+#[ignore = "writes sandbox screenshots; run explicitly"]
 fn sandbox_folder_picker() {
     let mut app = world();
     let window = app.main_window;
@@ -897,6 +1058,279 @@ fn sandbox_password() {
     println!(
         "{}",
         scene_sized("settings", &mut app, Size::new(1000.0, 900.0)).display()
+    );
+}
+
+/// Finds each real slider's hit area, drags its pointer, and renders the saved result.
+#[test]
+#[ignore = "writes offline storage screenshots; run explicitly"]
+fn sandbox_storage_settings() {
+    const STORAGE_SIZE: Size = Size::new(1000.0, 900.0);
+    let mut app = app();
+    let window = app.main_window;
+    let _ = app.update(Msg::OpenSettings);
+    println!(
+        "{}",
+        scene_sized("storage-defaults", &mut app, STORAGE_SIZE).display()
+    );
+    assert_eq!(app.settings.cache.gib(), 10.0);
+    assert_eq!(app.settings.cache.months(), 3.0);
+
+    for axis in 0..2 {
+        let mut renderer = renderer();
+        let y = (120..700)
+            .step_by(3)
+            .find(|&y| {
+                let mut messages = Vec::new();
+                let mut ui = UserInterface::build(
+                    app.view(window),
+                    STORAGE_SIZE,
+                    Cache::default(),
+                    &mut renderer,
+                );
+                let _ = ui.update(
+                    &[iced::Event::Mouse(mouse::Event::ButtonPressed(
+                        mouse::Button::Left,
+                    ))],
+                    mouse::Cursor::Available(iced::Point::new(550.0, y as f32)),
+                    &mut renderer,
+                    &mut iced_runtime::core::clipboard::Null,
+                    &mut messages,
+                );
+                messages.iter().any(|msg| match msg {
+                    Msg::SetCachePolicy(limits) if axis == 0 => {
+                        limits.bytes != app.settings.cache.bytes
+                            && limits.days == app.settings.cache.days
+                    }
+                    Msg::SetCachePolicy(limits) => {
+                        limits.days != app.settings.cache.days
+                            && limits.bytes == app.settings.cache.bytes
+                    }
+                    _ => false,
+                })
+            })
+            .expect("slider pointer hit area");
+        let mut messages = Vec::new();
+        {
+            let mut ui = UserInterface::build(
+                app.view(window),
+                STORAGE_SIZE,
+                Cache::default(),
+                &mut renderer,
+            );
+            for (event, x) in [
+                (mouse::Event::ButtonPressed(mouse::Button::Left), 550.0),
+                (
+                    mouse::Event::CursorMoved {
+                        position: iced::Point::new(750.0, y as f32),
+                    },
+                    750.0,
+                ),
+                (mouse::Event::ButtonReleased(mouse::Button::Left), 750.0),
+            ] {
+                let _ = ui.update(
+                    &[iced::Event::Mouse(event)],
+                    mouse::Cursor::Available(iced::Point::new(x, y as f32)),
+                    &mut renderer,
+                    &mut iced_runtime::core::clipboard::Null,
+                    &mut messages,
+                );
+            }
+        }
+        assert!(
+            messages
+                .iter()
+                .any(|msg| matches!(msg, Msg::ApplyCachePolicy)),
+            "slider release commits"
+        );
+        for message in messages {
+            let _ = app.update(message);
+        }
+    }
+    assert!(
+        app.settings.cache.gib() > 10.0,
+        "size changed by pointer drag"
+    );
+    assert!(
+        app.settings.cache.months() > 3.0,
+        "age changed by pointer drag"
+    );
+    println!(
+        "{}",
+        scene_sized("storage-changed", &mut app, STORAGE_SIZE).display()
+    );
+    let chosen = app.settings.cache;
+    let _ = app.update(Msg::CloseSettings);
+    assert_eq!(
+        Settings::load(&app.settings_path).unwrap().cache,
+        chosen,
+        "choices saved only in this sandbox's temporary settings file"
+    );
+    app.settings = Settings::load(&app.settings_path).unwrap();
+    let _ = app.update(Msg::OpenSettings);
+    println!(
+        "{}",
+        scene_sized("storage-reopened", &mut app, STORAGE_SIZE).display()
+    );
+    println!(
+        "storage saved: {} GiB, {} months",
+        chosen.gib(),
+        chosen.months()
+    );
+}
+
+#[test]
+#[ignore = "writes sandbox screenshots; run explicitly"]
+fn sandbox_message_menu() {
+    let mut app = world();
+    open_with(
+        &mut app,
+        2,
+        vec![
+            msg(2, 1, 9, 4, "Первое сообщение в видимой истории"),
+            msg(2, 2, ME, 3, "Ответ на него, справа"),
+            msg(
+                2,
+                3,
+                9,
+                2,
+                "Это сообщение останется на месте под открытым меню",
+            ),
+            msg(2, 4, ME, 1, "Последнее сообщение у нижней границы"),
+        ],
+    );
+    println!("{}", scene("message-menu-closed", &mut app).display());
+    let window = window_of(&app);
+    for (id, name, size) in [
+        (1, "message-menu-top", SIZE),
+        (4, "message-menu-bottom", SIZE),
+        (4, "message-menu-narrow", Size::new(540.0, 700.0)),
+    ] {
+        let _ = app.update(Msg::Pane(window, PaneMsg::OpenMenu(id)));
+        let _ = app.update(Msg::Pane(
+            window,
+            PaneMsg::MenuReady(
+                id,
+                Ok(crate::td::MessageRights {
+                    delete_for_self: true,
+                    delete_for_all: true,
+                    edit: id == 4,
+                }),
+            ),
+        ));
+        let _ = app.update(Msg::Pane(
+            window,
+            PaneMsg::ReactionsReady(id, Ok(vec!["👍".into(), "🔥".into()])),
+        ));
+        println!("{}", scene_sized(name, &mut app, size).display());
+        if name == "message-menu-top" {
+            click(&mut app, window, iced::Point::new(610.0, 400.0));
+            println!("{}", scene("message-menu-outside", &mut app).display());
+        } else if name == "message-menu-bottom" {
+            click(&mut app, window, iced::Point::new(775.0, 634.0));
+            println!("{}", scene("message-menu-cancel", &mut app).display());
+        }
+        let _ = app.update(Msg::Pane(window, PaneMsg::CloseMenu));
+    }
+
+    // A viewport that grows until every row fits must not reuse a positive
+    // bottom offset cached before the resize.
+    let large = Size::new(1000.0, 1100.0);
+    let _ = app.update(Msg::Pane(window, PaneMsg::OpenMenu(4)));
+    let normal = run_frames(&mut app, window, large, 4, &mut renderer());
+    let stale = app.session.panes.get_mut(&window).unwrap();
+    stale.scroll = Some(iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 300.0 });
+    let resized = run_frames(&mut app, window, large, 1, &mut renderer());
+    assert_eq!(
+        normal, resized,
+        "fully fitting history ignores stale scroll"
+    );
+    println!("{}", save("message-menu-resized", large, resized).display());
+
+    let tiny = Size::new(700.0, 300.0);
+    let mut compact = world();
+    open_with(
+        &mut compact,
+        2,
+        vec![msg(2, 1, 9, 1, "Сообщение в низком окне")],
+    );
+    let compact_window = window_of(&compact);
+    let _ = compact.update(Msg::Pane(compact_window, PaneMsg::OpenMenu(1)));
+    let _ = compact.update(Msg::Pane(
+        compact_window,
+        PaneMsg::ReactionsReady(1, Ok(vec!["👍".into(), "🔥".into()])),
+    ));
+    let compact_open = run_frames(&mut compact, compact_window, tiny, 4, &mut renderer());
+    let _ = compact.update(Msg::Pane(compact_window, PaneMsg::CloseMenu));
+    let compact_closed = run_frames(&mut compact, compact_window, tiny, 4, &mut renderer());
+    assert_ne!(
+        compact_open, compact_closed,
+        "tiny viewport retains a popup"
+    );
+    println!(
+        "{}",
+        save("message-menu-tiny", tiny, compact_open).display()
+    );
+
+    // Keep the target in the prefetched slice, but outside the real viewport.
+    let mut long = world();
+    open_with(
+        &mut long,
+        2,
+        (1..=45)
+            .map(|id| msg(2, id, 9, 46 - id as i32, "Сообщение длинной истории"))
+            .collect(),
+    );
+    let long_window = window_of(&long);
+    let closed = run_frames(&mut long, long_window, SIZE, 4, &mut renderer());
+    let pane = &long.session.panes[&long_window];
+    let visible = pane.visible();
+    let target = visible.start;
+    assert!(target < visible.end, "prefetched bubble exists");
+    let below: f32 = pane.messages[target + 1..]
+        .iter()
+        .map(|message| pane.height_estimate(message))
+        .sum();
+    assert!(
+        below > pane.view_size.unwrap().0,
+        "prefetched bubble is fully above the viewport"
+    );
+    let target_id = pane.messages[target].id;
+    let _ = long.update(Msg::Pane(long_window, PaneMsg::OpenMenu(target_id)));
+    let offscreen = run_frames(&mut long, long_window, SIZE, 4, &mut renderer());
+    assert_eq!(closed, offscreen, "offscreen bubble has no visible popup");
+    println!(
+        "{}",
+        save("message-menu-offscreen", SIZE, offscreen).display()
+    );
+
+    let last_id = long.session.panes[&long_window].messages.last().unwrap().id;
+    let _ = long.update(Msg::Pane(long_window, PaneMsg::OpenMenu(last_id)));
+    long.session
+        .panes
+        .get_mut(&long_window)
+        .unwrap()
+        .loading_newer = true;
+    let loading_closed = {
+        let menu = long
+            .session
+            .panes
+            .get_mut(&long_window)
+            .unwrap()
+            .menu
+            .take();
+        let pixels = run_frames(&mut long, long_window, SIZE, 4, &mut renderer());
+        long.session.panes.get_mut(&long_window).unwrap().menu = menu;
+        pixels
+    };
+    let loading_open = run_frames(&mut long, long_window, SIZE, 4, &mut renderer());
+    assert_ne!(
+        loading_closed, loading_open,
+        "menu remains visible next to the last bubble during newer loading"
+    );
+    println!(
+        "{}",
+        save("message-menu-loading-newer", SIZE, loading_open).display()
     );
 }
 
@@ -1194,5 +1628,61 @@ fn sandbox_archive_search() {
     println!(
         "{}",
         screenshot("archive-search-results", &mut app).display()
+    );
+}
+
+/// Headless iced draws the real controls and bubbles; decoded YUV frames need
+/// a live TDLib media stream/GPU and therefore are not part of these PNGs.
+#[test]
+#[ignore = "writes video-player sandbox screenshots; run explicitly"]
+fn sandbox_video_note_player() {
+    let mut app = world();
+    let window = app.main_window;
+    let file_path = std::env::current_exe().expect("sandbox media file path");
+    let round_file = local_file(306, &file_path);
+    let normal_file = local_file(307, &file_path);
+    let mut round = msg(1, 101, 7, 3, "");
+    round["content"] = json!({
+        "@type": "messageVideoNote", "is_viewed": false, "is_secret": false,
+        "video_note": {"@type": "videoNote", "duration": 9, "waveform": "",
+            "length": 384, "video": round_file}
+    });
+    let mut normal = msg(1, 102, 7, 2, "");
+    normal["content"] = json!({
+        "@type": "messageVideo", "alternative_videos": [], "storyboards": [],
+        "start_timestamp": 0, "show_caption_above_media": false,
+        "has_spoiler": false, "is_secret": false,
+        "caption": {"@type": "formattedText", "text": "", "entities": []},
+        "video": {"@type": "video", "duration": 75, "width": 480, "height": 270,
+            "file_name": "normal.mp4", "mime_type": "video/mp4", "has_stickers": false,
+            "supports_streaming": true, "video": normal_file}
+    });
+    open_with(&mut app, 1, vec![round, normal]);
+
+    let _ = app.update(Msg::Video(video::VideoMsg::Play(window, 1, 101, 306, true)));
+    assert!(
+        app.session
+            .video
+            .as_ref()
+            .is_some_and(|v| v.round && v.file_id == 306)
+    );
+    println!("{}", scene("video-note-player-round", &mut app).display());
+
+    let _ = app.update(Msg::Video(video::VideoMsg::Play(
+        window, 1, 102, 307, false,
+    )));
+    assert!(
+        app.session
+            .video
+            .as_ref()
+            .is_some_and(|v| !v.round && v.file_id == 307)
+    );
+    println!("{}", scene("video-note-player-normal", &mut app).display());
+
+    let _ = app.update(Msg::Video(video::VideoMsg::ToggleExpanded));
+    assert!(app.view_video_overlay(window).is_some());
+    println!(
+        "{}",
+        scene("video-note-player-expanded", &mut app).display()
     );
 }

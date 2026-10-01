@@ -17,6 +17,12 @@ static BASE: LazyLock<PathBuf> = LazyLock::new(|| {
         .unwrap_or_else(|| PathBuf::from("telega-data"))
 });
 
+/// Serialises the tests that use `avatars()`: one of them removes the
+/// directory to prove `store` creates it, and the binary's tests run in
+/// parallel against the same data directory (see `paths::BASE`).
+#[cfg(test)]
+pub static AVATARS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// An empty `TELEGA_DATA_DIR` means "not set". Taken literally it is a path
 /// of zero length, so `db`, `files` and `plugins` land next to the working
 /// directory of whoever started the client instead of in the data
@@ -96,6 +102,14 @@ pub fn plugins() -> PathBuf {
 
 pub fn tmp() -> PathBuf {
     base().join("tmp")
+}
+
+/// Content-addressed cache of decoded profile pictures (see
+/// `app::avatar_cache`): at the top of the data directory, shared by every
+/// account, so a forgotten account keeps nothing of it and `remove_account`
+/// does not touch it. Kept in the open, like the files TDLib downloads.
+pub fn avatars() -> PathBuf {
+    base().join("avatars")
 }
 
 /// Removes an account's archive of deleted messages and its plugin

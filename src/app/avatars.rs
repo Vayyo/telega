@@ -8,12 +8,11 @@ use iced::widget::{container, image, sensor, text};
 use iced::{Element, Task};
 use tdlib_rs::types::File;
 
-use super::media::FileState;
 use super::{App, Msg};
-use crate::td;
 
-/// Side of the decoded picture: sharp up to 32 px at 2× scale.
-const SIDE: u32 = 64;
+/// Side of the decoded picture: sharp up to 32 px at 2× scale. The disk
+/// cache sizes its entries by it (`avatar_cache::ENTRY_LEN`).
+pub(crate) const SIDE: u32 = 64;
 /// Decoded pictures kept (16 KB each).
 const MAX_CACHED: usize = 600;
 
@@ -31,11 +30,11 @@ pub(crate) struct Avatars {
     /// The peer owning each file, for O(1) lookup when a download finishes
     /// (instead of scanning every peer known to the client).
     owners: HashMap<i32, Peer>,
-    /// Decoded picture and the clock tick of its last use, for eviction of
-    /// the least recently *used* picture: a chat pinned at the top of the
-    /// list must not lose its photo just because hundreds of strangers'
-    /// avatars were decoded since.
-    decoded: HashMap<i32, (image::Handle, u64)>,
+    /// Decoded picture, last-use clock tick, and content digest for an own
+    /// photo decoded before the client's account identity is known.
+    /// A chat pinned at the top must not lose its picture just because
+    /// hundreds of strangers' avatars were decoded since.
+    decoded: HashMap<i32, (image::Handle, u64, [u8; 32])>,
     clock: u64,
     pub(crate) decoding: HashSet<i32>,
 }
@@ -43,13 +42,18 @@ pub(crate) struct Avatars {
 impl Avatars {
     pub(crate) fn handle(&self, peer: Peer) -> Option<&image::Handle> {
         let file_id = self.files.get(&peer)?;
-        self.decoded.get(file_id).map(|(h, _)| h)
+        self.decoded.get(file_id).map(|(h, _, _)| h)
     }
 
-    fn store(&mut self, file_id: i32, handle: image::Handle) {
+    pub(crate) fn portrait(&self, peer: Peer) -> Option<(&image::Handle, [u8; 32])> {
+        let file_id = self.files.get(&peer)?;
+        self.decoded.get(file_id).map(|(h, _, digest)| (h, *digest))
+    }
+
+    fn store(&mut self, file_id: i32, handle: image::Handle, digest: [u8; 32]) {
         self.decoding.remove(&file_id);
         self.clock += 1;
-        self.decoded.insert(file_id, (handle, self.clock));
+        self.decoded.insert(file_id, (handle, self.clock, digest));
         while self.decoded.len() > MAX_CACHED {
             let Some((&oldest, _)) = self.decoded.iter().min_by_key(|(_, e)| e.1) else {
                 break;
@@ -80,6 +84,24 @@ impl App {
     /// the sensor in `avatar`): a contact list may know thousands of users
     /// whose picture is never displayed.
     pub(crate) fn set_avatar(&mut self, peer: Peer, small: Option<&File>) -> Task<Msg> {
+        let old = self.session.avatars.files.get(&peer).copied();
+        let same = small.is_some_and(|file| old == Some(file.id));
+        if matches!(peer, Peer::User(id) if self.session.my_id.is_none_or(|my_id| my_id == id)
+            && self.settings.accounts.iter().any(|a| a.slot == self.session.slot && a.user_id == Some(id)))
+            && !same
+            && (old.is_some() || small.is_none())
+        {
+            self.account_portraits.remove(&self.session.slot);
+            if let Some(account) = self
+                .settings
+                .accounts
+                .iter_mut()
+                .find(|a| a.slot == self.session.slot)
+                && account.avatar_digest.take().is_some()
+            {
+                self.save_settings();
+            }
+        }
         if let Some(old) = self.session.avatars.files.remove(&peer) {
             self.session.avatars.owners.remove(&old);
         }
@@ -88,9 +110,7 @@ impl App {
         };
         self.session.avatars.files.insert(peer, file.id);
         self.session.avatars.owners.insert(file.id, peer);
-        if !self.session.files.get(&file.id).is_some_and(|f| f.done) {
-            self.session.files.insert(file.id, FileState::from(file));
-        }
+        self.remember_file(file);
         Task::none()
     }
 
@@ -107,15 +127,30 @@ impl App {
         self.fetch_avatar(file_id)
     }
 
+    /// An explicit action — a person's card (`CardMsg::Open`), a chat's
+    /// profile (`open_profile`) — is the user asking for this peer, so a
+    /// picture whose download gave up is asked for again. The sensor
+    /// (`avatar_shown`) never does this: it runs on every display, and a
+    /// picture that fails each time would otherwise be requested from
+    /// TDLib over and over without the user ever asking for it.
+    pub(super) fn retry_avatar(&mut self, peer: Peer) {
+        let Some(&file_id) = self.session.avatars.files.get(&peer) else {
+            return;
+        };
+        // Only `failed` goes: a download in flight, or one already done,
+        // stays as it is.
+        if let Some(state) = self.session.files.get_mut(&file_id) {
+            state.failed = false;
+        }
+    }
+
     fn fetch_avatar(&mut self, file_id: i32) -> Task<Msg> {
         match self.session.files.get(&file_id) {
             Some(f) if f.done => self.decode_avatar(file_id),
-            Some(f) if f.downloading => Task::none(),
+            // In flight, or failed before: the sensor never asks again.
+            Some(f) if f.downloading || f.failed => Task::none(),
             // Low priority: pictures wait behind what the user opened.
-            _ => Task::perform(
-                td::download_file(self.session.client_id, file_id, 1),
-                Msg::Done,
-            ),
+            _ => self.request_download(file_id, 1),
         }
     }
 
@@ -135,27 +170,47 @@ impl App {
         if !self.session.avatars.decoding.insert(file_id) {
             return Task::none();
         }
+        let client_id = self.session.client_id;
         Task::perform(
             async move {
                 let _permit = super::media::DECODES
                     .acquire()
                     .await
                     .map_err(|e| e.to_string())?;
-                tokio::task::spawn_blocking(move || decode(&path))
+                tokio::task::spawn_blocking(move || decode_cached(&path))
                     .await
                     .map_err(|e| e.to_string())
                     .and_then(|r| r)
             },
-            move |r| Msg::AvatarDecoded(file_id, r),
+            move |r| Msg::AvatarDecoded(client_id, file_id, r),
         )
     }
 
-    pub(crate) fn avatar_decoded(&mut self, file_id: i32, result: Result<Vec<u8>, String>) {
+    pub(crate) fn avatar_decoded(
+        &mut self,
+        file_id: i32,
+        result: Result<(Vec<u8>, [u8; 32]), String>,
+    ) {
         match result {
-            Ok(rgba) => self
-                .session
-                .avatars
-                .store(file_id, image::Handle::from_rgba(SIDE, SIDE, rgba)),
+            Ok((rgba, digest)) => {
+                let handle = image::Handle::from_rgba(SIDE, SIDE, rgba);
+                if let Some(Peer::User(id)) = self.session.avatars.owners.get(&file_id)
+                    && self.session.my_id.is_none_or(|my_id| my_id == *id)
+                    && let Some(account) = self
+                        .settings
+                        .accounts
+                        .iter_mut()
+                        .find(|a| a.slot == self.session.slot && a.user_id == Some(*id))
+                {
+                    self.account_portraits
+                        .insert(self.session.slot, handle.clone());
+                    if account.avatar_digest != Some(digest) {
+                        account.avatar_digest = Some(digest);
+                        self.save_settings();
+                    }
+                }
+                self.session.avatars.store(file_id, handle, digest);
+            }
             // A broken picture falls back to initials.
             Err(_) => {
                 self.session.avatars.decoding.remove(&file_id);
@@ -167,31 +222,63 @@ impl App {
     /// sensor drives lazy loading: fetched the first time it comes on
     /// screen, and re-fetched if it was since evicted from the cache.
     pub(crate) fn avatar<'a>(&self, peer: Peer, name: &str, size: f32) -> Element<'a, Msg> {
-        let picture: Element<'a, Msg> = if let Some(handle) = self.session.avatars.handle(peer) {
+        let picture: Element<'a, Msg> = if let Some(handle) =
+            self.session.avatars.handle(peer).or_else(|| {
+                let Peer::User(id) = peer else {
+                    return None;
+                };
+                self.account_portraits.get(&self.session.slot).filter(|_| {
+                    self.session.my_id.is_none_or(|my_id| my_id == id)
+                        && self
+                            .settings
+                            .accounts
+                            .iter()
+                            .any(|a| a.slot == self.session.slot && a.user_id == Some(id))
+                })
+            }) {
             image(handle.clone()).width(size).height(size).into()
         } else {
             let id = match peer {
                 Peer::Chat(id) | Peer::User(id) => id,
             };
-            let color = super::look::person_color(id);
-            container(
-                text(initials(name))
-                    .size(size * 0.4)
-                    .color(iced::Color::WHITE),
-            )
-            .center_x(size)
-            .center_y(size)
-            .style(move |_| container::Style {
-                background: Some(color.into()),
-                border: iced::border::rounded(size / 2.0),
-                ..container::Style::default()
-            })
-            .into()
+            placeholder(id, name, size)
         };
         sensor(picture)
+            .key((peer, self.session.avatars.files.get(&peer).copied()))
             .on_show(move |_| Msg::AvatarShown(peer))
             .into()
     }
+
+    /// An inactive account has no live TDLib peer or avatar sensor.
+    pub(crate) fn account_avatar<'a>(
+        &self,
+        slot: u32,
+        user_id: i64,
+        name: &str,
+        size: f32,
+    ) -> Element<'a, Msg> {
+        match self.account_portraits.get(&slot) {
+            Some(handle) => image(handle.clone()).width(size).height(size).into(),
+            None => placeholder(user_id, name, size),
+        }
+    }
+}
+
+fn placeholder<'a>(id: i64, name: &str, size: f32) -> Element<'a, Msg> {
+    let color = super::look::person_color(id);
+    container(
+        text(initials(name))
+            .size(size * 0.4)
+            .color(iced::Color::WHITE),
+    )
+    .center_x(size)
+    .center_y(size)
+    .style(move |_| container::Style {
+        background: Some(color.into()),
+        border: iced::border::rounded(size / 2.0),
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// "Игорь Петров" → "ИП", "Rust чат" → "RЧ", "Маша" → "М".
@@ -203,9 +290,19 @@ pub(crate) fn initials(name: &str) -> String {
         .collect()
 }
 
-/// Square-cropped, scaled and cut into a circle with a soft edge.
+/// Square-cropped, scaled and cut into a circle with a soft edge. Only
+/// tests call it: the client decodes through `decode_cached`, which decides
+/// by the file's bytes whether there is anything to decode at all.
+#[cfg(test)]
 pub(crate) fn decode(path: &str) -> Result<Vec<u8>, String> {
-    let img = super::media::open_image(path)?;
+    let bytes = std::fs::read(path).map_err(|e| format!("фото: {e}"))?;
+    decode_bytes(&bytes)
+}
+
+/// Decodes the bytes of a picture file into the round `SIDE`×`SIDE` RGBA
+/// picture the cache stores.
+fn decode_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let img = super::media::open_image_bytes(bytes)?;
     let side = img.width().min(img.height());
     let img = img
         .crop_imm(
@@ -223,6 +320,23 @@ pub(crate) fn decode(path: &str) -> Result<Vec<u8>, String> {
         pixel.0[3] = (f32::from(pixel.0[3]) * coverage) as u8;
     }
     Ok(rgba.into_raw())
+}
+
+/// The picture of `path`, decoded in this session. The file is read once:
+/// its bytes address the entry in the on-disk cache, so a picture decoded
+/// by an earlier session, or decoded for another `file_id` carrying the
+/// same bytes, comes back without touching the decoder.
+pub(crate) fn decode_cached(path: &str) -> Result<(Vec<u8>, [u8; 32]), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("фото: {e}"))?;
+    let digest = super::avatar_cache::hash(&bytes);
+    if let Some(rgba) = super::avatar_cache::load(&digest) {
+        return Ok((rgba, digest));
+    }
+    let rgba = decode_bytes(&bytes)?;
+    // Not being able to cache must not stop the picture from being shown:
+    // the next session decodes the file again, as it always did.
+    let _ = super::avatar_cache::store(&digest, &rgba);
+    Ok((rgba, digest))
 }
 
 #[cfg(test)]
@@ -255,7 +369,7 @@ mod tests {
     fn cache_is_bounded() {
         let mut avatars = Avatars::default();
         for id in 0..(MAX_CACHED as i32 + 50) {
-            avatars.store(id, image::Handle::from_rgba(1, 1, vec![0; 4]));
+            avatars.store(id, image::Handle::from_rgba(1, 1, vec![0; 4]), [0; 32]);
         }
         assert_eq!(avatars.decoded.len(), MAX_CACHED);
         assert!(!avatars.decoded.contains_key(&0), "oldest went first");

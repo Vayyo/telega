@@ -1,12 +1,13 @@
 [package]
 name = "telega"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
 arboard = { version = "3", features = ["wayland-data-control"] }
 argon2 = "0.5"
 base64 = "0.23"
+blake3 = "1.8.7"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cpal = "0.18"
@@ -15,6 +16,7 @@ ffmpeg-next = "9"
 flate2 = "1"
 getrandom = "0.3"
 iced = { version = "0.14", features = ["advanced", "image", "tokio"] }
+iced_runtime = "0.14"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 mlua = { version = "0.12", features = ["luau", "serde"] }
 notify-rust = "4"
@@ -37,9 +39,6 @@ zbus = "5"
 
 [build-dependencies]
 tdlib-rs = { version = "1.4", features = ["local-tdlib"] }
-
-[dev-dependencies]
-iced_runtime = "0.14"
 
 # TDLib 1.8.67 (member tags) is newer than the one tdlib-rs ships: the crate
 # is vendored with the new API schema and links the TDLib built into

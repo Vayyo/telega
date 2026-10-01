@@ -1,5 +1,5 @@
 //! Sound and motion: voice messages (play, record), looped animations
-//! (GIFs, round videos, animated stickers) and videos opened externally.
+//! (GIFs, animated stickers) and videos opened externally.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ use iced::Task;
 use iced::futures::{SinkExt, Stream};
 use iced::widget::image;
 
-use super::media::{Media, Motion, ROUND_SIZE, STICKER_SIZE};
+use super::media::{Media, Motion, STICKER_SIZE};
 use super::{App, Msg, WinId};
 use crate::av::audio::{Pcm, Player, Recorder};
 use crate::av::lottie::Lottie;
@@ -240,10 +240,7 @@ impl App {
                 )
             }
             Some(f) if f.downloading => Task::none(),
-            _ => Task::perform(
-                td::download_file(self.session.client_id, file_id, 30),
-                Msg::Done,
-            ),
+            _ => self.request_download(file_id, 30),
         }
     }
 
@@ -339,10 +336,7 @@ impl App {
             }
             _ => {
                 self.session.playback.open_when_done.push(file_id);
-                Task::perform(
-                    td::download_file(self.session.client_id, file_id, 28),
-                    Msg::Done,
-                )
+                self.request_download(file_id, 28)
             }
         }
     }
@@ -380,10 +374,7 @@ impl App {
             }
             _ => {
                 self.session.playback.wanted.insert(file_id, motion);
-                Task::perform(
-                    td::download_file(self.session.client_id, file_id, 12),
-                    Msg::Done,
-                )
+                self.request_download(file_id, 12)
             }
         }
     }
@@ -420,9 +411,6 @@ impl App {
         };
         let (w, h) = match motion {
             Motion::Lottie => (STICKER_SIZE as u32 * 2, STICKER_SIZE as u32 * 2),
-            Motion::Video if self.is_round(file_id) => {
-                (ROUND_SIZE as u32 * 2, ROUND_SIZE as u32 * 2)
-            }
             _ => (
                 (super::media::PHOTO_MAX_W * 2.0) as u32,
                 (super::media::PHOTO_MAX_H * 2.0) as u32,
@@ -454,13 +442,6 @@ impl App {
             .values()
             .flat_map(|p| p.messages.iter())
             .any(|m| matches!(&m.media, Some(Media::Sticker { file_id: f, .. }) if *f == file_id))
-    }
-
-    fn is_round(&self, file_id: i32) -> bool {
-        self.session.panes
-            .values()
-            .flat_map(|p| p.messages.iter())
-            .any(|m| matches!(&m.media, Some(Media::Animation { file_id: f, round: true, .. }) if *f == file_id))
     }
 
     pub(super) fn animation_frame(&mut self, file_id: i32, w: u32, h: u32, rgba: Vec<u8>) {

@@ -109,22 +109,52 @@ impl App {
             .get(&user_id)
             .cloned()
             .unwrap_or_default();
+        let mut changed = false;
         match self.settings.accounts.iter_mut().find(|a| a.slot == slot) {
-            Some(account) if account.user_id == Some(user_id) => return Task::none(),
+            Some(account) if account.user_id == Some(user_id) => {}
             Some(account) => {
+                self.account_portraits.remove(&slot);
+                account.avatar_digest = None;
                 account.user_id = Some(user_id);
                 if !name.is_empty() {
                     account.name = name;
                 }
+                changed = true;
             }
-            None => self.settings.accounts.push(Account {
-                slot,
-                user_id: Some(user_id),
-                name,
-                ..Account::default()
-            }),
+            None => {
+                self.settings.accounts.push(Account {
+                    slot,
+                    user_id: Some(user_id),
+                    name,
+                    ..Account::default()
+                });
+                changed = true;
+            }
         }
-        self.save_settings();
+        // The picture may have finished decoding before TDLib reported my_id.
+        if let Some((handle, digest)) = self
+            .session
+            .avatars
+            .portrait(super::avatars::Peer::User(user_id))
+        {
+            let account = self
+                .settings
+                .accounts
+                .iter_mut()
+                .find(|a| a.slot == slot)
+                .unwrap();
+            if account.avatar_digest != Some(digest) || !self.account_portraits.contains_key(&slot)
+            {
+                self.account_portraits.insert(slot, handle.clone());
+            }
+            if account.avatar_digest != Some(digest) {
+                account.avatar_digest = Some(digest);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_settings();
+        }
         Task::none()
     }
 
@@ -171,6 +201,9 @@ impl App {
                 }
             }
         });
+        if !leave.forget {
+            self.persist_video_volume();
+        }
         if leave.forget {
             let slot = self.session.slot;
             let user_id = self
@@ -179,6 +212,7 @@ impl App {
                 .iter()
                 .find(|a| a.slot == slot)
                 .and_then(|a| a.user_id);
+            self.account_portraits.remove(&slot);
             self.settings.accounts.retain(|a| a.slot != slot);
             if let Err(e) = crate::paths::remove_account(slot) {
                 self.error = Some(format!("данные аккаунта: {e}"));

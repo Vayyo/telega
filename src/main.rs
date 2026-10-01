@@ -31,8 +31,8 @@ fn main() -> iced::Result {
         Err(error) => startup_error(&error),
     };
 
-    // Daemon: several windows; the app opens the main one itself and quits
-    // when it is closed.
+    // Daemon: secondary windows are independent; on Linux the main window
+    // closes to the tray when available and explicit Quit exits the process.
     iced::daemon(App::boot, App::update, App::view)
         .title(App::title)
         .subscription(App::subscription)

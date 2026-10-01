@@ -349,13 +349,22 @@ impl App {
                 name,
                 phone,
                 user_id,
-            } => row![
-                self.avatar(super::avatars::Peer::User(*user_id), name, 40.0),
-                column![text(name).size(15), text(phone_label(phone)).size(13)].spacing(2),
-            ]
-            .spacing(8)
-            .align_y(iced::Center)
-            .into(),
+            } => {
+                let card = row![
+                    self.avatar(super::avatars::Peer::User(*user_id), name, 40.0),
+                    column![text(name).size(15), text(phone_label(phone)).size(13)].spacing(2),
+                ]
+                .spacing(8)
+                .align_y(iced::Center);
+                if *user_id != 0 {
+                    iced::widget::mouse_area(card)
+                        .interaction(iced::mouse::Interaction::Pointer)
+                        .on_press(Msg::Card(super::card::CardMsg::Open(window, *user_id)))
+                        .into()
+                } else {
+                    card.into()
+                }
+            }
             Extra::Location {
                 latitude,
                 longitude,

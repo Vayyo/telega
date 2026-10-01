@@ -43,6 +43,9 @@ impl App {
     pub(crate) fn on_card(&mut self, msg: CardMsg) -> Task<Msg> {
         match msg {
             CardMsg::Open(window, user_id) => {
+                // The user asked for this person: that is the explicit
+                // action which gives a failed picture a second chance.
+                self.retry_avatar(Peer::User(user_id));
                 self.session.user_card = Some(UserCard {
                     window,
                     user_id,
@@ -200,13 +203,17 @@ impl App {
                 .get(&card.user_id)
                 .map_or("…", String::as_str),
         };
+        let mut card_name = row![text(name).size(18)].spacing(4).align_y(iced::Center);
+        if self.is_bot_user(card.user_id) {
+            card_name = card_name.push(text("Bot").size(11).style(text::primary));
+        }
         let close = button(text("✕").size(16))
             .style(button::text)
             .on_press(Msg::Card(CardMsg::Close));
         let mut head = column![
             row![space().width(Fill), close],
             container(self.avatar(Peer::User(card.user_id), name, 96.0)).center_x(Fill),
-            container(text(name.to_owned()).size(18)).center_x(Fill),
+            container(card_name).center_x(Fill),
         ]
         .spacing(6);
 

@@ -168,7 +168,8 @@ pub async fn set_parameters(
     api_hash: String,
     slot: u32,
     key: String,
-) -> TdResult<()> {
+    limits: crate::settings::CacheLimits,
+) -> TdResult<Option<String>> {
     functions::set_tdlib_parameters(
         false,
         crate::paths::db_dir(slot).to_string_lossy().into_owned(),
@@ -187,7 +188,56 @@ pub async fn set_parameters(
         client_id,
     )
     .await
-    .map_err(err)
+    .map_err(err)?;
+    // Requests before accepted parameters can hang. A failed cache option is
+    // reported separately and never prevents the login from continuing.
+    Ok(apply_cache_limits(client_id, limits).await.err())
+}
+
+pub(crate) fn storage_limits(limits: crate::settings::CacheLimits) -> [(&'static str, i64); 3] {
+    [
+        (
+            "storage_max_files_size",
+            (limits.bytes / 1024).clamp(1, i32::MAX as u64) as i64,
+        ),
+        (
+            "storage_max_time_from_last_access",
+            limits.days.saturating_mul(86_400).clamp(1, i32::MAX as u64) as i64,
+        ),
+        ("storage_max_file_count", i32::MAX as i64),
+    ]
+}
+
+pub async fn apply_cache_limits(
+    client_id: i32,
+    limits: crate::settings::CacheLimits,
+) -> TdResult<()> {
+    let mut first_error = None;
+    for (name, value) in storage_limits(limits) {
+        if let Err(e) = functions::set_option(
+            name.into(),
+            Some(enums::OptionValue::Integer(
+                tdlib_rs::types::OptionValueInteger { value },
+            )),
+            client_id,
+        )
+        .await
+        {
+            first_error.get_or_insert_with(|| format!("{name}: {}", err(e)));
+        }
+    }
+    if let Err(e) = functions::set_option(
+        "use_storage_optimizer".into(),
+        Some(enums::OptionValue::Boolean(
+            tdlib_rs::types::OptionValueBoolean { value: true },
+        )),
+        client_id,
+    )
+    .await
+    {
+        first_error.get_or_insert_with(|| format!("use_storage_optimizer: {}", err(e)));
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 pub async fn send_phone(client_id: i32, phone: String) -> TdResult<()> {
@@ -1740,5 +1790,44 @@ mod tests {
             untouched.excluded_chat_ids = original.excluded_chat_ids.clone();
             assert_eq!(untouched, original, "non-membership folder rules changed");
         }
+    }
+
+    #[test]
+    fn default_cache_limits_use_kib_seconds_and_unlimited_file_count() {
+        assert_eq!(
+            storage_limits(crate::settings::CacheLimits::default()),
+            [
+                ("storage_max_files_size", 10_485_760),
+                ("storage_max_time_from_last_access", 7_776_000),
+                ("storage_max_file_count", i32::MAX as i64),
+            ]
+        );
+    }
+
+    #[test]
+    fn cache_storage_limits_saturate_large_sizes_and_ages() {
+        assert_eq!(
+            storage_limits(crate::settings::CacheLimits {
+                bytes: u64::MAX,
+                days: u64::MAX,
+            }),
+            [
+                ("storage_max_files_size", i32::MAX as i64),
+                ("storage_max_time_from_last_access", i32::MAX as i64),
+                ("storage_max_file_count", i32::MAX as i64),
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_cache_limits_still_allow_a_kib_and_a_second() {
+        assert_eq!(
+            storage_limits(crate::settings::CacheLimits { bytes: 0, days: 0 }),
+            [
+                ("storage_max_files_size", 1),
+                ("storage_max_time_from_last_access", 1),
+                ("storage_max_file_count", i32::MAX as i64),
+            ]
+        );
     }
 }

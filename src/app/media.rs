@@ -51,7 +51,7 @@ pub(crate) enum Media {
         height: u32,
         emoji: String,
     },
-    /// Played in the system player (with sound); a still preview inline.
+    /// Video (including round video notes), played inline with sound.
     Video {
         file_id: i32,
         mini: Option<image::Handle>,
@@ -61,9 +61,9 @@ pub(crate) enum Media {
         height: u32,
         duration: i32,
         spoiler: bool,
+        round: bool,
     },
-    /// GIFs (MP4 in Telegram) and round video messages: looped inline
-    /// without sound while on screen.
+    /// GIFs (MP4 in Telegram): looped inline without sound while on screen.
     Animation {
         file_id: i32,
         mini: Option<image::Handle>,
@@ -71,7 +71,6 @@ pub(crate) enum Media {
         width: u32,
         height: u32,
         duration: i32,
-        round: bool,
         spoiler: bool,
     },
 }
@@ -119,11 +118,10 @@ impl Media {
     /// Size of the inline picture of visual media.
     pub(crate) fn display_box(&self) -> Option<(f32, f32)> {
         match self {
-            Self::Photo { width, height, .. } | Self::Video { width, height, .. } => {
-                Some(Self::photo_box(*width, *height))
-            }
-            Self::Animation { round: true, .. } => Some((ROUND_SIZE, ROUND_SIZE)),
-            Self::Animation { width, height, .. } => Some(Self::photo_box(*width, *height)),
+            Self::Video { round: true, .. } => Some((ROUND_SIZE, ROUND_SIZE)),
+            Self::Photo { width, height, .. }
+            | Self::Video { width, height, .. }
+            | Self::Animation { width, height, .. } => Some(Self::photo_box(*width, *height)),
             Self::Sticker { width, height, .. } => Some(Self::sticker_box(*width, *height)),
             Self::Document { .. } | Self::Voice { .. } => None,
         }
@@ -217,6 +215,7 @@ pub(crate) fn media_of(content: &MessageContent) -> Option<(Media, Vec<File>)> {
                     height: v.height.max(1) as u32,
                     duration: v.duration,
                     spoiler: m.has_spoiler,
+                    round: false,
                 },
                 files,
             ))
@@ -233,7 +232,6 @@ pub(crate) fn media_of(content: &MessageContent) -> Option<(Media, Vec<File>)> {
                     width: a.width.max(1) as u32,
                     height: a.height.max(1) as u32,
                     duration: a.duration,
-                    round: false,
                     spoiler: m.has_spoiler,
                 },
                 files,
@@ -244,7 +242,7 @@ pub(crate) fn media_of(content: &MessageContent) -> Option<(Media, Vec<File>)> {
             let mut files = vec![v.video.clone()];
             files.extend(v.thumbnail.as_ref().map(|t| t.file.clone()));
             Some((
-                Media::Animation {
+                Media::Video {
                     file_id: v.video.id,
                     mini: v.minithumbnail.as_ref().and_then(mini_handle),
                     thumb: still_thumbnail(v.thumbnail.as_ref()),
@@ -316,6 +314,10 @@ pub(crate) struct FileState {
     pub(crate) downloading: bool,
     pub(crate) uploading: bool,
     pub(crate) done: bool,
+    /// The client asked for the file and TDLib did not finish it (stopped,
+    /// or refused the request outright): TDLib will not resume it on its
+    /// own, so only an explicit action asks again in this session.
+    pub(crate) failed: bool,
 }
 
 impl From<&File> for FileState {
@@ -328,6 +330,7 @@ impl From<&File> for FileState {
             downloading: f.local.is_downloading_active,
             uploading: f.remote.is_uploading_active,
             done: f.local.is_downloading_completed,
+            failed: false,
         }
     }
 }
@@ -344,6 +347,16 @@ impl FileState {
             return 0;
         }
         ((part as f64 / self.size as f64) * 100.0).clamp(0.0, 100.0) as u32
+    }
+
+    /// Whether what the client already knows about the file — a download in
+    /// flight, finished, or failed — must outlive this snapshot, which
+    /// confirms none of it. TDLib repeats stale file objects (the same
+    /// photo in a user update, a message reparsed), and those must not
+    /// erase a request the client already made.
+    pub(crate) fn survives(&self, snapshot: &File) -> bool {
+        (self.done || self.downloading || self.failed)
+            && !(snapshot.local.is_downloading_completed || snapshot.local.is_downloading_active)
     }
 }
 
@@ -412,17 +425,32 @@ impl ImageCache {
     }
 }
 
-/// Opens an image from a stranger: bounded dimensions and allocation
-/// instead of whatever a crafted header claims.
-pub(crate) fn open_image(path: &str) -> Result<::image::DynamicImage, String> {
+/// Bounds accepted from a stranger's file, whatever its header claims.
+fn limits() -> ::image::Limits {
     let mut limits = ::image::Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_SIDE);
     limits.max_image_height = Some(MAX_IMAGE_SIDE);
     limits.max_alloc = Some(MAX_IMAGE_ALLOC);
+    limits
+}
+
+/// Opens an image from a stranger: bounded dimensions and allocation
+/// instead of whatever a crafted header claims.
+pub(crate) fn open_image(path: &str) -> Result<::image::DynamicImage, String> {
     let mut reader = ::image::ImageReader::open(path)
         .and_then(|r| r.with_guessed_format())
         .map_err(|e| format!("фото: {e}"))?;
-    reader.limits(limits);
+    reader.limits(limits());
+    reader.decode().map_err(|e| format!("фото: {e}"))
+}
+
+/// The same, for bytes already in hand (a caller that hashes them anyway,
+/// like `avatars::decode_cached`, reads the file once).
+pub(crate) fn open_image_bytes(bytes: &[u8]) -> Result<::image::DynamicImage, String> {
+    let mut reader = ::image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("фото: {e}"))?;
+    reader.limits(limits());
     reader.decode().map_err(|e| format!("фото: {e}"))
 }
 
@@ -584,15 +612,31 @@ pub(crate) fn clean_paste_dir() {
 }
 
 impl super::App {
+    /// Remembers a file from a snapshot (a message parsed, a peer's photo).
+    /// A stale snapshot repeats a file object that confirms no download at
+    /// all, so what the client already knows — a download in flight, done,
+    /// or failed — outlives it (`FileState::survives`); otherwise the
+    /// snapshot is the fresher truth.
+    pub(super) fn remember_file(&mut self, file: &File) {
+        let survives = self
+            .session
+            .files
+            .get(&file.id)
+            .is_some_and(|state| state.survives(file));
+        if !survives {
+            self.session.files.insert(file.id, FileState::from(file));
+        }
+    }
+
     /// Remembers the files a message refers to.
     pub(super) fn note_files(&mut self, content: &MessageContent) {
         if let Some((_, files)) = media_of(content) {
-            for file in &files {
-                self.session.files.insert(file.id, FileState::from(file));
+            for file in files {
+                self.remember_file(&file);
             }
         }
         if let Some((_, Some(file))) = super::extra::extra_of(content) {
-            self.session.files.insert(file.id, FileState::from(&file));
+            self.remember_file(&file);
         }
     }
 
@@ -600,20 +644,29 @@ impl super::App {
     /// (`MsgItem::parse`) instead of re-parsing the message content for them.
     pub(super) fn note_files_of(&mut self, files: &[File]) {
         for file in files {
-            self.session.files.insert(file.id, FileState::from(file));
+            self.remember_file(file);
         }
     }
 
     pub(super) fn on_file(&mut self, file: &File) -> Task<Msg> {
-        let state = FileState::from(file);
+        let mut state = FileState::from(file);
         let previous = self.session.files.get(&file.id);
         let finished = state.done && !previous.is_some_and(|s| s.done);
         // A download that was active and stopped without completing (no
         // space, network error, ...): the viewer must not be left showing
         // "Загрузка…" forever.
-        let failed = !state.done && !state.downloading && previous.is_some_and(|s| s.downloading);
+        let stopped = !state.done && !state.downloading && previous.is_some_and(|s| s.downloading);
+        // The failure outlives the updates that follow it (TDLib repeating
+        // the file as it was before the request, for instance): only
+        // progress or completion clear it, so that an automatic path cannot
+        // restart by itself what the user never asked for again.
+        state.failed = if state.done || state.downloading {
+            false
+        } else {
+            stopped || previous.is_some_and(|s| s.failed)
+        };
         self.session.files.insert(file.id, state);
-        if failed {
+        if stopped {
             return self.viewer_file_failed(file.id);
         }
         if !finished {
@@ -632,6 +685,25 @@ impl super::App {
         ])
     }
 
+    /// Asks TDLib for the whole file, once, and remembers the request on
+    /// the file's state: a sensor reporting the same picture again then
+    /// finds it "downloading" instead of asking a second time. A request
+    /// TDLib refuses is remembered as a failure rather than leaving the
+    /// file in flight forever. Explicit actions (the viewer, "Скачать",
+    /// playing) go through here too: they are what retries a failed file.
+    pub(super) fn request_download(&mut self, file_id: i32, priority: i32) -> Task<Msg> {
+        if let Some(state) = self.session.files.get_mut(&file_id)
+            && !state.done
+        {
+            state.downloading = true;
+            state.failed = false;
+        }
+        Task::perform(
+            td::download_file(self.session.client_id, file_id, priority),
+            move |result| Msg::FileRequestDone(file_id, result),
+        )
+    }
+
     /// A photo came into view: decode it if downloaded, else download it.
     pub(super) fn show_photo(&mut self, file_id: i32) -> Task<Msg> {
         self.session.wanted_photos.insert(file_id);
@@ -640,11 +712,10 @@ impl super::App {
         }
         match self.session.files.get(&file_id) {
             Some(f) if f.done => self.decode_photo(file_id),
-            Some(f) if f.downloading => Task::none(),
-            _ => Task::perform(
-                td::download_file(self.session.client_id, file_id, 16),
-                Msg::Done,
-            ),
+            // In flight, or failed before: an automatic path never asks
+            // again (that is an explicit action, through `request_download`).
+            Some(f) if f.downloading || f.failed => Task::none(),
+            _ => self.request_download(file_id, 16),
         }
     }
 

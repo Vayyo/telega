@@ -28,19 +28,86 @@ pub struct Settings {
     pub active_account: u32,
     /// Color scheme and accent.
     pub look: crate::app::look::LookSettings,
+    /// Per-account downloaded files and separate shared decoded-avatar cache policy.
+    pub cache: CacheLimits,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheLimits {
+    pub bytes: u64,
+    pub days: u64,
+}
+
+impl Default for CacheLimits {
+    fn default() -> Self {
+        Self {
+            bytes: 10 * 1024 * 1024 * 1024,
+            days: 90,
+        }
+    }
+}
+
+impl CacheLimits {
+    pub const GIB_MAX: u32 = 100;
+    pub const MONTHS_MAX: u32 = 12;
+
+    pub fn from_sliders(gib: f32, months: f32) -> Self {
+        let normalized = |value: f32, default: f32, max: u32| {
+            if value.is_nan() {
+                default as u64
+            } else {
+                value.round().clamp(1.0, max as f32) as u64
+            }
+        };
+        Self {
+            bytes: normalized(gib, 10.0, Self::GIB_MAX) * 1024 * 1024 * 1024,
+            days: normalized(months, 3.0, Self::MONTHS_MAX) * 30,
+        }
+    }
+
+    pub fn gib(self) -> f32 {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        (self.bytes.saturating_add(GIB / 2) / GIB).clamp(1, Self::GIB_MAX as u64) as f32
+    }
+
+    pub fn months(self) -> f32 {
+        (self.days.saturating_add(15) / 30).clamp(1, Self::MONTHS_MAX as u64) as f32
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Account {
     pub slot: u32,
     /// Known once logged in; `None` while the login is not finished.
     pub user_id: Option<i64>,
     pub name: String,
+    /// Content digest of the cached, decoded own profile photo.
+    pub avatar_digest: Option<[u8; 32]>,
     /// Client password: salt of the key and a check value of it (the
     /// password itself is never stored).
     pub lock_salt: Option<String>,
     pub lock_check: Option<String>,
+    /// Per chat and message, independent of the TDLib file identifier.
+    pub video_volumes: BTreeMap<i64, BTreeMap<i64, VideoVolume>>,
+}
+
+/// Playback level and the last audible level (for unmuting after a restart).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VideoVolume {
+    pub volume: f32,
+    pub unmuted: f32,
+}
+
+impl Default for VideoVolume {
+    fn default() -> Self {
+        Self {
+            volume: 1.0,
+            unmuted: 1.0,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -54,6 +121,7 @@ impl Default for Settings {
             accounts: Vec::new(),
             active_account: 0,
             look: Default::default(),
+            cache: CacheLimits::default(),
         }
     }
 }
@@ -147,6 +215,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn serialized_default_settings_include_cache_policy() {
+        assert_eq!(
+            serde_json::to_value(Settings::default()).unwrap()["cache"],
+            serde_json::json!({"bytes": 10_737_418_240_u64, "days": 90}),
+        );
+    }
+
+    #[test]
+    fn cache_defaults_to_ten_gib_and_ninety_days() {
+        assert_eq!(
+            Settings::default().cache,
+            CacheLimits {
+                bytes: 10 * 1024 * 1024 * 1024,
+                days: 90,
+            }
+        );
+    }
+
+    #[test]
+    fn nondefault_cache_limits_survive_settings_save_and_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "telega-settings-cache-roundtrip-{}",
+            std::process::id()
+        ));
+        let path = dir.join("settings.json");
+        let settings = Settings {
+            cache: CacheLimits {
+                bytes: 27 * 1024 * 1024 * 1024,
+                days: 150,
+            },
+            ..Settings::default()
+        };
+        settings.save(&path).unwrap();
+        assert_eq!(Settings::load(&path), Ok(settings));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn older_settings_without_cache_and_empty_settings_use_cache_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "telega-settings-cache-legacy-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"notifications":false,"keep_deleted":false}"#).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.cache, CacheLimits::default());
+        assert!(!loaded.notifications);
+        assert!(!loaded.keep_deleted);
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(Settings::load(&path).unwrap().cache, CacheLimits::default());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cache_sliders_convert_months_and_gib_and_clamp_both_ends() {
+        let gib: u64 = 1024 * 1024 * 1024;
+        assert_eq!(
+            CacheLimits::from_sliders(10.0, 3.0),
+            CacheLimits {
+                bytes: 10 * gib,
+                days: 90,
+            }
+        );
+        assert_eq!(
+            CacheLimits::from_sliders(0.0, 0.0),
+            CacheLimits {
+                bytes: gib,
+                days: 30,
+            }
+        );
+        assert_eq!(
+            CacheLimits::from_sliders(500.0, 500.0),
+            CacheLimits {
+                bytes: 100 * gib,
+                days: 360,
+            }
+        );
+        let selected = CacheLimits::from_sliders(27.0, 5.0);
+        assert_eq!((selected.gib(), selected.months()), (27.0, 5.0));
+        assert_eq!(
+            CacheLimits::from_sliders(selected.gib(), selected.months()),
+            selected
+        );
+    }
+
+    #[test]
     fn saved_settings_load_back_and_missing_file_gives_defaults() {
         let dir = std::env::temp_dir().join(format!("telega-settings-{}", std::process::id()));
         let path = dir.join("settings.json");
@@ -186,6 +342,7 @@ mod tests {
                 scheme: crate::app::look::Scheme::Graphite,
                 accent: crate::app::look::Accent::Violet,
             },
+            cache: CacheLimits::default(),
         };
         off.save(&path).unwrap();
         assert_eq!(Settings::load(&path), Ok(off.clone()));

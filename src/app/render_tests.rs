@@ -80,6 +80,7 @@ fn fill(app: &mut App, n: i64) {
                 height: 720,
                 duration: 75,
                 spoiler: id % 2 == 0,
+                round: false,
             }),
             6 => Some(Media::Animation {
                 file_id: id as i32,
@@ -88,7 +89,6 @@ fn fill(app: &mut App, n: i64) {
                 width: 480,
                 height: 270,
                 duration: 3,
-                round: id % 2 == 0,
                 spoiler: false,
             }),
             _ => None,

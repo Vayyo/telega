@@ -70,6 +70,15 @@ pub(super) struct Session {
     pub(super) auth: Auth,
     pub(super) input: String,
     pub(super) busy: bool,
+    /// Option writes start only after parameters have been accepted.
+    pub(super) cache_params_accepted: bool,
+    pub(super) cache_initializing: bool,
+    /// One policy write at a time for this client, with the latest queued value.
+    pub(super) cache_applying: Option<crate::settings::CacheLimits>,
+    pub(super) cache_pending: Option<crate::settings::CacheLimits>,
+    /// Drag changes wait for release before launching their queued option group.
+    pub(super) cache_commit_pending: bool,
+    pub(super) cache_applied: Option<crate::settings::CacheLimits>,
     pub(super) chats: HashMap<i64, ChatItem>,
     /// Main chat list sorted like Telegram: by descending TDLib `order`.
     pub(super) order: BTreeSet<(Reverse<i64>, i64)>,
@@ -108,6 +117,8 @@ pub(super) struct Session {
     /// Stand-in for a folder whose chats are not loaded yet.
     pub(super) empty_list: BTreeSet<(Reverse<i64>, i64)>,
     pub(super) users: HashMap<i64, String>,
+    /// TDLib users currently reported as bots; resolved by user id, not chat id.
+    pub(super) bot_users: HashSet<i64>,
     /// One pane per open window, the main one included.
     pub(super) panes: HashMap<WinId, ChatPane>,
     pub(super) confirm_logout: bool,
@@ -185,6 +196,12 @@ impl Session {
             auth: Auth::Starting,
             input: String::new(),
             busy: false,
+            cache_params_accepted: false,
+            cache_initializing: false,
+            cache_applying: None,
+            cache_pending: None,
+            cache_commit_pending: false,
+            cache_applied: None,
             chats: HashMap::new(),
             order: BTreeSet::new(),
             archived: BTreeSet::new(),
@@ -209,6 +226,7 @@ impl Session {
             next_folder_edit: 0,
             empty_list: BTreeSet::new(),
             users: HashMap::new(),
+            bot_users: HashSet::new(),
             panes: HashMap::from([(main_window, ChatPane::default())]),
             confirm_logout: false,
             archive: None,

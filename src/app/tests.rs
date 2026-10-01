@@ -8,7 +8,7 @@ use super::sandbox;
 use super::tabs::MAX_TABS;
 use super::*;
 use crate::av::audio::Recorder;
-use crate::settings::Account;
+use crate::settings::{Account, CacheLimits};
 use serde_json::{Value, json};
 
 #[test]
@@ -419,6 +419,374 @@ fn turning_keep_deleted_off_hides_archive_and_on_restores_it() {
     let _ = app.update(Msg::SetKeepDeleted(true));
     open(&mut app, 1, &[(11, "b")]);
     assert_eq!(shown(&app), [(10, "a", true), (11, "b", false)]);
+}
+
+#[test]
+fn setting_cache_policy_updates_only_cache_settings() {
+    let mut app = app();
+    let limits = CacheLimits {
+        bytes: 2 * 1024 * 1024 * 1024,
+        days: 30,
+    };
+    let mut expected = app.settings.clone();
+    expected.cache = limits;
+    let _ = app.update(Msg::SetCachePolicy(limits));
+    assert_eq!(app.settings, expected);
+}
+
+#[test]
+fn late_cache_options_do_not_clear_auth_busy() {
+    let mut app = app();
+    let client = app.session.client_id;
+    app.session.cache_initializing = true;
+    app.session.auth = Auth::Phone;
+    app.session.busy = true;
+
+    let _ = app.update(Msg::ParametersSetForClient(
+        client,
+        CacheLimits::default(),
+        Ok(None),
+    ));
+
+    assert!(app.session.busy, "pending phone request must stay busy");
+    assert!(app.session.cache_params_accepted);
+}
+
+#[test]
+fn cache_policy_persists_on_exit() {
+    let selected = CacheLimits::from_sliders(65.0, 8.0);
+
+    {
+        let mut app = app();
+        let main_window = app.main_window;
+        let _ = app.update(Msg::SetCachePolicy(selected));
+        let _ = app.update(Msg::ApplyCachePolicy);
+        assert_eq!(
+            Settings::load(&app.settings_path).unwrap().cache,
+            CacheLimits::default()
+        );
+        let _ = app.update(Msg::WindowClosed(main_window));
+        assert_eq!(
+            Settings::load(&app.settings_path).unwrap().cache,
+            selected,
+            "closing the main window must save the released slider choice"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut app = app();
+        let _ = app.update(Msg::SetCachePolicy(selected));
+        let _ = app.update(Msg::ApplyCachePolicy);
+        assert_eq!(
+            Settings::load(&app.settings_path).unwrap().cache,
+            CacheLimits::default()
+        );
+        let _ = app.update(Msg::Tray(tray::TrayEvent::Quit));
+        assert_eq!(
+            Settings::load(&app.settings_path).unwrap().cache,
+            selected,
+            "quitting from the tray must save the released slider choice"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn close_to_tray_main_closed_ack_keeps_drafts_panes_and_client_without_exiting() {
+    use iced::futures::StreamExt;
+    use iced_runtime::{Action, task::into_stream};
+
+    let mut app = app();
+    app.session.client_id = 42;
+    let main = app.main_window;
+    open(&mut app, 1, &[(10, "main message")]);
+    let second = open_window(&mut app, 2, &[(20, "other message")]);
+    let _ = app.update(Msg::Pane(main, typed("unfinished main draft")));
+    let _ = app.update(Msg::Pane(second, typed("unfinished other draft")));
+    let client = app.session.client_id;
+
+    // Closed is a native-window acknowledgement, even if no tray handle is
+    // currently available; it must not end the still-running session.
+    let task = app.update(Msg::WindowClosed(main));
+    let actions = iced::futures::executor::block_on(async {
+        match into_stream(task) {
+            Some(stream) => stream.collect::<Vec<_>>().await,
+            None => Vec::new(),
+        }
+    });
+    assert!(
+        !actions.iter().any(|action| matches!(action, Action::Exit)),
+        "acknowledging the main native window's close must not exit"
+    );
+    assert_eq!(app.session.client_id, client);
+    assert_eq!(app.main_window, main);
+    assert!(app.session.panes[&main].shows(1));
+    assert_eq!(
+        app.session.panes[&main].compose.text(),
+        "unfinished main draft"
+    );
+    assert_eq!(shown_in(&app, main), [(10, "main message", false)]);
+    assert!(app.session.panes[&second].shows(2));
+    assert_eq!(
+        app.session.panes[&second].compose.text(),
+        "unfinished other draft"
+    );
+    assert_eq!(shown_in(&app, second), [(20, "other message", false)]);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn close_to_tray_activate_reopens_the_same_main_window_id() {
+    use iced::futures::StreamExt;
+    use iced_runtime::{Action, task::into_stream, window::Action as WindowAction};
+
+    let mut app = app();
+    let main = app.main_window;
+    // The OS has already destroyed the native window; no tray fixture or
+    // process-wide window state is needed to acknowledge that event.
+    drop(app.update(Msg::WindowClosed(main)));
+
+    let mut stream = into_stream(app.update(Msg::Tray(tray::TrayEvent::Activate)))
+        .expect("tray activation must produce a window-open action");
+    let mut opened = Vec::new();
+    while let Some(action) = stream.next().await {
+        match action {
+            Action::Window(WindowAction::Open(id, _settings, channel)) => {
+                assert_eq!(
+                    id, main,
+                    "tray activation must restore the original window ID"
+                );
+                channel
+                    .send(id)
+                    .expect("window-open response must be accepted");
+                opened.push(id);
+            }
+            Action::Output(message) => {
+                drop(app.update(message));
+            }
+            Action::Exit => panic!("tray activation must not exit the app"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        opened,
+        [main],
+        "tray activation must open the main window once"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn close_to_tray_activate_during_close_defers_one_restore_until_closed_ack() {
+    use iced::futures::StreamExt;
+    use iced_runtime::{Action, task::into_stream, window::Action as WindowAction};
+
+    let mut app = app();
+    let main = app.main_window;
+    open(&mut app, 5, &[(10, "kept message")]);
+    drop(app.update(Msg::Pane(main, typed("unfinished draft"))));
+    app.main_window_state = MainWindowState::Closing { restore: false };
+
+    for _ in 0..2 {
+        assert!(
+            into_stream(app.update(Msg::Tray(tray::TrayEvent::Activate))).is_none(),
+            "an activation before close acknowledgement must not open a second native window"
+        );
+    }
+    assert_eq!(
+        app.main_window_state,
+        MainWindowState::Closing { restore: true }
+    );
+
+    let mut stream = into_stream(app.update(Msg::WindowClosed(main)))
+        .expect("the deferred activation must reopen the acknowledged window");
+    assert_eq!(app.main_window_state, MainWindowState::Opening);
+    assert!(
+        into_stream(app.update(Msg::Tray(tray::TrayEvent::Activate))).is_none(),
+        "activation while opening must not queue a duplicate window"
+    );
+
+    let mut opens = 0;
+    let mut opened = 0;
+    while let Some(action) = stream.next().await {
+        match action {
+            Action::Window(WindowAction::Open(id, _settings, channel)) => {
+                assert_eq!(id, main, "the original main window ID must be reused");
+                opens += 1;
+                channel.send(id).expect("native window opened");
+            }
+            Action::Output(Msg::MainWindowOpened(id)) => {
+                assert_eq!(id, main);
+                opened += 1;
+                drop(app.update(Msg::MainWindowOpened(id)));
+            }
+            Action::Exit => panic!("restoring the main window must not exit"),
+            _ => {}
+        }
+    }
+    assert_eq!((opens, opened), (1, 1));
+    assert_eq!(app.main_window_state, MainWindowState::Open);
+    assert!(app.session.panes[&main].shows(5));
+    assert_eq!(shown(&app), [(10, "kept message", false)]);
+    assert_eq!(pane(&app).compose.text(), "unfinished draft");
+
+    let actions = into_stream(app.update(Msg::Tray(tray::TrayEvent::Activate)))
+        .expect("an already-open window can be focused")
+        .collect::<Vec<_>>()
+        .await;
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::Window(WindowAction::Open(_, _, _)))),
+        "an activation after the open signal must not open another window"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn close_to_tray_stale_notification_stays_hidden_and_current_click_restores_one_window() {
+    use iced::futures::StreamExt;
+    use iced_runtime::{Action, task::into_stream, window::Action as WindowAction};
+
+    let mut app = app();
+    let main = app.main_window;
+    app.session
+        .chats
+        .insert(5, chat_item("Requested chat", false));
+    open(&mut app, 5, &[(10, "existing history")]);
+    drop(app.update(Msg::WindowClosed(main)));
+    assert_eq!(app.main_window_state, MainWindowState::Hidden);
+
+    let stale = app.session.slot + 1;
+    assert!(
+        into_stream(app.update(Msg::NotificationClicked(stale, 5))).is_none(),
+        "a notification from another account must not open a window"
+    );
+    assert_eq!(app.main_window_state, MainWindowState::Hidden);
+    assert_eq!(active(&app), Some(5));
+
+    let slot = app.session.slot;
+    let mut stream = into_stream(app.update(Msg::NotificationClicked(slot, 5)))
+        .expect("current-account notification must reopen the main window");
+    assert_eq!(app.main_window_state, MainWindowState::Opening);
+    assert_eq!(active(&app), Some(5), "the requested chat must be selected");
+    let mut opens = 0;
+    let mut opened = 0;
+    while let Some(action) = stream.next().await {
+        match action {
+            Action::Window(WindowAction::Open(id, _, channel)) => {
+                assert_eq!(id, main);
+                opens += 1;
+                channel.send(id).expect("native window opened");
+            }
+            Action::Output(Msg::MainWindowOpened(id)) => {
+                assert_eq!(id, main);
+                opened += 1;
+                drop(app.update(Msg::MainWindowOpened(id)));
+            }
+            Action::Exit => panic!("a notification click must not quit"),
+            _ => {}
+        }
+    }
+    assert_eq!((opens, opened), (1, 1));
+    assert_eq!(app.main_window_state, MainWindowState::Open);
+    assert_eq!(shown(&app), [(10, "existing history", false)]);
+
+    // A click can also target an existing background tab rather than the
+    // chat already visible before the main window was hidden. Do not poll
+    // this task: switching tabs may contain real TDLib requests.
+    let mut switched = self::app();
+    switched
+        .session
+        .chats
+        .insert(5, chat_item("Requested chat", false));
+    switched
+        .session
+        .chats
+        .insert(6, chat_item("Previously visible", false));
+    select(&mut switched, 5, &[(10, "background history")]);
+    select(&mut switched, 6, &[(20, "other history")]);
+    assert_eq!(active(&switched), Some(6));
+    let main = switched.main_window;
+    drop(switched.update(Msg::WindowClosed(main)));
+    let slot = switched.session.slot;
+    drop(switched.update(Msg::NotificationClicked(slot, 5)));
+    assert_eq!(switched.main_window_state, MainWindowState::Opening);
+    assert_eq!(active(&switched), Some(5));
+    assert_eq!(shown(&switched), [(10, "background history", false)]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn close_to_tray_main_close_request_without_tray_exits_and_saves_unsaved_cache() {
+    use iced::futures::StreamExt;
+    use iced_runtime::{Action, task::into_stream};
+
+    let mut app = app();
+    let selected = CacheLimits::from_sliders(65.0, 8.0);
+    drop(app.update(Msg::SetCachePolicy(selected)));
+    drop(app.update(Msg::ApplyCachePolicy));
+    assert_eq!(
+        Settings::load(&app.settings_path).unwrap().cache,
+        CacheLimits::default()
+    );
+
+    let main = app.main_window;
+    let actions = iced::futures::executor::block_on(async {
+        into_stream(app.update(Msg::WindowCloseRequested(main)))
+            .expect("closing without a tray must request exit")
+            .collect::<Vec<_>>()
+            .await
+    });
+    assert!(
+        actions.iter().any(|action| matches!(action, Action::Exit)),
+        "a main close request without a tray must exit"
+    );
+    assert_eq!(Settings::load(&app.settings_path).unwrap().cache, selected);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn close_to_tray_secondary_close_request_keeps_pane_until_closed_ack() {
+    use iced_runtime::task::into_stream;
+
+    let mut app = app();
+    let main = app.main_window;
+    open(&mut app, 1, &[(10, "main message")]);
+    let second = open_window(&mut app, 2, &[(20, "secondary message")]);
+    drop(app.update(Msg::Pane(second, typed("unsent reply"))));
+
+    assert!(
+        into_stream(app.update(Msg::WindowCloseRequested(second))).is_none(),
+        "the secondary close request must not end the app or prematurely close its pane"
+    );
+    assert_eq!(app.session.panes[&second].compose.text(), "unsent reply");
+    assert_eq!(shown_in(&app, second), [(20, "secondary message", false)]);
+
+    drop(app.update(Msg::WindowClosed(second)));
+    assert!(!app.session.panes.contains_key(&second));
+    assert_eq!(shown_in(&app, main), [(10, "main message", false)]);
+    assert_eq!(app.main_window, main);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn close_to_tray_quit_requests_exit() {
+    use iced::futures::StreamExt;
+    use iced_runtime::{Action, task::into_stream};
+
+    let mut app = app();
+    let actions = iced::futures::executor::block_on(async {
+        into_stream(app.update(Msg::Tray(tray::TrayEvent::Quit)))
+            .expect("tray quit must produce an exit action")
+            .collect::<Vec<_>>()
+            .await
+    });
+    assert!(
+        actions.iter().any(|action| matches!(action, Action::Exit)),
+        "explicit tray quit must exit even though window close acknowledgements do not"
+    );
 }
 
 #[test]
@@ -2008,7 +2376,7 @@ fn evicted_avatar_is_refetched_when_shown_again() {
 
     // More avatars than the private MAX_CACHED bound (600): 9500 evicts.
     for id in 9501..10300 {
-        app.avatar_decoded(id, Ok(vec![0u8; 4]));
+        app.avatar_decoded(id, Ok((vec![0u8; 4], [0u8; 32])));
     }
     assert!(
         app.session.avatars.handle(peer).is_none(),
@@ -2019,6 +2387,520 @@ fn evicted_avatar_is_refetched_when_shown_again() {
     // away instead of leaving initials up until the app restarts.
     let _ = app.update(Msg::AvatarShown(peer));
     assert!(app.session.avatars.decoding.contains(&9500));
+}
+
+/// An `updateUser` whose profile photo is `small`: the peer's avatar file
+/// becomes known without anything being downloaded.
+fn user_with_photo(id: i64, small: Value) -> Value {
+    json!({
+        "@type": "updateUser",
+        "user": {
+            "@type": "user", "id": id, "first_name": "Тест", "last_name": "",
+            "usernames": null, "phone_number": "",
+            "status": {"@type": "userStatusEmpty"},
+            "profile_photo": {"@type": "profilePhoto", "id": "1",
+                              "small": small.clone(), "big": small,
+                              "minithumbnail": null, "has_animation": false,
+                              "is_personal": false},
+            "accent_color_id": 0, "background_custom_emoji_id": "0",
+            "upgraded_gift_colors": null, "profile_accent_color_id": 0,
+            "profile_background_custom_emoji_id": "0", "emoji_status": null,
+            "is_contact": false, "is_mutual_contact": false, "is_close_friend": false,
+            "verification_status": null, "is_premium": false, "is_support": false,
+            "restriction_info": null, "active_story_state": null,
+            "restricts_new_chats": false, "paid_message_star_count": 0,
+            "have_access": true, "type": {"@type": "userTypeRegular"},
+            "language_code": "", "added_to_attachment_menu": false
+        }
+    })
+}
+
+#[test]
+fn repeated_avatar_show_while_in_flight_does_not_duplicate_the_download() {
+    let mut app = app();
+    let peer = avatars::Peer::User(42);
+    // The picture is known but not on disk, so the first sensor report has
+    // to start the download.
+    td(
+        &mut app,
+        user_with_photo(42, file(9500, 1000, 0, false, "")),
+    );
+    assert_eq!(app.update(Msg::AvatarShown(peer)).units(), 1);
+
+    // A list scrolled back and forth re-reports the same picture: while
+    // TDLib is still fetching it, that must not become a second request.
+    assert_eq!(app.update(Msg::AvatarShown(peer)).units(), 0);
+}
+
+#[test]
+fn avatar_update_while_in_flight_does_not_lose_the_running_download() {
+    let mut app = app();
+    let peer = avatars::Peer::User(42);
+    td(
+        &mut app,
+        user_with_photo(42, file(9500, 1000, 0, false, "")),
+    );
+    assert_eq!(app.update(Msg::AvatarShown(peer)).units(), 1);
+
+    // TDLib repeats the same photo with no progress (`is_downloading_active:
+    // false`) while the request it already got is still pending: that is
+    // stale data, not a cancel, so the in-flight download must survive.
+    td(
+        &mut app,
+        user_with_photo(42, file(9500, 1000, 0, false, "")),
+    );
+    assert_eq!(app.update(Msg::AvatarShown(peer)).units(), 0);
+}
+
+#[test]
+fn failed_avatar_download_is_not_retried_by_the_sensor() {
+    let mut app = app();
+    let peer = avatars::Peer::User(42);
+    td(
+        &mut app,
+        user_with_photo(42, file(9500, 1000, 0, false, "")),
+    );
+    assert_eq!(app.update(Msg::AvatarShown(peer)).units(), 1);
+
+    // The download runs, then dies without completing (no network, ...).
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(9500, 1000, 500, false, "")}),
+    );
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(9500, 1000, 0, false, "")}),
+    );
+
+    // Retrying a failed download is the user's explicit action, never a
+    // side effect of the picture scrolling back into view.
+    assert_eq!(app.update(Msg::AvatarShown(peer)).units(), 0);
+}
+
+/// A failed picture is retried by an explicit action, never by the sensor
+/// alone — but should not stay initials until the client restarts either.
+/// Opening a person's card is such an action: the user asked for this
+/// person, so the picture the download gave up on is asked for again.
+#[test]
+fn opening_a_user_card_gives_a_failed_avatar_a_second_chance() {
+    use crate::app::card::CardMsg;
+
+    let mut app = app();
+    let window = app.main_window;
+    let peer = avatars::Peer::User(42);
+    td(
+        &mut app,
+        user_with_photo(42, file(9500, 1000, 0, false, "")),
+    );
+    assert_eq!(app.update(Msg::AvatarShown(peer)).units(), 1);
+
+    // The download runs, then dies without completing (no network, ...).
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(9500, 1000, 500, false, "")}),
+    );
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(9500, 1000, 0, false, "")}),
+    );
+    assert_eq!(
+        app.update(Msg::AvatarShown(peer)).units(),
+        0,
+        "the sensor alone never retries a failed picture"
+    );
+
+    let _ = app.update(Msg::Card(CardMsg::Open(window, 42)));
+    assert_eq!(
+        app.update(Msg::AvatarShown(peer)).units(),
+        1,
+        "the card is an explicit action, so the picture may be asked for again"
+    );
+}
+
+/// The same for a chat: its profile panel is the explicit action that is
+/// allowed to revive a failed chat picture.
+#[test]
+fn opening_a_chat_profile_gives_a_failed_avatar_a_second_chance() {
+    let mut app = app();
+    let window = app.main_window;
+    let peer = avatars::Peer::Chat(5);
+    app.session.chats.insert(5, chat_item("Чат", false));
+    // The panel asks TDLib only for a chat whose type it knows.
+    app.session.chats.get_mut(&5).unwrap().kind =
+        Some(serde_json::from_value(json!({"@type": "chatTypePrivate", "user_id": 42})).unwrap());
+
+    // The chat list learns the chat's picture: known, nothing downloaded.
+    td(
+        &mut app,
+        json!({"@type": "updateChatPhoto", "chat_id": 5, "photo": {
+            "@type": "chatPhotoInfo",
+            "small": file(9600, 1000, 0, false, ""),
+            "big": file(9600, 1000, 0, false, ""),
+            "minithumbnail": null, "has_animation": false, "is_personal": false}}),
+    );
+    assert_eq!(app.update(Msg::AvatarShown(peer)).units(), 1);
+
+    // The download runs, then dies without completing.
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(9600, 1000, 500, false, "")}),
+    );
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(9600, 1000, 0, false, "")}),
+    );
+    assert_eq!(
+        app.update(Msg::AvatarShown(peer)).units(),
+        0,
+        "the sensor alone never retries a failed picture"
+    );
+
+    let _ = app.update(Msg::OpenProfile(window, 5));
+    assert_eq!(
+        app.update(Msg::AvatarShown(peer)).units(),
+        1,
+        "the profile panel is an explicit action, so the picture may be asked for again"
+    );
+}
+
+/// Side of a decoded avatar, px (see `avatars::SIDE`), and its RGBA size.
+const AVATAR_RGBA_LEN: usize = 64 * 64 * 4;
+
+/// The on-disk cache of decoded avatars (`paths::avatars()`). Spelled out
+/// here, rather than called, because these tests are written against the
+/// tree before the module that owns that path exists.
+fn avatar_cache_dir() -> std::path::PathBuf {
+    crate::paths::base().join("avatars")
+}
+
+/// Serialises the tests that read or write the shared avatar cache, which is
+/// one directory for the whole binary while the tests run in parallel (see
+/// `paths::AVATARS_TEST_LOCK`). A test that panicked while holding it must
+/// not fail the others: the lock serialises, it does not guard data.
+fn shared_cache() -> std::sync::MutexGuard<'static, ()> {
+    crate::paths::AVATARS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Cache entries holding exactly this picture. Selecting by content, not by
+/// name, keeps a test on its own entry: every test of the binary writes its
+/// own pictures into the same directory.
+fn cache_entries_of(rgba: &[u8]) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(avatar_cache_dir()) else {
+        return Vec::new();
+    };
+    let mut found: Vec<_> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| std::fs::read(path).is_ok_and(|bytes| bytes == rgba))
+        .collect();
+    found.sort();
+    found
+}
+
+/// The picture `sandbox::photo` put on disk for `file_id`, decoded the way
+/// the client decodes it.
+fn avatar_rgba(app: &App, file_id: i32) -> Vec<u8> {
+    let path = app
+        .session
+        .files
+        .get(&file_id)
+        .expect("photo file")
+        .path
+        .clone();
+    avatars::decode(&path).expect("decodable picture")
+}
+
+#[test]
+fn avatars_with_identical_bytes_share_one_cache_entry() {
+    let _shared = shared_cache();
+    let mut app = app();
+    let first = avatars::Peer::Chat(2);
+    let second = avatars::Peer::User(42);
+    // The same picture under two file ids, as TDLib hands it out for one
+    // photo seen in two chats: the bytes, not the file id, identify it.
+    sandbox::photo(&mut app, first, 9101, [10, 20, 30], [200, 210, 220]);
+    sandbox::photo(&mut app, second, 9102, [10, 20, 30], [200, 210, 220]);
+    let rgba = avatar_rgba(&app, 9101);
+    assert_eq!(avatar_rgba(&app, 9102), rgba, "same picture, same bytes");
+
+    assert_eq!(
+        cache_entries_of(&rgba).len(),
+        1,
+        "identical bytes under two file ids are written to disk once"
+    );
+    assert!(
+        app.session.avatars.handle(first).is_some(),
+        "the first peer shows the picture"
+    );
+    assert!(
+        app.session.avatars.handle(second).is_some(),
+        "the second peer shows the same picture, not initials"
+    );
+}
+
+#[test]
+fn corrupt_cache_entry_does_not_show_a_broken_avatar() {
+    let _shared = shared_cache();
+    let mut app = app();
+    let peer = avatars::Peer::User(43);
+    sandbox::photo(&mut app, peer, 9200, [11, 22, 33], [201, 210, 219]);
+    let rgba = avatar_rgba(&app, 9200);
+    let entries = cache_entries_of(&rgba);
+    assert_eq!(entries.len(), 1, "the decoded picture went to disk");
+
+    // A torn write: the entry holds a tenth of a picture.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&entries[0])
+        .unwrap()
+        .set_len(10)
+        .unwrap();
+
+    // Restart on the same data directory, then the picture is shown again.
+    app.session = Session::new(0, app.main_window, 0);
+    sandbox::photo(&mut app, peer, 9200, [11, 22, 33], [201, 210, 219]);
+
+    assert!(
+        app.session.avatars.handle(peer).is_some(),
+        "a truncated entry must not leave initials on screen"
+    );
+    assert_eq!(
+        std::fs::metadata(&entries[0]).unwrap().len(),
+        AVATAR_RGBA_LEN as u64,
+        "the entry is repaired to a whole picture"
+    );
+    assert_eq!(
+        std::fs::read(&entries[0]).unwrap(),
+        rgba,
+        "repaired to the picture itself, not to a part of it"
+    );
+}
+
+#[test]
+fn cached_avatar_survives_restart_without_being_decoded_again() {
+    let _shared = shared_cache();
+    let mut app = app();
+    let peer = avatars::Peer::User(44);
+    sandbox::photo(&mut app, peer, 9300, [12, 34, 56], [210, 220, 230]);
+    let rgba = avatar_rgba(&app, 9300);
+    let entries = cache_entries_of(&rgba);
+    assert_eq!(entries.len(), 1, "the decoded picture went to disk");
+
+    // Next start on the same data directory: the session, and with it every
+    // decoded picture in memory, is gone.
+    app.session = Session::new(0, app.main_window, 0);
+    assert!(
+        app.session.avatars.handle(peer).is_none(),
+        "nothing is decoded in memory yet"
+    );
+
+    // A stand-in for the cached picture: a decode of the source file would
+    // write the real bytes over it, so an untouched entry is proof the
+    // picture came from disk instead of being decoded again.
+    let cached = vec![7u8; AVATAR_RGBA_LEN];
+    std::fs::write(&entries[0], &cached).unwrap();
+
+    sandbox::photo(&mut app, peer, 9300, [12, 34, 56], [210, 220, 230]);
+
+    assert!(
+        app.session.avatars.handle(peer).is_some(),
+        "the avatar on disk survives the restart"
+    );
+    assert_eq!(
+        std::fs::read(&entries[0]).unwrap(),
+        cached,
+        "the cached entry was used as it is, without decoding again"
+    );
+}
+
+#[test]
+fn repeated_photo_show_while_in_flight_does_not_duplicate_the_download() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, photo_content()));
+
+    // First sight starts the download of the largest size up to 1280 px.
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        1
+    );
+    // The same bubble reported again while TDLib is still fetching it: no
+    // second request for a file that is already on its way.
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        0
+    );
+}
+
+#[test]
+fn failed_photo_download_is_not_retried_by_the_sensor() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, photo_content()));
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        1
+    );
+
+    // The bubble's download runs, then dies without completing.
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(103, 1000, 500, false, "")}),
+    );
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(103, 1000, 0, false, "")}),
+    );
+
+    // Scrolling the photo back into view must not silently restart a
+    // download that already failed.
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        0
+    );
+}
+
+#[test]
+fn explicit_download_retries_a_failed_photo_and_keeps_the_sensor_out() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, photo_content()));
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        1
+    );
+
+    // The download runs, then dies without completing: the file is now
+    // marked as failed, like in the test above.
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(103, 1000, 500, false, "")}),
+    );
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(103, 1000, 0, false, "")}),
+    );
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        0,
+        "a failed file stays failed for the sensor"
+    );
+
+    // The other half of the same guard: "Скачать" is a deliberate action,
+    // not a sensor, so it is exactly what is allowed to ask TDLib again for
+    // a file the client gave up on — the failure must not lock the file out
+    // of retries for the rest of the session.
+    assert_eq!(app.update(Msg::FileDownload(103)).units(), 1);
+
+    // And the retry puts the file back in flight, so the sensor that fired
+    // a moment ago still adds no request of its own.
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        0,
+        "the retried file is in flight again"
+    );
+}
+
+/// A reparse of the same message carries a stale file object that confirms
+/// no download at all. It must not erase the request the client already
+/// made: the sensor would then ask TDLib a second time for a file that is
+/// already on its way, and the bubble's own guard would be gone.
+#[test]
+fn reparsing_a_message_keeps_the_in_flight_photo_marker() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, photo_content()));
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        1
+    );
+
+    // TDLib reports the same message again (a re-delivery, or the pane
+    // re-parsing it): the bubble stays, its file snapshot is unchanged.
+    new_message_value(&mut app, media_message(1, 10, photo_content()));
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        0,
+        "the reparse must not put a second request for the picture in flight"
+    );
+}
+
+/// The same snapshot problem for a picture that already failed: nothing in
+/// the reparse made the download any likelier, so the failure the user must
+/// explicitly retry has to outlive it.
+#[test]
+fn reparsing_a_message_keeps_the_failed_photo_marker() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, photo_content()));
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        1
+    );
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(103, 1000, 500, false, "")}),
+    );
+    td(
+        &mut app,
+        json!({"@type": "updateFile", "file": file(103, 1000, 0, false, "")}),
+    );
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        0
+    );
+
+    new_message_value(&mut app, media_message(1, 10, photo_content()));
+    assert_eq!(
+        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
+            .units(),
+        0,
+        "the reparse must not revive a failed download for the sensor"
+    );
+}
+
+/// A request TDLib refuses has to reach the viewer as well as the file
+/// state: with only the state marked, a photo opened on a broken download
+/// spins on «Загрузка…» forever with no way to tell why.
+#[test]
+fn viewer_shows_an_error_when_the_photo_request_fails() {
+    let mut app = app();
+    let window = app.main_window;
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, photo_content()));
+    let _ = app.update(Msg::ViewPhoto(window, 103));
+    assert!(
+        app.session.photo_view.as_ref().unwrap().error.is_none(),
+        "the picture is still on its way, no error to show yet"
+    );
+
+    // A failure of some other file is not this viewer's business.
+    let _ = app.update(Msg::FileRequestDone(104, Err("нет сети".into())));
+    assert!(app.session.photo_view.as_ref().unwrap().error.is_none());
+
+    // TDLib refuses this download: the viewer is no longer waiting for
+    // anything, so it must say so instead of loading forever.
+    let _ = app.update(Msg::FileRequestDone(103, Err("нет сети".into())));
+    assert_eq!(
+        app.session
+            .photo_view
+            .as_ref()
+            .and_then(|v| v.error.as_deref()),
+        Some("не удалось загрузить фото"),
+    );
 }
 
 fn thumbnail(id: i32, format: &str) -> Value {
@@ -2095,15 +2977,6 @@ fn voice_stickers_videos_and_gifs_are_recognized() {
         Media::Animation {
             file_id: 304,
             thumb: None,
-            round: false,
-            ..
-        }
-    ));
-    assert!(matches!(
-        media[4],
-        Media::Animation {
-            file_id: 306,
-            round: true,
             ..
         }
     ));
@@ -2115,6 +2988,484 @@ fn voice_stickers_videos_and_gifs_are_recognized() {
     for id in [300, 301, 302, 303, 304, 306] {
         assert!(app.session.files.contains_key(&id), "file {id}");
     }
+}
+
+fn video_note_player_note(file_id: i32) -> Value {
+    json!({"@type": "messageVideoNote", "is_viewed": false, "is_secret": false,
+        "video_note": {"@type": "videoNote", "duration": 9, "waveform": "", "length": 384,
+            "video": file(file_id, 9000, 0, false, "")}})
+}
+
+/// Send a real iced pointer press into the selected rendered media bubble.
+/// Do not dispatch unrelated clicks: the old GIF action launches a system player.
+fn video_note_player_press_media(app: &App, bubble_index: usize) -> Msg {
+    use iced_runtime::user_interface::{Cache, UserInterface};
+
+    let mut renderer = sandbox::renderer();
+    let window = app.main_window;
+    let mut previous_hit = false;
+    let mut seen_bubbles = 0;
+    for y in (100..610).step_by(2) {
+        let mut messages = Vec::new();
+        {
+            let mut ui = UserInterface::build(
+                app.view(window),
+                iced::Size::new(1000.0, 700.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            let _ = ui.update(
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                    iced::mouse::Button::Left,
+                ))],
+                iced::mouse::Cursor::Available(iced::Point::new(400.0, y as f32)),
+                &mut renderer,
+                &mut iced_runtime::core::clipboard::Null,
+                &mut messages,
+            );
+        }
+        let hit = messages.into_iter().find(|message| {
+            matches!(
+                message,
+                Msg::Video(video::VideoMsg::Play(..)) | Msg::PlayVideo(_)
+            )
+        });
+        if let Some(message) = hit {
+            if !previous_hit {
+                if seen_bubbles == bubble_index {
+                    return message;
+                }
+                seen_bubbles += 1;
+            }
+            previous_hit = true;
+        } else {
+            previous_hit = false;
+        }
+    }
+    panic!("visible media bubble {bubble_index} did not receive a pointer press");
+}
+
+fn video_note_player_open_bubble(app: &mut App, bubble_index: usize, file_id: i32) {
+    let pressed = video_note_player_press_media(app, bubble_index);
+    assert!(
+        matches!(pressed, Msg::Video(video::VideoMsg::Play(..))),
+        "clicking the round bubble must open its inline player, got {pressed:?}"
+    );
+    let _ = app.update(pressed);
+    let playing = app
+        .session
+        .video
+        .as_ref()
+        .expect("inline player must become active");
+    assert_eq!(
+        playing.file_id, file_id,
+        "clicked bubble must play its own file"
+    );
+}
+
+#[test]
+fn video_note_player_click_opens_round_file_in_inline_player() {
+    let mut app = app();
+    let window = app.main_window;
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, video_note_player_note(306)));
+    assert_eq!(
+        pane(&app).messages[0].media.as_ref().unwrap().display_box(),
+        Some((media::ROUND_SIZE, media::ROUND_SIZE))
+    );
+
+    let pressed = video_note_player_press_media(&app, 0);
+    assert!(
+        matches!(pressed, Msg::Video(video::VideoMsg::Play(..))),
+        "clicking the round bubble must open its inline player, got {pressed:?}"
+    );
+    let _ = app.update(pressed);
+    let playing = app.session.video.as_ref().expect("inline player is active");
+    assert_eq!(
+        (playing.window, playing.chat_id, playing.file_id),
+        (window, 1, 306)
+    );
+    // Dropping App stops the streaming player.
+}
+
+#[test]
+fn video_note_player_gif_stays_on_animation_path() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    let gif = json!({"@type": "messageAnimation", "show_caption_above_media": false,
+        "has_spoiler": false, "is_secret": false,
+        "caption": {"@type": "formattedText", "text": "", "entities": []},
+        "animation": {"@type": "animation", "duration": 3, "width": 480, "height": 270,
+            "file_name": "g.mp4", "mime_type": "video/mp4", "has_stickers": false,
+            "animation": file(304, 9000, 0, false, "")}});
+    new_message_value(&mut app, media_message(1, 11, gif));
+
+    assert!(
+        matches!(video_note_player_press_media(&app, 0), Msg::PlayVideo(304)),
+        "GIF click must keep its animation action rather than open the inline video player"
+    );
+    assert!(app.session.video.is_none());
+}
+
+#[test]
+fn video_note_player_mute_is_separate_for_messages_sharing_a_file() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    for message_id in [10, 11] {
+        new_message_value(
+            &mut app,
+            media_message(1, message_id, video_note_player_note(306)),
+        );
+    }
+
+    video_note_player_open_bubble(&mut app, 0, 306);
+    let _ = app.update(Msg::Video(video::VideoMsg::ToggleMute));
+    assert_eq!(app.session.video.as_ref().unwrap().player.volume(), 0.0);
+    let _ = app.update(Msg::Video(video::VideoMsg::Close));
+    video_note_player_open_bubble(&mut app, 1, 306);
+    assert!(
+        app.session.video.as_ref().unwrap().player.volume() > 0.0,
+        "the other message must keep its own volume even with the same file"
+    );
+    let _ = app.update(Msg::Video(video::VideoMsg::Close));
+    video_note_player_open_bubble(&mut app, 0, 306);
+    assert_eq!(
+        app.session.video.as_ref().unwrap().player.volume(),
+        0.0,
+        "the first message must still be muted when reopened"
+    );
+}
+
+#[test]
+fn video_note_player_mute_survives_reopen_other_video_and_settings_reload() {
+    let mut app = app();
+    app.settings.accounts = vec![Account {
+        slot: app.session.slot,
+        user_id: Some(42),
+        name: "Viewer".into(),
+        ..Default::default()
+    }];
+    open(&mut app, 1, &[]);
+    for (message_id, file_id) in [(10, 306), (11, 307)] {
+        new_message_value(
+            &mut app,
+            media_message(1, message_id, video_note_player_note(file_id)),
+        );
+    }
+
+    video_note_player_open_bubble(&mut app, 0, 306);
+    let _ = app.update(Msg::Video(video::VideoMsg::ToggleMute));
+    assert_eq!(app.session.video.as_ref().unwrap().player.volume(), 0.0);
+    let _ = app.update(Msg::Video(video::VideoMsg::Close));
+    video_note_player_open_bubble(&mut app, 1, 307);
+    assert!(
+        app.session.video.as_ref().unwrap().player.volume() > 0.0,
+        "muting one message must not mute another"
+    );
+    let _ = app.update(Msg::Video(video::VideoMsg::Close));
+    video_note_player_open_bubble(&mut app, 0, 306);
+    assert_eq!(
+        app.session.video.as_ref().unwrap().player.volume(),
+        0.0,
+        "muted message must still be muted when reopened"
+    );
+    let _ = app.update(Msg::Video(video::VideoMsg::Close));
+
+    let _ = app.update(Msg::FlushSettings(app.session.settings_save_token));
+    let settings = Settings::load(&app.settings_path).unwrap();
+    let mut restarted = App::new(
+        0,
+        0,
+        String::new(),
+        settings,
+        app.settings_path.clone(),
+        WinId::unique(),
+    );
+    restarted.session.auth = Auth::Ready;
+    open(&mut restarted, 1, &[]);
+    new_message_value(
+        &mut restarted,
+        media_message(1, 10, video_note_player_note(306)),
+    );
+    video_note_player_open_bubble(&mut restarted, 0, 306);
+    assert_eq!(
+        restarted.session.video.as_ref().unwrap().player.volume(),
+        0.0,
+        "a settings reload must restore the video's muted volume"
+    );
+}
+
+/// Enter and leave through real iced cursor events around the pointer click.
+/// Reuse the widget cache across rebuilds so mouse_area remembers its hover state.
+fn video_note_player_pointer(app: &mut App, x: f32, y: f32) -> Vec<Msg> {
+    use iced_runtime::user_interface::{Cache, UserInterface};
+
+    let mut renderer = sandbox::renderer();
+    let size = iced::Size::new(1000.0, 700.0);
+    let point = iced::Point::new(x, y);
+    let mut cache = Cache::default();
+    let mut moved = Vec::new();
+    {
+        let mut ui = UserInterface::build(app.view(app.main_window), size, cache, &mut renderer);
+        let _ = ui.update(
+            &[iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                position: point,
+            })],
+            iced::mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut iced_runtime::core::clipboard::Null,
+            &mut moved,
+        );
+        cache = ui.into_cache();
+    }
+    for message in moved {
+        let _ = app.update(message);
+    }
+    let mut messages = Vec::new();
+    {
+        let mut ui = UserInterface::build(app.view(app.main_window), size, cache, &mut renderer);
+        for event in [
+            iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+            iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+        ] {
+            let _ = ui.update(
+                &[iced::Event::Mouse(event)],
+                iced::mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut iced_runtime::core::clipboard::Null,
+                &mut messages,
+            );
+        }
+        cache = ui.into_cache();
+    }
+    let outside = iced::Point::new(999.0, 699.0);
+    let mut exited = Vec::new();
+    {
+        let mut ui = UserInterface::build(app.view(app.main_window), size, cache, &mut renderer);
+        let _ = ui.update(
+            &[iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                position: outside,
+            })],
+            iced::mouse::Cursor::Available(outside),
+            &mut renderer,
+            &mut iced_runtime::core::clipboard::Null,
+            &mut exited,
+        );
+    }
+    for message in exited {
+        let _ = app.update(message);
+    }
+    messages
+}
+
+fn video_note_player_drag_volume(
+    app: &mut App,
+    range: std::ops::RangeInclusive<f32>,
+) -> (f32, Vec<Msg>) {
+    let (slider_x, slider_y) = [350_u32, 450, 550, 650, 750, 850]
+        .into_iter()
+        .find_map(|x| {
+            (100..695)
+                .step_by(4)
+                .find(|&y| {
+                    video_note_player_pointer(app, x as f32, y as f32)
+                        .iter()
+                        .any(|m| matches!(m, Msg::Video(video::VideoMsg::Volume(_))))
+                })
+                .map(|y| (x, y))
+        })
+        .expect("playing video's volume slider receives a real pointer press");
+    let (value, messages) = (slider_x.saturating_sub(150)..slider_x + 151)
+        .find_map(|x| {
+            let messages = video_note_player_pointer(app, x as f32, slider_y as f32);
+            let value = messages.iter().find_map(|m| match m {
+                Msg::Video(video::VideoMsg::Volume(v)) => Some(*v),
+                _ => None,
+            })?;
+            range.contains(&value).then_some((value, messages))
+        })
+        .expect("slider should offer a volume inside the selected range");
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m, Msg::Video(video::VideoMsg::VolumeReleased))),
+        "the real pointer release must commit the changed volume"
+    );
+    (value, messages)
+}
+
+#[test]
+fn video_note_player_slider_release_saves_its_own_nonzero_volume() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    for message_id in [10, 11] {
+        new_message_value(
+            &mut app,
+            media_message(1, message_id, video_note_player_note(306)),
+        );
+    }
+    video_note_player_open_bubble(&mut app, 0, 306);
+
+    let (value, messages) = video_note_player_drag_volume(&mut app, 0.3..=0.5);
+    for message in messages {
+        let _ = app.update(message);
+    }
+    let actual = app.session.video.as_ref().unwrap().player.volume();
+    assert!(
+        (actual - value).abs() <= 0.011,
+        "slider selected {value}, player plays at {actual}"
+    );
+    let _ = app.update(Msg::FlushSettings(app.session.settings_save_token));
+    let saved = Settings::load(&app.settings_path).unwrap();
+    let stored = saved
+        .accounts
+        .iter()
+        .find(|account| account.slot == app.session.slot)
+        .unwrap()
+        .video_volumes[&1][&10]
+        .volume;
+    assert!(
+        (stored - actual).abs() <= 0.011,
+        "settings saved {stored}, player plays at {actual}"
+    );
+
+    let _ = app.update(Msg::Video(video::VideoMsg::Close));
+    video_note_player_open_bubble(&mut app, 1, 306);
+    assert_eq!(app.session.video.as_ref().unwrap().player.volume(), 1.0);
+    let _ = app.update(Msg::Video(video::VideoMsg::Close));
+    video_note_player_open_bubble(&mut app, 0, 306);
+    let reopened = app.session.video.as_ref().unwrap().player.volume();
+    assert!(
+        (reopened - actual).abs() <= 0.011,
+        "reopened message plays at {reopened} instead of {actual}"
+    );
+}
+
+#[test]
+fn video_note_player_mute_restores_slider_volume_below_ten_percent() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, video_note_player_note(306)));
+    video_note_player_open_bubble(&mut app, 0, 306);
+    let (selected, events) = video_note_player_drag_volume(&mut app, 0.025..=0.035);
+    for event in events {
+        let _ = app.update(event);
+    }
+    let before = app.session.video.as_ref().unwrap().player.volume();
+    assert!(
+        (before - selected).abs() <= 0.011,
+        "slider selection {selected} plays at {before}"
+    );
+    let _ = app.update(Msg::Video(video::VideoMsg::ToggleMute));
+    assert_eq!(app.session.video.as_ref().unwrap().player.volume(), 0.0);
+    let _ = app.update(Msg::Video(video::VideoMsg::ToggleMute));
+    let restored = app.session.video.as_ref().unwrap().player.volume();
+    assert!(
+        (restored - before).abs() <= 0.001,
+        "unmuted at {restored}, slider had chosen {before}"
+    );
+}
+
+#[test]
+fn video_note_player_click_after_media_edit_plays_new_file() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, video_note_player_note(306)));
+    video_note_player_open_bubble(&mut app, 0, 306);
+    td(
+        &mut app,
+        json!({"@type": "updateMessageContent", "chat_id": 1, "message_id": 10,
+            "new_content": video_note_player_note(307)}),
+    );
+    assert!(
+        matches!(
+            pane(&app).messages[0].media,
+            Some(Media::Video { file_id: 307, .. })
+        ),
+        "the edited message must show its replacement media"
+    );
+    let pressed = (100..695)
+        .step_by(2)
+        .find_map(|y| {
+            video_note_player_pointer(&mut app, 400.0, y as f32)
+                .into_iter()
+                .find(|m| {
+                    matches!(
+                        m,
+                        Msg::Video(video::VideoMsg::Play(..) | video::VideoMsg::TogglePause)
+                    )
+                })
+        })
+        .expect("the replacement media must receive an iced pointer click");
+    assert!(
+        matches!(
+            pressed,
+            Msg::Video(video::VideoMsg::Play(_, 1, 10, 307, true))
+        ),
+        "clicking replacement media must launch its new file, not pause the stale player: {pressed:?}"
+    );
+    let _ = app.update(pressed);
+    assert_eq!(app.session.video.as_ref().unwrap().file_id, 307);
+}
+
+#[test]
+fn video_note_player_expand_control_opens_overlay_and_escape_returns_to_bubble() {
+    let mut app = app();
+    let window = app.main_window;
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, video_note_player_note(306)));
+    video_note_player_open_bubble(&mut app, 0, 306);
+
+    let (control_x, control_y, pressed) = (100..695)
+        .step_by(4)
+        .find_map(|y| {
+            (320..900).step_by(8).find_map(|x| {
+                video_note_player_pointer(&mut app, x as f32, y as f32)
+                    .into_iter()
+                    .find(|m| matches!(m, Msg::Video(video::VideoMsg::ToggleExpanded)))
+                    .map(|pressed| (x, y, pressed))
+            })
+        })
+        .expect("playing video's expand control must receive an iced pointer click");
+    let _ = app.update(pressed);
+    assert!(app.session.video.as_ref().unwrap().expanded);
+    assert!(
+        app.view_video_overlay(window).is_some(),
+        "expanded video fills the window overlay"
+    );
+    let close = video_note_player_pointer(&mut app, 974.0, 27.0);
+    assert!(
+        close
+            .iter()
+            .any(|m| matches!(m, Msg::Video(video::VideoMsg::ToggleExpanded))),
+        "the overlay's close button returns to the bubble: {close:?}"
+    );
+    for message in close {
+        let _ = app.update(message);
+    }
+    assert!(!app.session.video.as_ref().unwrap().expanded);
+    let reopened = video_note_player_pointer(&mut app, control_x as f32, control_y as f32);
+    assert!(
+        reopened
+            .iter()
+            .any(|m| matches!(m, Msg::Video(video::VideoMsg::ToggleExpanded)))
+    );
+    for message in reopened {
+        let _ = app.update(message);
+    }
+    assert!(app.session.video.as_ref().unwrap().expanded);
+
+    let _ = app.update(Msg::Key(
+        window,
+        keyboard::Key::Named(keyboard::key::Named::Escape),
+        keyboard::Modifiers::empty(),
+    ));
+    assert!(!app.session.video.as_ref().unwrap().expanded);
+    assert!(
+        app.view_video_overlay(window).is_none(),
+        "Escape returns video to the message bubble"
+    );
+    assert_eq!(app.session.video.as_ref().unwrap().file_id, 306);
 }
 
 #[test]
@@ -2253,6 +3604,390 @@ fn switching_keeps_accounts_and_log_out_moves_to_another() {
     assert_eq!(
         Settings::load(&app.settings_path).unwrap().active_account,
         0
+    );
+}
+
+/// Count pixels in the inactive account's portrait area in the popup. The
+/// synthetic photo is saturated magenta; initials and the menu are not.
+fn inactive_account_portrait_pixels(app: &mut App) -> usize {
+    let window = app.main_window;
+    let size = iced::Size::new(800.0, 500.0);
+    let pixels = sandbox::run_frames(app, window, size, 4, &mut sandbox::renderer());
+    (105..165)
+        .flat_map(|y| (12..68).map(move |x| (y * 800 + x) * 4))
+        .filter(|&offset| {
+            let rgba = &pixels[offset..offset + 4];
+            rgba[0] > 180 && rgba[1] < 90 && rgba[2] > 120
+        })
+        .count()
+}
+
+/// Count magenta pixels only in the popup's top, active-account portrait.
+/// The inactive account rows are below this region.
+fn active_account_portrait_pixels(app: &mut App) -> usize {
+    let window = app.main_window;
+    let size = iced::Size::new(800.0, 500.0);
+    let pixels = sandbox::run_frames(app, window, size, 4, &mut sandbox::renderer());
+    (56..91)
+        .flat_map(|y| (20..55).map(move |x| (y * 800 + x) * 4))
+        .filter(|&offset| {
+            let rgba = &pixels[offset..offset + 4];
+            rgba[0] > 180 && rgba[1] < 90 && rgba[2] > 120
+        })
+        .count()
+}
+
+/// Count synthetic-photo pixels in the always-visible top-left header avatar,
+/// above the account popup (which begins below this crop).
+fn header_account_portrait_pixels(app: &mut App) -> usize {
+    assert!(
+        !app.session.accounts_open,
+        "measure the header without a popup"
+    );
+    let window = app.main_window;
+    let size = iced::Size::new(800.0, 500.0);
+    let pixels = sandbox::run_frames(app, window, size, 4, &mut sandbox::renderer());
+    (2..34)
+        .flat_map(|y| (5..36).map(move |x| (y * 800 + x) * 4))
+        .filter(|&offset| {
+            let rgba = &pixels[offset..offset + 4];
+            rgba[0] > 180 && rgba[1] < 90 && rgba[2] > 120
+        })
+        .count()
+}
+
+/// Simulate the new TDLib client without starting TDLib or changing the
+/// settings path, exactly as a completed account switch does.
+fn inactive_account_portrait_switch(app: &mut App, slot: u32, user_id: i64) {
+    let _ = app.switch_account(slot);
+    assert_eq!(app.after_close(), slot);
+    app.session = Session::new(0, app.main_window, slot);
+    app.session.auth = Auth::Ready;
+    app.session.my_id = Some(user_id);
+}
+
+/// Two logged-in accounts with the owner's inactive row initially showing
+/// initials. Return to the owner so tests can exercise a fresh photo update.
+fn inactive_account_portrait_fixture() -> (App, usize) {
+    let mut app = app();
+    app.session.my_id = Some(1000);
+    app.settings.accounts = vec![
+        Account {
+            slot: 0,
+            user_id: Some(1000),
+            name: "Magenta Owner".into(),
+            ..Default::default()
+        },
+        Account {
+            slot: 3,
+            user_id: Some(2000),
+            name: "Other Account".into(),
+            ..Default::default()
+        },
+    ];
+    inactive_account_portrait_switch(&mut app, 3, 2000);
+    let _ = app.update(Msg::ToggleAccounts);
+    let initials = inactive_account_portrait_pixels(&mut app);
+    inactive_account_portrait_switch(&mut app, 0, 1000);
+    (app, initials)
+}
+
+/// A redraw while preserving the sensor's widget state across TDLib updates.
+fn inactive_account_portrait_sensor_frame(
+    app: &mut App,
+    cache: iced_runtime::user_interface::Cache,
+    renderer: &mut iced::Renderer,
+) -> (iced_runtime::user_interface::Cache, bool) {
+    use iced_runtime::user_interface::UserInterface;
+
+    let size = iced::Size::new(800.0, 500.0);
+    let mut ui = UserInterface::build(app.view(app.main_window), size, cache, renderer);
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[iced::Event::Window(iced::window::Event::RedrawRequested(
+            std::time::Instant::now(),
+        ))],
+        iced::mouse::Cursor::Unavailable,
+        renderer,
+        &mut iced_runtime::core::clipboard::Null,
+        &mut messages,
+    );
+    let theme = app.theme(app.main_window).unwrap_or(iced::Theme::Dark);
+    ui.draw(
+        renderer,
+        &theme,
+        &iced_runtime::core::renderer::Style {
+            text_color: theme.palette().text,
+        },
+        iced::mouse::Cursor::Unavailable,
+    );
+    let cache = ui.into_cache();
+    let own_shown = messages
+        .iter()
+        .any(|message| matches!(message, Msg::AvatarShown(avatars::Peer::User(1000))));
+    for message in messages {
+        let _ = app.update(message);
+    }
+    (cache, own_shown)
+}
+
+#[test]
+fn inactive_account_portrait_loads_when_photo_file_arrives_after_first_show() {
+    let _shared = shared_cache();
+    let (mut app, initials) = inactive_account_portrait_fixture();
+    let mut renderer = sandbox::renderer();
+    let mut cache = iced_runtime::user_interface::Cache::default();
+    let mut own_shown = false;
+    for _ in 0..4 {
+        let (next, shown) = inactive_account_portrait_sensor_frame(&mut app, cache, &mut renderer);
+        cache = next;
+        own_shown |= shown;
+    }
+    assert!(
+        own_shown,
+        "the owner's visible avatar sensor ran before its file was known"
+    );
+
+    // Supply real image bytes in a local file without marking the owner's
+    // photo decoded. A separate sandbox app only generates the source PNG.
+    let mut source = self::app();
+    sandbox::photo(
+        &mut source,
+        avatars::Peer::User(9000),
+        9912,
+        [250, 20, 180],
+        [210, 50, 155],
+    );
+    let path = source.session.files[&9912].path.clone();
+    td(
+        &mut app,
+        user_with_photo(1000, file(9912, 1000, 1000, true, &path)),
+    );
+    for _ in 0..4 {
+        (cache, _) = inactive_account_portrait_sensor_frame(&mut app, cache, &mut renderer);
+    }
+    let scheduled = app.session.avatars.decoding.contains(&9912);
+    assert!(
+        scheduled || app.account_portraits.contains_key(&0),
+        "a visible owner's late local photo must schedule decoding or show a real portrait"
+    );
+    if scheduled {
+        let decoded = avatars::decode_cached(&path);
+        let client_id = app.session.client_id;
+        let _ = app.update(Msg::AvatarDecoded(client_id, 9912, decoded));
+    }
+    inactive_account_portrait_switch(&mut app, 3, 2000);
+    let _ = app.update(Msg::ToggleAccounts);
+    let shown = inactive_account_portrait_pixels(&mut app);
+    assert!(
+        shown > initials + 80,
+        "inactive account must render the late photo: before={initials}, after={shown}"
+    );
+}
+
+#[test]
+fn inactive_account_portrait_clears_removed_photo_before_my_id_on_restart() {
+    let _shared = shared_cache();
+    let (mut app, initials) = inactive_account_portrait_fixture();
+    sandbox::photo(
+        &mut app,
+        avatars::Peer::User(1000),
+        9913,
+        [250, 20, 180],
+        [210, 50, 155],
+    );
+    let settings = Settings::load(&app.settings_path).expect("saved portrait digest");
+    let mut restarted = App::new(
+        0,
+        0,
+        String::new(),
+        settings,
+        app.settings_path.clone(),
+        WinId::unique(),
+    );
+    restarted.session.auth = Auth::Ready;
+    restarted.session.archive = Some(Archive::in_memory());
+    assert_eq!(restarted.session.my_id, None);
+    assert!(
+        restarted.account_portraits.contains_key(&0),
+        "restart must preload the previously cached own portrait"
+    );
+
+    let mut removed = user_with_photo(1000, file(9913, 0, 0, false, ""));
+    removed["user"]["profile_photo"] = Value::Null;
+    td(&mut restarted, removed);
+    td(
+        &mut restarted,
+        json!({"@type": "updateOption", "name": "my_id",
+               "value": {"@type": "optionValueInteger", "value": "1000"}}),
+    );
+    inactive_account_portrait_switch(&mut restarted, 3, 2000);
+    let _ = restarted.update(Msg::ToggleAccounts);
+    let shown = inactive_account_portrait_pixels(&mut restarted);
+    assert!(
+        shown <= initials + 20,
+        "photo removed before my_id must not show stale portrait: before={initials}, after={shown}"
+    );
+}
+
+#[test]
+fn inactive_account_portrait_survives_switch_restart_and_removal() {
+    let _shared = shared_cache();
+    let mut app = app();
+    app.session.my_id = Some(1000);
+    app.settings.accounts = vec![
+        Account {
+            slot: 0,
+            user_id: Some(1000),
+            name: "Magenta Owner".into(),
+            ..Default::default()
+        },
+        Account {
+            slot: 3,
+            user_id: Some(2000),
+            name: "Other Account".into(),
+            ..Default::default()
+        },
+    ];
+
+    inactive_account_portrait_switch(&mut app, 3, 2000);
+    let _ = app.update(Msg::ToggleAccounts);
+    let initials = inactive_account_portrait_pixels(&mut app);
+    inactive_account_portrait_switch(&mut app, 0, 1000);
+    sandbox::photo(
+        &mut app,
+        avatars::Peer::User(1000),
+        9911,
+        [250, 20, 180],
+        [210, 50, 155],
+    );
+    inactive_account_portrait_switch(&mut app, 3, 2000);
+    let _ = app.update(Msg::ToggleAccounts);
+    let switched = inactive_account_portrait_pixels(&mut app);
+    assert!(
+        switched > initials + 80,
+        "inactive account must show its photo after switching: before={initials}, after={switched}"
+    );
+
+    let settings = Settings::load(&app.settings_path).expect("saved account settings");
+    let mut restarted = App::new(
+        0,
+        0,
+        String::new(),
+        settings,
+        app.settings_path.clone(),
+        WinId::unique(),
+    );
+    restarted.session.auth = Auth::Ready;
+    restarted.session.my_id = Some(2000);
+    let _ = restarted.update(Msg::ToggleAccounts);
+    let restored = inactive_account_portrait_pixels(&mut restarted);
+    assert!(
+        restored > initials + 80,
+        "inactive photo must survive app restart: before={initials}, after={restored}"
+    );
+
+    inactive_account_portrait_switch(&mut restarted, 0, 1000);
+    let _ = restarted.set_avatar(avatars::Peer::User(1000), None);
+    inactive_account_portrait_switch(&mut restarted, 3, 2000);
+    let _ = restarted.update(Msg::ToggleAccounts);
+    let removed = inactive_account_portrait_pixels(&mut restarted);
+    assert!(
+        removed <= initials + 20,
+        "removed own photo must fall back to initials: before={initials}, after={removed}"
+    );
+}
+
+#[test]
+fn active_account_portrait_cached_after_switch_or_restart() {
+    let _shared = shared_cache();
+    let (mut app, _) = inactive_account_portrait_fixture();
+    let _ = app.update(Msg::ToggleAccounts);
+    let initials = active_account_portrait_pixels(&mut app);
+
+    sandbox::photo(
+        &mut app,
+        avatars::Peer::User(1000),
+        9914,
+        [250, 20, 180],
+        [210, 50, 155],
+    );
+    let photographed = active_account_portrait_pixels(&mut app);
+    assert!(
+        photographed > initials + 80,
+        "the active account's generated photo must be visible before switching: initials={initials}, photographed={photographed}"
+    );
+
+    inactive_account_portrait_switch(&mut app, 3, 2000);
+    inactive_account_portrait_switch(&mut app, 0, 1000);
+    assert!(
+        app.session.files.is_empty(),
+        "the new session has no Telegram photo file to rediscover"
+    );
+    let _ = app.update(Msg::ToggleAccounts);
+    let restored = active_account_portrait_pixels(&mut app);
+    assert!(
+        restored > initials + 80,
+        "the active account's cached photo must survive a switch to a new session without its file: initials={initials}, restored={restored}"
+    );
+}
+
+/// The same saved owner and magenta photo as the active-account popup test,
+/// but measure only the header before and after the photo is introduced.
+fn header_account_portrait_photo_fixture() -> (App, usize) {
+    let (mut app, _) = inactive_account_portrait_fixture();
+    let initials = header_account_portrait_pixels(&mut app);
+    sandbox::photo(
+        &mut app,
+        avatars::Peer::User(1000),
+        9915,
+        [250, 20, 180],
+        [210, 50, 155],
+    );
+    let photographed = header_account_portrait_pixels(&mut app);
+    assert!(
+        photographed > initials + 80,
+        "the header must show the source photo before switching: initials={initials}, photographed={photographed}"
+    );
+    (app, initials)
+}
+
+#[test]
+fn header_account_portrait_cached_before_my_id_after_switch() {
+    let _shared = shared_cache();
+    let (mut app, initials) = header_account_portrait_photo_fixture();
+    inactive_account_portrait_switch(&mut app, 3, 2000);
+    inactive_account_portrait_switch(&mut app, 0, 1000);
+    app.session.my_id = None;
+    assert_eq!(app.settings.accounts[0].user_id, Some(1000));
+    let restored = header_account_portrait_pixels(&mut app);
+    assert!(
+        restored > initials + 80,
+        "the header must show the cached photo before my_id arrives after switching: initials={initials}, restored={restored}"
+    );
+}
+
+#[test]
+fn header_account_portrait_cached_before_my_id_after_restart() {
+    let _shared = shared_cache();
+    let (app, initials) = header_account_portrait_photo_fixture();
+    let settings = Settings::load(&app.settings_path).expect("saved account settings");
+    assert_eq!(settings.accounts[0].user_id, Some(1000));
+    let mut restarted = App::new(
+        0,
+        0,
+        String::new(),
+        settings,
+        app.settings_path.clone(),
+        WinId::unique(),
+    );
+    restarted.session.auth = Auth::Ready;
+    restarted.session.archive = Some(Archive::in_memory());
+    assert_eq!(restarted.session.my_id, None);
+    let restored = header_account_portrait_pixels(&mut restarted);
+    assert!(
+        restored > initials + 80,
+        "the header must show the cached photo before my_id arrives after restart: initials={initials}, restored={restored}"
     );
 }
 
@@ -3184,7 +4919,7 @@ fn empty_archive_moves_between_sidebar_and_menu_without_changing_chat_lists() {
     assert!(app.session.archived.is_empty() && app.session.order.is_empty());
     let _ = app.update(Msg::ShowArchive(main, false));
     let _ = app.update(Msg::ToggleAccounts);
-    let open = sandbox::click(&mut app, main, iced::Point::new(70.0, 85.0));
+    let open = sandbox::click(&mut app, main, iced::Point::new(70.0, 132.0));
     assert!(
         open.iter()
             .any(|m| matches!(m, Msg::OpenArchiveFromMenu(c) if *c == client))
@@ -3201,7 +4936,7 @@ fn empty_archive_moves_between_sidebar_and_menu_without_changing_chat_lists() {
         )
     );
     let _ = app.update(Msg::ToggleAccounts);
-    let restore = sandbox::click(&mut app, main, iced::Point::new(70.0, 115.0));
+    let restore = sandbox::click(&mut app, main, iced::Point::new(70.0, 164.0));
     assert!(
         restore.iter().any(
             |m| matches!(m, Msg::SetArchiveCollapsed(w, c, false) if *w == main && *c == client)
@@ -3573,12 +5308,12 @@ fn main_settings_take_precedence_and_close_archive_panel_on_entry() {
         Ok(true),
     );
     app.session.settings_open = true;
-    let messages = sandbox::click(&mut app, window, iced::Point::new(945.0, 25.0));
+    let messages = sandbox::click(&mut app, window, iced::Point::new(945.0, 65.0));
     assert!(messages.iter().any(|msg| matches!(msg, Msg::CloseSettings)));
     assert!(!app.session.settings_open);
     assert!(pane(&app).list.archive_settings.is_some());
 
-    let messages = sandbox::click(&mut app, window, iced::Point::new(190.0, 20.0));
+    let messages = sandbox::click(&mut app, window, iced::Point::new(60.0, 20.0));
     assert!(messages.iter().any(|msg| matches!(msg, Msg::OpenSettings)));
     assert!(app.session.settings_open);
     assert!(pane(&app).list.archive_settings.is_none());
@@ -4232,17 +5967,34 @@ fn archive_panel_belongs_to_the_window_when_tabs_switch() {
             .as_ref(),
         Some(&values)
     );
+    assert_eq!(active(&app), Some(2));
+    app.session.accounts_open = true;
+    app.session.confirm_logout = true;
     let _ = app.update(Msg::SelectTab(1));
-    assert_eq!(
-        pane(&app)
-            .list
-            .archive_settings
-            .as_ref()
-            .unwrap()
-            .settings
-            .as_ref(),
-        Some(&values)
-    );
+    assert_eq!(active(&app), Some(1));
+    assert!(pane(&app).list.archive);
+    assert!(pane(&app).list.archive_settings.is_none());
+    assert!(!app.session.accounts_open && !app.session.confirm_logout);
+
+    // The sidebar remains in archive mode and the panel can be reopened.
+    let _ = app.update(Msg::ToggleArchiveSettings(window, true));
+    assert!(pane(&app).list.archive_settings.is_some());
+    app.session.settings_open = true;
+    app.session.accounts_open = true;
+    app.session.confirm_logout = true;
+    let _ = app.update(Msg::SelectTab(1));
+    assert_eq!(active(&app), Some(1));
+    assert!(!app.session.settings_open);
+    assert!(!app.session.accounts_open && !app.session.confirm_logout);
+    assert!(pane(&app).list.archive);
+    assert!(pane(&app).list.archive_settings.is_none());
+
+    let _ = app.update(Msg::OpenSettings);
+    assert!(app.session.settings_open);
+    let _ = app.update(Msg::SelectTab(2));
+    assert_eq!(active(&app), Some(2));
+    assert!(!app.session.settings_open);
+    assert!(pane(&app).list.archive);
 }
 
 #[test]
@@ -5878,6 +7630,7 @@ fn locked_account_waits_for_the_password_and_keys_follow_changes() {
         name: "Alice".into(),
         lock_salt: Some(salt.clone()),
         lock_check: Some(crate::lock::check_value(&key)),
+        ..Default::default()
     }];
     td(
         &mut app,
@@ -6387,5 +8140,436 @@ fn reply_previews_follow_edits_and_deletions() {
     assert!(
         app.session.reply_previews[&(1, 1)].deleted,
         "a foreign deletion marks the cached preview deleted, like the pane"
+    );
+}
+
+// Screenshot comparisons below deliberately hold the chat title, avatar and
+// message fixed: only TDLib's user type (or the cursor) changes.
+const UI_HOVER_AND_BOT_SIZE: iced::Size = iced::Size::new(1000.0, 700.0);
+
+fn ui_hover_and_bot_frame(app: &mut App) -> Vec<u8> {
+    sandbox::run_frames(
+        app,
+        app.main_window,
+        UI_HOVER_AND_BOT_SIZE,
+        3,
+        &mut sandbox::renderer(),
+    )
+}
+
+fn ui_hover_and_bot_changed(a: &[u8], b: &[u8], rect: (usize, usize, usize, usize)) -> usize {
+    assert_eq!(a.len(), b.len());
+    let (left, top, right, bottom) = rect;
+    assert!(left < right && right <= 1000 && top < bottom && bottom <= 700);
+    (top..bottom)
+        .flat_map(|y| (left..right).map(move |x| (y * 1000 + x) * 4))
+        .filter(|&i| a[i..i + 4] != b[i..i + 4])
+        .count()
+}
+
+fn ui_hover_and_bot_user(app: &mut App, id: i64, bot: bool) {
+    let mut update = user_with_photo(id, Value::Null);
+    update["user"]["profile_photo"] = Value::Null;
+    if bot {
+        update["user"]["type"] =
+            serde_json::to_value(tdlib_rs::enums::UserType::Bot(Default::default())).unwrap();
+    }
+    td(app, update);
+}
+
+fn ui_hover_and_bot_private_chat(app: &mut App, user_id: i64) {
+    let mut chat = chat_item("Тест", true);
+    chat.kind = Some(
+        serde_json::from_value(json!({"@type": "chatTypePrivate", "user_id": user_id})).unwrap(),
+    );
+    app.session.chats.insert(1, chat);
+    app.set_order(1, 100);
+    app.set_archive_order(1, 100);
+    app.session
+        .chats
+        .get_mut(&1)
+        .unwrap()
+        .folders
+        .push((3, 100));
+    app.session
+        .folder_lists
+        .entry(3)
+        .or_default()
+        .insert((std::cmp::Reverse(100), 1));
+    let _ = app.update(Msg::Pane(app.main_window, PaneMsg::SelectChat(1)));
+    open(app, 1, &[]);
+}
+
+#[test]
+#[ignore = "writes a bot chat screenshot; run explicitly"]
+fn sandbox_bot_badge() {
+    let mut app = app();
+    ui_hover_and_bot_user(&mut app, 42, true);
+    ui_hover_and_bot_private_chat(&mut app, 42);
+    let pixels = ui_hover_and_bot_frame(&mut app);
+    println!(
+        "{}",
+        sandbox::save("bot-badge", UI_HOVER_AND_BOT_SIZE, pixels).display()
+    );
+}
+
+#[test]
+fn ui_hover_and_bot_private_badge_appears_in_lists_tabs_header_and_profile_then_clears() {
+    let mut app = app();
+    td(&mut app, folders_update(&[(3, "Работа")]));
+    // User information may precede the chat; the same user is updated again
+    // after the chat has been opened.
+    ui_hover_and_bot_user(&mut app, 42, false);
+    ui_hover_and_bot_private_chat(&mut app, 42);
+    assert_eq!(
+        app.visible_tabs(),
+        [1],
+        "opened chat must have a visible tab"
+    );
+    let window = app.main_window;
+    let _ = app.update(Msg::ToggleProfile(window));
+    let _ = app.update(Msg::ProfileLoaded(window, 1, Ok(td::Profile::default())));
+
+    // Isolate the title regions; the avatar and the rest of the application
+    // cannot stand in for visible text beside the title.
+    let surfaces = [
+        ("main list", None, false, (54, 93, 295, 260)),
+        ("archive list", None, true, (54, 93, 295, 340)),
+        ("folder list", Some(3), false, (54, 93, 295, 260)),
+        ("search list", None, false, (54, 93, 295, 260)),
+    ];
+    for (name, folder, archive, crop) in surfaces {
+        let _ = app.update(Msg::ShowArchive(window, archive));
+        if !archive {
+            let _ = app.update(Msg::ShowFolder(window, folder));
+        }
+        if name == "search list" {
+            let _ = app.update(Msg::ListQuery(window, "Тест".into()));
+            let _ = app.update(Msg::ListChats(window, "Тест".into(), Ok(vec![1])));
+        }
+        assert!(
+            app.displayed_chat_ids(window).unwrap().contains(&1),
+            "{name} must actually show the private chat"
+        );
+        let regular = ui_hover_and_bot_frame(&mut app);
+        // A different title proves the screenshot crop really contains the
+        // row (the bot update below does not alter this title or avatar).
+        app.session.chats.get_mut(&1).unwrap().title = "Иное имя".into();
+        let renamed = ui_hover_and_bot_frame(&mut app);
+        app.session.chats.get_mut(&1).unwrap().title = "Тест".into();
+        assert!(
+            ui_hover_and_bot_changed(&regular, &renamed, crop) > 12,
+            "{name}: screenshot crop must include the chat title"
+        );
+        ui_hover_and_bot_user(&mut app, 42, true);
+        let bot = ui_hover_and_bot_frame(&mut app);
+        ui_hover_and_bot_user(&mut app, 42, false);
+        let cleared = ui_hover_and_bot_frame(&mut app);
+        assert_eq!(
+            ui_hover_and_bot_changed(&regular, &cleared, crop),
+            0,
+            "{name}: regular title must return after Bot → regular"
+        );
+        assert!(
+            ui_hover_and_bot_changed(&regular, &bot, crop) > 12,
+            "{name}: Bot must be visible next to the unchanged title"
+        );
+        if name == "main list" {
+            for (surface, crop) in [
+                ("tab", (125, 3, 340, 34)),
+                ("chat header", (340, 43, 610, 106)),
+                ("profile title", (690, 74, 995, 300)),
+            ] {
+                assert!(
+                    ui_hover_and_bot_changed(&regular, &renamed, crop) > 12,
+                    "{surface}: screenshot crop must include the chat title"
+                );
+                assert_eq!(
+                    ui_hover_and_bot_changed(&regular, &cleared, crop),
+                    0,
+                    "{surface}: stale Bot label must disappear"
+                );
+                assert!(
+                    ui_hover_and_bot_changed(&regular, &bot, crop) > 12,
+                    "{surface}: Bot must be visible next to the unchanged title"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ui_hover_and_bot_compact_list_keeps_bot_visible_with_long_name_mute_and_unread() {
+    let mut app = app();
+    let window = WinId::unique();
+    app.session.panes.insert(window, ChatPane::default());
+    let long_name = "Очень длинное имя бота для узкого списка чатов";
+    ui_hover_and_bot_user(&mut app, 42, false);
+    ui_hover_and_bot_private_chat(&mut app, 42);
+    let chat = app.session.chats.get_mut(&1).unwrap();
+    chat.title = long_name.into();
+    chat.unread = 12;
+    chat.notify.mute_for = i32::MAX;
+    assert!(app.displayed_chat_ids(window).unwrap().contains(&1));
+    assert!(app.session.chats[&1].muted());
+
+    let frame = |app: &mut App| {
+        sandbox::run_frames(
+            app,
+            window,
+            UI_HOVER_AND_BOT_SIZE,
+            3,
+            &mut sandbox::renderer(),
+        )
+    };
+    let regular = frame(&mut app);
+    app.session.chats.get_mut(&1).unwrap().title = "Иное имя".into();
+    let renamed = frame(&mut app);
+    app.session.chats.get_mut(&1).unwrap().title = long_name.into();
+    let row = (35, 55, 215, 150);
+    assert!(
+        ui_hover_and_bot_changed(&regular, &renamed, row) > 12,
+        "compact list screenshot must include the chat title"
+    );
+    ui_hover_and_bot_user(&mut app, 42, true);
+    let bot = frame(&mut app);
+    assert!(
+        ui_hover_and_bot_changed(&regular, &bot, row) > 12,
+        "Bot must remain visible beside a truncated name in the 220px panel with mute and unread"
+    );
+}
+
+#[test]
+fn ui_hover_and_bot_group_sender_shows_bot_beside_the_same_name_only_for_bots() {
+    let mut app = app();
+    app.session.chats.insert(1, chat_item("Группа", false));
+    ui_hover_and_bot_user(&mut app, 7, false);
+    open(&mut app, 1, &[(10, "постоянное сообщение")]);
+    let regular = ui_hover_and_bot_frame(&mut app);
+    let mut renamed_update = user_with_photo(7, Value::Null);
+    renamed_update["user"]["profile_photo"] = Value::Null;
+    renamed_update["user"]["first_name"] = json!("Другое имя");
+    td(&mut app, renamed_update);
+    let renamed = ui_hover_and_bot_frame(&mut app);
+    ui_hover_and_bot_user(&mut app, 7, false);
+    assert!(
+        ui_hover_and_bot_changed(&regular, &renamed, (320, 98, 600, 672)) > 12,
+        "sender screenshot crop must contain the displayed user"
+    );
+    ui_hover_and_bot_user(&mut app, 7, true);
+    let bot = ui_hover_and_bot_frame(&mut app);
+    ui_hover_and_bot_user(&mut app, 7, false);
+    let cleared = ui_hover_and_bot_frame(&mut app);
+    let sender = (320, 98, 600, 672);
+    assert_eq!(
+        ui_hover_and_bot_changed(&regular, &cleared, sender),
+        0,
+        "the original sender name must be restored"
+    );
+    assert!(
+        ui_hover_and_bot_changed(&regular, &bot, sender) > 12,
+        "Bot must be visible next to the unchanged group sender name"
+    );
+}
+
+#[test]
+fn ui_hover_and_bot_user_card_shows_bot_beside_the_same_name_only_for_bots() {
+    let mut app = app();
+    ui_hover_and_bot_user(&mut app, 42, false);
+    let _ = app.update(Msg::Card(super::card::CardMsg::Open(app.main_window, 42)));
+    let regular = ui_hover_and_bot_frame(&mut app);
+    let mut renamed_update = user_with_photo(42, Value::Null);
+    renamed_update["user"]["profile_photo"] = Value::Null;
+    renamed_update["user"]["first_name"] = json!("Другое имя");
+    td(&mut app, renamed_update);
+    let renamed = ui_hover_and_bot_frame(&mut app);
+    ui_hover_and_bot_user(&mut app, 42, false);
+    let title = (475, 142, 590, 194);
+    assert!(
+        ui_hover_and_bot_changed(&regular, &renamed, title) > 12,
+        "user card crop must include the person's rendered name"
+    );
+    ui_hover_and_bot_user(&mut app, 42, true);
+    let bot = ui_hover_and_bot_frame(&mut app);
+    ui_hover_and_bot_user(&mut app, 42, false);
+    let cleared = ui_hover_and_bot_frame(&mut app);
+    assert_eq!(
+        ui_hover_and_bot_changed(&regular, &cleared, title),
+        0,
+        "user card must clear the badge when the person stops being a bot"
+    );
+    assert!(
+        ui_hover_and_bot_changed(&regular, &bot, title) > 12,
+        "Bot must appear next to the unchanged name in the user card"
+    );
+}
+
+/// Keep one iced widget tree between cursor moves: mouse_area remembers
+/// whether it was inside the note, which is needed for a genuine exit.
+fn ui_hover_and_bot_pointer_frame(
+    app: &mut App,
+    cache: iced_runtime::user_interface::Cache,
+    renderer: &mut iced::Renderer,
+    point: iced::Point,
+) -> (iced_runtime::user_interface::Cache, Vec<u8>) {
+    use iced_runtime::core::renderer::{Headless, Style};
+    use iced_runtime::user_interface::UserInterface;
+
+    let mut messages = Vec::new();
+    let mut ui = UserInterface::build(
+        app.view(app.main_window),
+        UI_HOVER_AND_BOT_SIZE,
+        cache,
+        renderer,
+    );
+    let _ = ui.update(
+        &[iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: point,
+        })],
+        iced::mouse::Cursor::Available(point),
+        renderer,
+        &mut iced_runtime::core::clipboard::Null,
+        &mut messages,
+    );
+    let cache = ui.into_cache();
+    for message in messages {
+        let _ = app.update(message);
+    }
+    // The redraw after update is what the user actually sees, not the
+    // pre-update tree that produced the on_enter/on_exit message.
+    let theme = iced::Theme::Dark;
+    let mut ui = UserInterface::build(
+        app.view(app.main_window),
+        UI_HOVER_AND_BOT_SIZE,
+        cache,
+        renderer,
+    );
+    let mut redraw_messages = Vec::new();
+    let _ = ui.update(
+        &[iced::Event::Window(iced::window::Event::RedrawRequested(
+            std::time::Instant::now(),
+        ))],
+        iced::mouse::Cursor::Available(point),
+        renderer,
+        &mut iced_runtime::core::clipboard::Null,
+        &mut redraw_messages,
+    );
+    ui.draw(
+        renderer,
+        &theme,
+        &Style {
+            text_color: theme.palette().text,
+        },
+        iced::mouse::Cursor::Available(point),
+    );
+    let pixels = renderer.screenshot(iced::Size::new(1000, 700), 1.0, theme.palette().background);
+    let cache = ui.into_cache();
+    for message in redraw_messages {
+        let _ = app.update(message);
+    }
+    (cache, pixels)
+}
+
+#[test]
+fn ui_hover_and_bot_round_note_controls_only_cover_the_circle_while_hovered() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, video_note_player_note(306)));
+    video_note_player_open_bubble(&mut app, 0, 306);
+
+    // Locate the rendered note through its real clickable picture, not an
+    // assumed scroll offset. The controls occupy its lower ~80 pixels.
+    let first_y = (100..610)
+        .step_by(2)
+        .find(|&y| {
+            video_note_player_pointer(&mut app, 400.0, y as f32)
+                .iter()
+                .any(|msg| matches!(msg, Msg::Video(video::VideoMsg::TogglePause)))
+        })
+        .expect("round note picture receives a real pointer press");
+    let rect = (340, first_y + 125, 520, (first_y + 218).min(695));
+    let mut renderer = sandbox::renderer();
+    let (cache, outside) = ui_hover_and_bot_pointer_frame(
+        &mut app,
+        Default::default(),
+        &mut renderer,
+        iced::Point::new(900.0, 650.0),
+    );
+    let (cache, hovering) = ui_hover_and_bot_pointer_frame(
+        &mut app,
+        cache,
+        &mut renderer,
+        iced::Point::new(400.0, (first_y + 60) as f32),
+    );
+    let (_, after_exit) = ui_hover_and_bot_pointer_frame(
+        &mut app,
+        cache,
+        &mut renderer,
+        iced::Point::new(900.0, 650.0),
+    );
+    assert_eq!(
+        ui_hover_and_bot_changed(&outside, &after_exit, rect),
+        0,
+        "round note controls must disappear once the cursor leaves"
+    );
+    assert!(
+        ui_hover_and_bot_changed(&outside, &hovering, rect) > 12,
+        "round note controls must appear over the video while the cursor is inside it"
+    );
+}
+
+#[test]
+fn ui_hover_and_bot_round_note_corner_does_not_show_controls() {
+    let mut app = app();
+    open(&mut app, 1, &[]);
+    new_message_value(&mut app, media_message(1, 10, video_note_player_note(306)));
+    video_note_player_open_bubble(&mut app, 0, 306);
+
+    let first_y = (100..610)
+        .step_by(2)
+        .find(|&y| {
+            video_note_player_pointer(&mut app, 400.0, y as f32)
+                .iter()
+                .any(|msg| matches!(msg, Msg::Video(video::VideoMsg::TogglePause)))
+        })
+        .expect("round note picture receives a real pointer press");
+    // Find the left edge at the note's vertical center, where even a
+    // circular hit target spans its full diameter.
+    let left_x = (200..=400)
+        .step_by(2)
+        .find(|&x| {
+            video_note_player_pointer(&mut app, x as f32, (first_y + 110) as f32)
+                .iter()
+                .any(|msg| matches!(msg, Msg::Video(video::VideoMsg::TogglePause)))
+        })
+        .expect("round note center receives a real pointer press");
+    let rect = (340, first_y + 125, 520, (first_y + 218).min(695));
+    let mut renderer = sandbox::renderer();
+    let (cache, outside) = ui_hover_and_bot_pointer_frame(
+        &mut app,
+        Default::default(),
+        &mut renderer,
+        iced::Point::new(900.0, 650.0),
+    );
+    let (cache, corner) = ui_hover_and_bot_pointer_frame(
+        &mut app,
+        cache,
+        &mut renderer,
+        iced::Point::new((left_x + 5) as f32, (first_y + 5) as f32),
+    );
+    let (_, inside) = ui_hover_and_bot_pointer_frame(
+        &mut app,
+        cache,
+        &mut renderer,
+        iced::Point::new(400.0, (first_y + 60) as f32),
+    );
+    assert_eq!(
+        ui_hover_and_bot_changed(&outside, &corner, rect),
+        0,
+        "round note controls must stay hidden in a square corner outside the circle"
+    );
+    assert!(
+        ui_hover_and_bot_changed(&outside, &inside, rect) > 12,
+        "round note controls must appear when the cursor moves inside the circle"
     );
 }

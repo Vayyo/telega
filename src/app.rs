@@ -1,4 +1,5 @@
 mod accounts;
+mod avatar_cache;
 mod avatars;
 mod card;
 mod extra;
@@ -36,7 +37,7 @@ use tdlib_rs::types::{ChatPosition, File, Message};
 
 use crate::archive::Archive;
 use crate::plugins::{self, Action, HostCmd, HostEvent, HostHandle, PluginInfo};
-use crate::settings::Settings;
+use crate::settings::{CacheLimits, Settings};
 use crate::td;
 use media::Media;
 use pane::{ChatPane, Page};
@@ -44,6 +45,14 @@ use plugin_runtime::message_event;
 use session::{FolderCreation, FolderReorder, FolderReorderState, ListRead, Session};
 
 pub(crate) type WinId = window::Id;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainWindowState {
+    Open,
+    Closing { restore: bool },
+    Hidden,
+    Opening,
+}
 
 const FOLDER_REORDER_UNCONFIRMED: &str =
     "Порядок папок не подтверждён: старый запрос ещё может примениться";
@@ -69,10 +78,17 @@ pub(crate) enum Msg {
     OpenSettings,
     CloseSettings,
     SetKeepDeleted(bool),
+    SetCachePolicy(CacheLimits),
+    ApplyCachePolicy,
+    CachePolicyApplied(i32, CacheLimits, Result<(), String>),
+    AvatarSweepDone,
+    AvatarSweepTick,
     /// Opens a separate chat window, optionally with a chat already selected.
     OpenChatWindow(Option<i64>),
     /// Opens the archive list in its own window.
     OpenArchiveWindow(WinId, i32),
+    WindowCloseRequested(WinId),
+    MainWindowOpened(WinId),
     WindowClosed(WinId),
     Key(WinId, Key, Modifiers),
     /// Action inside the chat pane of a window.
@@ -109,9 +125,13 @@ pub(crate) enum Msg {
     FileCancel(i32),
     FileOpen(i32),
     FileShowFolder(i32),
+    /// Answer to a `download_file` request, tagged with its file: on
+    /// failure the request is taken back out of flight and the file is
+    /// marked as failed, so that nothing retries it on its own.
+    FileRequestDone(i32, Result<(), String>),
     ImageDecoded(i32, Result<(u32, u32, Vec<u8>), String>),
-    /// Round profile picture of a file, ready to show.
-    AvatarDecoded(i32, Result<Vec<u8>, String>),
+    /// Round profile picture of a file, tagged with its originating client.
+    AvatarDecoded(i32, i32, Result<(Vec<u8>, [u8; 32]), String>),
     /// A picture's sensor reported it on screen: fetch it if missing, or
     /// keep it from being evicted from the cache while it stays there.
     AvatarShown(avatars::Peer),
@@ -134,8 +154,9 @@ pub(crate) enum Msg {
     /// Pinned messages of a chat, reloaded for every pane showing it
     /// (including background tabs, unlike `PaneMsg::PinnedLoaded`).
     PinnedRefreshed(i64, Result<Vec<Message>, String>),
-    /// Answer to `setTdlibParameters` (a wrong key shows up here).
-    ParametersSet(Result<(), String>),
+    /// Parameters were accepted; the initial cache option error is nonfatal.
+    ParametersSet(Result<Option<String>, String>),
+    ParametersSetForClient(i32, CacheLimits, Result<Option<String>, String>),
     Video(video::VideoMsg),
     Card(card::CardMsg),
     ClearNotice,
@@ -212,6 +233,7 @@ pub(crate) enum Msg {
     /// Next frame of the "печатает…" dots.
     TypingTick,
     ToggleAccounts,
+    DismissAccountPopup,
     SwitchAccount(u32),
     AddAccount,
     CancelAddAccount,
@@ -647,6 +669,21 @@ impl From<&Message> for MsgItem {
 }
 
 impl App {
+    pub(crate) fn is_bot_user(&self, user_id: i64) -> bool {
+        self.session.bot_users.contains(&user_id)
+    }
+
+    pub(crate) fn is_bot_chat(&self, chat_id: i64) -> bool {
+        self.session
+            .chats
+            .get(&chat_id)
+            .and_then(|chat| chat.kind.as_ref())
+            .is_some_and(|kind| match kind {
+                tdlib_rs::enums::ChatType::Private(private) => self.is_bot_user(private.user_id),
+                _ => false,
+            })
+    }
+
     fn badge(&self) -> Option<tray::Badge> {
         tray::badge(self.session.unread.0, self.session.unread.1)
     }
@@ -782,14 +819,32 @@ fn window_settings(width: f32) -> window::Settings {
     }
 }
 
+fn main_window_settings() -> window::Settings {
+    let settings = window_settings(1000.0);
+    #[cfg(target_os = "linux")]
+    {
+        window::Settings {
+            exit_on_close_request: false,
+            ..settings
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        settings
+    }
+}
+
 pub(crate) struct App {
     api_id: i32,
     api_hash: String,
 
-    /// Full client window; closing it quits the program.
+    /// Full client window; its native surface can close while the session stays alive.
     main_window: WinId,
+    main_window_state: MainWindowState,
     settings: Settings,
     settings_path: PathBuf,
+    /// Portraits of logged-in accounts survive replacement of the TDLib session.
+    account_portraits: HashMap<u32, iced::widget::image::Handle>,
     /// Plugin thread; `None` until it has started.
     plugin_host: Option<HostHandle>,
     plugin_infos: Vec<PluginInfo>,
@@ -809,6 +864,10 @@ pub(crate) struct App {
     /// `try_save_settings`) so whatever is still in it, including a
     /// password salt, is not lost for good by the next autosave.
     settings_load_failed: bool,
+    cache_unsaved: bool,
+    last_avatar_sweep: Option<std::time::Instant>,
+    avatar_sweep_active: bool,
+    avatar_sweep_pending: Option<CacheLimits>,
 
     /// Everything tied to the running TDLib client / logged-in account:
     /// replaced wholesale by a blank one on account switch or log-out
@@ -858,7 +917,7 @@ impl App {
             Err(e) => (Settings::default(), Some(e)),
         };
         let load_failed = error.is_some();
-        let (main_window, open) = window::open(window_settings(1000.0));
+        let (main_window, open) = window::open(main_window_settings());
         let (mut app, start) = match credentials {
             Ok((api_id, api_hash)) => {
                 let client_id = tdlib_rs::create_client();
@@ -878,7 +937,12 @@ impl App {
         // The system theme as iced read it at start, before any second
         // window could overwrite it.
         let theme = iced::system::theme().map(Msg::SystemTheme);
-        (app, Task::batch([open.discard(), start, theme]))
+        let sweep = if load_failed {
+            Task::none()
+        } else {
+            app.schedule_avatar_sweep()
+        };
+        (app, Task::batch([open.discard(), start, theme, sweep]))
     }
 
     /// Fresh TDLib client with empty state on the active account slot,
@@ -886,6 +950,9 @@ impl App {
     /// cannot be reused, so log out and account switches start a new one
     /// in the same main window.
     fn start_session(&mut self) -> Task<Msg> {
+        if self.cache_unsaved {
+            self.save_settings();
+        }
         let client_id = tdlib_rs::create_client();
         self.session = Session::new(client_id, self.main_window, self.settings.active_account);
         Task::perform(td::start(client_id), Msg::Done)
@@ -901,12 +968,26 @@ impl App {
     ) -> Self {
         let look_settings = settings.look;
         let slot = settings.active_account;
+        let account_portraits = settings
+            .accounts
+            .iter()
+            .filter(|account| account.user_id.is_some())
+            .filter_map(|account| {
+                let rgba = avatar_cache::load(&account.avatar_digest?)?;
+                Some((
+                    account.slot,
+                    iced::widget::image::Handle::from_rgba(avatars::SIDE, avatars::SIDE, rgba),
+                ))
+            })
+            .collect();
         Self {
             api_id,
             api_hash,
             main_window,
+            main_window_state: MainWindowState::Open,
             settings,
             settings_path,
+            account_portraits,
             plugin_host: None,
             plugin_infos: Vec::new(),
             plugin_logs: HashMap::new(),
@@ -917,6 +998,10 @@ impl App {
             tray: None,
             error: None,
             settings_load_failed: false,
+            cache_unsaved: false,
+            last_avatar_sweep: None,
+            avatar_sweep_active: false,
+            avatar_sweep_pending: None,
             session: Session::new(client_id, main_window, slot),
         }
     }
@@ -937,7 +1022,9 @@ impl App {
                  чтобы не потерять пароль: почините или удалите settings.json"
                 .to_owned());
         }
-        self.settings.save(&self.settings_path)
+        self.settings.save(&self.settings_path)?;
+        self.cache_unsaved = false;
+        Ok(())
     }
 
     /// Same as `try_save_settings`, reporting a failure through `self.error`
@@ -966,6 +1053,48 @@ impl App {
             },
             Msg::FlushSettings,
         )
+    }
+
+    /// Maintenance uses the blocking pool and coalesces concurrent requests.
+    fn schedule_avatar_sweep(&mut self) -> Task<Msg> {
+        if self.settings_load_failed {
+            return Task::none();
+        }
+        let limits = self.settings.cache;
+        if self.avatar_sweep_active {
+            self.avatar_sweep_pending = Some(limits);
+            return Task::none();
+        }
+        self.avatar_sweep_active = true;
+        self.last_avatar_sweep = Some(std::time::Instant::now());
+        Task::perform(
+            async move {
+                let _ = tokio::task::spawn_blocking(move || avatar_cache::sweep(limits)).await;
+            },
+            |()| Msg::AvatarSweepDone,
+        )
+    }
+
+    /// One task writes all four TDLib options in order; a newer policy waits.
+    fn apply_cache_policy(&mut self) -> Task<Msg> {
+        let limits = self.settings.cache;
+        if self.session.cache_initializing || !self.session.cache_params_accepted {
+            self.session.cache_pending = Some(limits);
+            self.session.cache_commit_pending = true;
+            return Task::none();
+        }
+        if self.session.cache_applying.is_some() {
+            self.session.cache_pending = Some(limits);
+            self.session.cache_commit_pending = true;
+            return Task::none();
+        }
+        self.session.cache_pending = None;
+        self.session.cache_commit_pending = false;
+        let client = self.session.client_id;
+        self.session.cache_applying = Some(limits);
+        Task::perform(td::apply_cache_limits(client, limits), move |result| {
+            Msg::CachePolicyApplied(client, limits, result)
+        })
     }
 
     /// The archive, if saving deleted messages is enabled. Own deletions and
@@ -1000,11 +1129,13 @@ impl App {
                 }
                 _ => None,
             }),
+            window::close_requests().map(Msg::WindowCloseRequested),
             window::close_events().map(Msg::WindowClosed),
             Subscription::run(plugins::run).map(Msg::Plugin),
             Subscription::run(notify::clicks)
                 .map(|(slot, chat_id)| Msg::NotificationClicked(slot, chat_id)),
             iced::system::theme_changes().map(Msg::SystemTheme),
+            iced::time::every(std::time::Duration::from_secs(86_400)).map(|_| Msg::AvatarSweepTick),
             #[cfg(target_os = "linux")]
             Subscription::run(tray::run).map(Msg::Tray),
             if self.session.video.is_some() {
@@ -1058,6 +1189,27 @@ impl App {
                     self.error = Some(e);
                 }
             }
+            Msg::FileRequestDone(file_id, result) => {
+                // TDLib did not take the request: the file is not coming,
+                // so it must not read as "downloading" forever, and the
+                // paths that ask on their own must leave it alone — only an
+                // explicit action (`request_download`) asks again.
+                if result.is_err()
+                    && let Some(state) = self.session.files.get_mut(&file_id)
+                {
+                    state.downloading = false;
+                    state.failed = true;
+                }
+                // A viewer waiting for exactly this file must say so
+                // instead of spinning on "Загрузка…" forever. The global
+                // `self.error` is deliberately left alone: pictures are
+                // also fetched automatically (avatars, bubbles), and those
+                // must not throw errors at the user for a request they
+                // never made.
+                if result.is_err() {
+                    return self.viewer_file_failed(file_id);
+                }
+            }
             Msg::ArchiveWindowLoaded(window, client, result) => {
                 if client != self.session.client_id
                     || self.session.leave.is_some()
@@ -1097,7 +1249,10 @@ impl App {
                     self.error = None;
                 }
             }
-            Msg::LogOut => self.session.confirm_logout = true,
+            Msg::LogOut => {
+                self.session.accounts_open = false;
+                self.session.confirm_logout = true;
+            }
             Msg::ConfirmLogOut(confirmed) => {
                 self.session.confirm_logout = false;
                 if confirmed {
@@ -1106,13 +1261,82 @@ impl App {
                 }
             }
             Msg::OpenSettings => {
+                self.session.accounts_open = false;
+                self.session.confirm_logout = false;
                 self.session.settings_open = true;
                 if let Some(pane) = self.session.panes.get_mut(&self.main_window) {
                     pane.menu = None;
                     pane.list.archive_settings = None;
                 }
             }
-            Msg::CloseSettings => self.session.settings_open = false,
+            Msg::CloseSettings => {
+                self.session.settings_open = false;
+                if self.cache_unsaved {
+                    self.save_settings();
+                }
+                if self.session.cache_pending.is_some()
+                    || self.session.cache_applied != Some(self.settings.cache)
+                {
+                    return self.update(Msg::ApplyCachePolicy);
+                }
+            }
+            Msg::SetCachePolicy(limits) => {
+                if self.settings.cache == limits {
+                    return Task::none();
+                }
+                self.settings.cache = limits;
+                self.cache_unsaved = true;
+                self.session.cache_commit_pending = false;
+                if self.session.cache_applying.is_some() || self.session.cache_initializing {
+                    self.session.cache_pending = Some(limits);
+                }
+                return self.save_settings_debounced();
+            }
+            Msg::ApplyCachePolicy => {
+                return Task::batch([self.apply_cache_policy(), self.schedule_avatar_sweep()]);
+            }
+            Msg::CachePolicyApplied(client, limits, result) => {
+                if client != self.session.client_id || self.session.cache_applying != Some(limits) {
+                    return Task::none();
+                }
+                self.session.cache_applying = None;
+                match result {
+                    Ok(()) => {
+                        self.session.cache_applied = Some(limits);
+                        if self.error.as_deref().is_some_and(|error| {
+                            error.starts_with("Не удалось применить настройки хранилища:")
+                        }) {
+                            self.error = None;
+                        }
+                    }
+                    Err(error) => {
+                        self.error =
+                            Some(format!("Не удалось применить настройки хранилища: {error}"));
+                    }
+                }
+                if self.session.cache_commit_pending {
+                    self.session.cache_commit_pending = false;
+                    if let Some(pending) = self.session.cache_pending.take()
+                        && (pending != limits || self.session.cache_applied != Some(limits))
+                    {
+                        return self.apply_cache_policy();
+                    }
+                }
+            }
+            Msg::AvatarSweepDone => {
+                self.avatar_sweep_active = false;
+                if self.avatar_sweep_pending.take().is_some() {
+                    return self.schedule_avatar_sweep();
+                }
+            }
+            Msg::AvatarSweepTick => {
+                if self
+                    .last_avatar_sweep
+                    .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(86_400))
+                {
+                    return self.schedule_avatar_sweep();
+                }
+            }
             Msg::SetKeepDeleted(keep) => return self.set_keep_deleted(keep),
             Msg::OpenChatWindow(chat_id) => {
                 if chat_id.is_some() {
@@ -1129,6 +1353,14 @@ impl App {
                     return Task::none();
                 }
                 return self.open_archive_window();
+            }
+            Msg::WindowCloseRequested(window) => return self.on_window_close_requested(window),
+            Msg::MainWindowOpened(window) => {
+                if window == self.main_window && self.main_window_state == MainWindowState::Opening
+                {
+                    self.main_window_state = MainWindowState::Open;
+                    return self.focus_main_window();
+                }
             }
             Msg::WindowClosed(window) => return self.on_window_closed(window),
             Msg::Key(window, key, modifiers) => return self.on_key(window, key, modifiers),
@@ -1232,6 +1464,11 @@ impl App {
             Msg::OpenPluginHelp(open) => self.session.plugin_help_open = open,
             Msg::SelectTab(chat_id) => {
                 self.session.settings_open = false;
+                self.session.accounts_open = false;
+                self.session.confirm_logout = false;
+                if let Some(pane) = self.session.panes.get_mut(&self.main_window) {
+                    pane.list.archive_settings = None;
+                }
                 self.dismiss_chat_list_menu(self.main_window);
                 return self.show_in_main(chat_id);
             }
@@ -1251,19 +1488,33 @@ impl App {
                 }
             }
             Msg::FileDownload(file_id) => {
-                return Task::perform(
-                    td::download_file(self.session.client_id, file_id, 24),
-                    Msg::Done,
-                );
+                // Explicit, and sent even while a download is already
+                // running: TDLib then raises its priority (the bubble's 16 →
+                // 24) instead of fetching anything twice. The button shows
+                // "Отмена" while the file is on its way, so only a double
+                // click can reach this.
+                return self.request_download(file_id, 24);
             }
             Msg::FileCancel(file_id) => {
+                // The request is no longer in flight, and the file is not
+                // being fetched by anybody else: without this it would keep
+                // reading as "downloading" (and never be asked for again)
+                // for the rest of the session.
+                if let Some(state) = self.session.files.get_mut(&file_id) {
+                    state.downloading = false;
+                    state.failed = false;
+                }
                 return Task::perform(td::cancel_download(self.session.client_id, file_id), |()| {
                     Msg::Ignore
                 });
             }
             Msg::FileOpen(file_id) => self.open_file(file_id, false),
             Msg::FileShowFolder(file_id) => self.open_file(file_id, true),
-            Msg::AvatarDecoded(file_id, result) => self.avatar_decoded(file_id, result),
+            Msg::AvatarDecoded(client_id, file_id, result) => {
+                if client_id == self.session.client_id {
+                    self.avatar_decoded(file_id, result);
+                }
+            }
             Msg::AvatarShown(peer) => return self.avatar_shown(peer),
             Msg::ImageDecoded(file_id, result) => match result {
                 Ok((w, h, rgba)) => {
@@ -1296,13 +1547,13 @@ impl App {
                     self.tray = Some(handle);
                     return task;
                 }
-                tray::TrayEvent::Activate => {
-                    return Task::batch([
-                        tray::raise_on_hyprland(),
-                        window::gain_focus(self.main_window),
-                    ]);
+                tray::TrayEvent::Activate => return self.restore_main_window(),
+                tray::TrayEvent::Quit => {
+                    if self.cache_unsaved {
+                        self.save_settings();
+                    }
+                    return iced::exit();
                 }
-                tray::TrayEvent::Quit => return iced::exit(),
             },
             Msg::Password(msg) => return self.on_password(msg),
             // A failure (no rights to list admins, etc.) just leaves the
@@ -1324,19 +1575,44 @@ impl App {
                     }
                 }
             }
+            Msg::ParametersSetForClient(client, initial, result) => {
+                if client != self.session.client_id {
+                    return Task::none();
+                }
+                if matches!(result, Ok(None)) {
+                    self.session.cache_applied = Some(initial);
+                }
+                return self.update(Msg::ParametersSet(result));
+            }
             Msg::ParametersSet(result) => {
-                self.session.busy = false;
-                if let Err(e) = result {
-                    if self.session.db_key.is_some() && e.to_lowercase().contains("encryption") {
-                        // The check value passed but TDLib disagrees: the data
-                        // was written with another key.
-                        self.session.db_key = None;
-                        self.session.auth = Auth::Locked {
-                            error: Some("база зашифрована другим паролем".into()),
-                            forgot: false,
-                        };
-                    } else {
-                        self.error = Some(e);
+                if matches!(self.session.auth, Auth::Starting | Auth::Locked { .. }) {
+                    self.session.busy = false;
+                }
+                self.session.cache_initializing = false;
+                match result {
+                    Ok(option_error) => {
+                        self.session.cache_params_accepted = true;
+                        if let Some(error) = option_error {
+                            self.error =
+                                Some(format!("Не удалось применить настройки хранилища: {error}"));
+                        }
+                        if self.session.auth == Auth::Ready || self.session.cache_commit_pending {
+                            self.session.cache_pending = None;
+                            self.session.cache_commit_pending = false;
+                            return self.apply_cache_policy();
+                        }
+                    }
+                    Err(e) => {
+                        if self.session.db_key.is_some() && e.to_lowercase().contains("encryption")
+                        {
+                            self.session.db_key = None;
+                            self.session.auth = Auth::Locked {
+                                error: Some("база зашифрована другим паролем".into()),
+                                forgot: false,
+                            };
+                        } else {
+                            self.error = Some(e);
+                        }
                     }
                 }
             }
@@ -1860,7 +2136,14 @@ impl App {
                 self.look = look::Look::new(choice, self.system_mode);
                 self.save_settings();
             }
-            Msg::ToggleAccounts => self.session.accounts_open = !self.session.accounts_open,
+            Msg::ToggleAccounts => {
+                self.session.confirm_logout = false;
+                self.session.accounts_open = !self.session.accounts_open;
+            }
+            Msg::DismissAccountPopup => {
+                self.session.accounts_open = false;
+                self.session.confirm_logout = false;
+            }
             Msg::SwitchAccount(slot) => return self.switch_account(slot),
             Msg::AddAccount => return self.add_account(),
             Msg::CancelAddAccount => return self.cancel_add_account(),
@@ -1880,12 +2163,7 @@ impl App {
                     return Task::none();
                 }
                 self.dismiss_chat_list_menu(self.main_window);
-                let main = self.main_window;
-                #[cfg(target_os = "linux")]
-                let raise = tray::raise_on_hyprland();
-                #[cfg(not(target_os = "linux"))]
-                let raise = Task::none();
-                return Task::batch([self.show_in_main(chat_id), window::gain_focus(main), raise]);
+                return Task::batch([self.show_in_main(chat_id), self.restore_main_window()]);
             }
             Msg::SetNotifications(on) => {
                 self.settings.notifications = on;
@@ -1921,8 +2199,18 @@ impl App {
             Msg::AnimFrame(file_id, w, h, rgba) => self.animation_frame(file_id, w, h, rgba),
             Msg::AnimEnded(file_id) => self.animation_ended(file_id),
             Msg::PlayVideo(file_id) => return self.play_video(file_id),
-            Msg::RecordStart(window) => return self.record_start(window),
+            Msg::RecordStart(window) => {
+                if window != self.main_window || self.main_window_state == MainWindowState::Open {
+                    return self.record_start(window);
+                }
+            }
             Msg::RecordStarted(window, chat_id, result) => match result {
+                Ok(recorder)
+                    if window == self.main_window
+                        && self.main_window_state != MainWindowState::Open =>
+                {
+                    recorder.0.cancel();
+                }
                 Ok(recorder) => self.record_started(window, chat_id, recorder.0),
                 Err(e) => self.error = Some(e),
             },
@@ -1987,6 +2275,13 @@ impl App {
         }
         match key.as_ref() {
             Key::Named(keyboard::key::Named::Escape) => {
+                if window == self.main_window
+                    && (self.session.accounts_open || self.session.confirm_logout)
+                {
+                    self.session.accounts_open = false;
+                    self.session.confirm_logout = false;
+                    return Task::none();
+                }
                 // Esc closes the innermost thing: menu, reply, edit, then search.
                 if let Some(pane) = self.session.panes.get_mut(&window)
                     && pane.list.new_folder_name.is_some()
@@ -2008,9 +2303,6 @@ impl App {
                     } else {
                         pane.search = None;
                     }
-                }
-                if window == self.main_window {
-                    self.session.confirm_logout = false;
                 }
             }
             // Ctrl+V: an image in the clipboard is sent as a photo; text
@@ -2128,8 +2420,91 @@ impl App {
         ])
     }
 
+    fn focus_main_window(&self) -> Task<Msg> {
+        #[cfg(target_os = "linux")]
+        {
+            Task::batch([
+                tray::raise_on_hyprland(),
+                window::gain_focus(self.main_window),
+            ])
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            window::gain_focus(self.main_window)
+        }
+    }
+
+    fn restore_main_window(&mut self) -> Task<Msg> {
+        match self.main_window_state {
+            MainWindowState::Open => self.focus_main_window(),
+            MainWindowState::Closing { .. } => {
+                self.main_window_state = MainWindowState::Closing { restore: true };
+                Task::none()
+            }
+            MainWindowState::Hidden => {
+                self.main_window_state = MainWindowState::Opening;
+                iced_runtime::task::oneshot(|channel| {
+                    iced_runtime::Action::Window(iced_runtime::window::Action::Open(
+                        self.main_window,
+                        main_window_settings(),
+                        channel,
+                    ))
+                })
+                .map(Msg::MainWindowOpened)
+            }
+            MainWindowState::Opening => Task::none(),
+        }
+    }
+
+    fn on_window_close_requested(&mut self, window: WinId) -> Task<Msg> {
+        #[cfg(target_os = "linux")]
+        {
+            if window != self.main_window || self.main_window_state != MainWindowState::Open {
+                return Task::none();
+            }
+            if self.cache_unsaved {
+                self.save_settings();
+            }
+            if self.tray.is_none() {
+                return iced::exit();
+            }
+            self.main_window_state = MainWindowState::Closing { restore: false };
+            if self.focused == Some(window) {
+                self.focused = None;
+            }
+            Task::batch([self.cancel_recording_in(window), window::close(window)])
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = window;
+            Task::none()
+        }
+    }
+
     fn on_window_closed(&mut self, window: WinId) -> Task<Msg> {
         if window == self.main_window {
+            if self.cache_unsaved {
+                self.save_settings();
+            }
+            self.close_video_in(window);
+            #[cfg(target_os = "linux")]
+            {
+                let restore = matches!(
+                    self.main_window_state,
+                    MainWindowState::Closing { restore: true }
+                );
+                self.main_window_state = MainWindowState::Hidden;
+                if self.focused == Some(window) {
+                    self.focused = None;
+                }
+                let cancel = self.cancel_recording_in(window);
+                return if restore {
+                    Task::batch([cancel, self.restore_main_window()])
+                } else {
+                    cancel
+                };
+            }
+            #[cfg(not(target_os = "linux"))]
             return iced::exit();
         }
         self.close_video_in(window);
@@ -3123,6 +3498,11 @@ impl App {
             }
             Update::User(u) => {
                 let user = u.user;
+                if matches!(&user.r#type, tdlib_rs::enums::UserType::Bot(_)) {
+                    self.session.bot_users.insert(user.id);
+                } else {
+                    self.session.bot_users.remove(&user.id);
+                }
                 let name = format!("{} {}", user.first_name, user.last_name);
                 self.session.users.insert(user.id, name.trim().to_owned());
                 self.user_renamed(user.id);
@@ -3206,6 +3586,18 @@ impl App {
                     self.error = Some(format!("архив: {e}"));
                 }
                 let new_media = media::media_of(&u.new_content).map(|(m, _)| m);
+                if self.session.video.as_ref().is_some_and(|video| {
+                    video.chat_id == u.chat_id
+                        && video.message_id == u.message_id
+                        && !matches!(
+                            new_media.as_ref(),
+                            Some(media::Media::Video { file_id, round, .. })
+                                if *file_id == video.file_id && *round == video.round
+                        )
+                }) {
+                    self.persist_video_volume();
+                    self.session.video = None;
+                }
                 let new_extra = extra::extra_of(&u.new_content).map(|(e, _)| Box::new(e));
                 let new_rich = rich_of(&u.new_content, new_extra.as_deref());
                 for pane in self.panes_of(u.chat_id) {
@@ -3292,6 +3684,7 @@ impl App {
                     Task::perform(td::enable_notifications(self.session.client_id), |()| {
                         Msg::Ignore
                     }),
+                    self.apply_cache_policy(),
                     self.restore_tabs(),
                 ]);
             }
@@ -3329,15 +3722,19 @@ impl App {
     /// Opens the account's database (with the password key, if any).
     pub(crate) fn set_parameters(&mut self) -> Task<Msg> {
         self.session.busy = true;
+        self.session.cache_initializing = true;
+        let client = self.session.client_id;
+        let initial = self.settings.cache;
         Task::perform(
             td::set_parameters(
-                self.session.client_id,
+                client,
                 self.api_id,
                 self.api_hash.clone(),
                 self.session.slot,
                 crate::lock::tdlib_key(self.session.db_key.as_ref()),
+                initial,
             ),
-            Msg::ParametersSet,
+            move |result| Msg::ParametersSetForClient(client, initial, result),
         )
     }
 
@@ -3736,6 +4133,10 @@ impl App {
     }
 
     fn open_profile(&mut self, window: WinId, chat_id: i64) -> Task<Msg> {
+        // Opening the panel is the user asking for this chat: the explicit
+        // action that gives a failed picture a second chance (the sensor
+        // alone never retries, see `retry_avatar`).
+        self.retry_avatar(avatars::Peer::Chat(chat_id));
         let Some(pane) = self.session.panes.get_mut(&window) else {
             return Task::none();
         };

@@ -16,18 +16,23 @@ use iced::{Element, Event, Fill, Rectangle, Task, mouse, window};
 
 use super::{App, Msg, WinId};
 use crate::av::player::{Frame, Player};
+use crate::settings::{Account, VideoVolume};
 use crate::td;
 
 /// The video being played (one at a time).
 pub(crate) struct VideoPlayback {
     pub(crate) window: WinId,
     pub(crate) chat_id: i64,
+    pub(crate) message_id: i64,
     pub(crate) file_id: i32,
+    pub(crate) round: bool,
     pub(crate) player: Player,
     /// Tells the download reader to give up (the player is going away).
     stop: Arc<AtomicBool>,
     /// Shown over the whole window instead of in the bubble.
     pub(crate) expanded: bool,
+    /// Whether the pointer is over the compact round video.
+    controls_hovered: bool,
     /// Volume before muting, to restore.
     unmuted: f32,
     /// Drawn frames tell the shader which texture set to use.
@@ -49,12 +54,16 @@ impl Drop for VideoPlayback {
 #[derive(Debug, Clone)]
 pub(crate) enum VideoMsg {
     /// ▶ on a video bubble: play it here.
-    Play(WinId, i64, i32),
+    Play(WinId, i64, i64, i32, bool),
     TogglePause,
     /// Seek bar moved (0.0..=1.0 of the duration).
     Seek(f32),
+    /// Slider changes are audible immediately; disk writes wait for release.
+    Volume(f32),
+    VolumeReleased,
     ToggleMute,
     ToggleExpanded,
+    HoverControls(bool),
     Close,
     /// Low-rate upkeep while a video is open: the picture itself redraws
     /// on its own (see `VideoProgram::update`), this only refreshes the
@@ -65,15 +74,27 @@ pub(crate) enum VideoMsg {
 impl App {
     pub(crate) fn on_video(&mut self, msg: VideoMsg) -> Task<Msg> {
         match msg {
-            VideoMsg::Play(window, chat_id, file_id) => {
+            VideoMsg::Play(window, chat_id, message_id, file_id, round) => {
                 if let Some(video) = &self.session.video
                     && video.window == window
                     && video.chat_id == chat_id
+                    && video.message_id == message_id
                     && video.file_id == file_id
+                    && video.round == round
                 {
                     video.player.set_paused(!video.player.paused());
                     return Task::none();
                 }
+                self.persist_video_volume();
+                let preference = self
+                    .settings
+                    .accounts
+                    .iter()
+                    .find(|a| a.slot == self.session.slot)
+                    .and_then(|a| a.video_volumes.get(&chat_id))
+                    .and_then(|chat| chat.get(&message_id))
+                    .copied()
+                    .unwrap_or_default();
                 let size = self
                     .session
                     .files
@@ -83,16 +104,20 @@ impl App {
                 let source =
                     td::FileStream::new(self.session.client_id, file_id, size, Arc::clone(&stop));
                 let player = Player::open(source, None, true);
+                player.set_volume(preference.volume);
                 player.set_paused(false);
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 self.session.video = Some(VideoPlayback {
                     window,
                     chat_id,
+                    message_id,
                     file_id,
+                    round,
                     player,
                     stop,
                     expanded: false,
-                    unmuted: 1.0,
+                    controls_hovered: false,
+                    unmuted: preference.unmuted,
                     id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     token: Arc::new(()),
                 });
@@ -126,6 +151,16 @@ impl App {
                         .seek(duration.mul_f32(fraction.clamp(0.0, 1.0)));
                 }
             }
+            VideoMsg::Volume(value) => {
+                if let Some(video) = &mut self.session.video {
+                    let value = value.clamp(0.0, 1.0);
+                    if value > 0.0 {
+                        video.unmuted = value;
+                    }
+                    video.player.set_volume(value);
+                }
+            }
+            VideoMsg::VolumeReleased => self.persist_video_volume(),
             VideoMsg::ToggleMute => {
                 if let Some(video) = &mut self.session.video {
                     let volume = video.player.volume();
@@ -133,16 +168,35 @@ impl App {
                         video.unmuted = volume;
                         video.player.set_volume(0.0);
                     } else {
-                        video.player.set_volume(video.unmuted.max(0.1));
+                        video.player.set_volume(
+                            if video.unmuted.is_finite() && video.unmuted > 0.0 {
+                                video.unmuted.clamp(0.01, 1.0)
+                            } else {
+                                1.0
+                            },
+                        );
                     }
+                    self.persist_video_volume();
                 }
             }
             VideoMsg::ToggleExpanded => {
                 if let Some(video) = &mut self.session.video {
                     video.expanded = !video.expanded;
+                    video.controls_hovered = false;
                 }
             }
-            VideoMsg::Close => self.session.video = None,
+            VideoMsg::HoverControls(hovered) => {
+                if let Some(video) = &mut self.session.video
+                    && video.round
+                    && !video.expanded
+                {
+                    video.controls_hovered = hovered;
+                }
+            }
+            VideoMsg::Close => {
+                self.persist_video_volume();
+                self.session.video = None;
+            }
             VideoMsg::Tick => {
                 // The chat was left through some path other than closing
                 // its window or switching its chat (both already clear
@@ -155,6 +209,7 @@ impl App {
                         .is_some_and(|p| p.shows(v.chat_id))
                 });
                 if !shown {
+                    self.persist_video_volume();
                     self.session.video = None;
                 }
             }
@@ -162,12 +217,66 @@ impl App {
         Task::none()
     }
 
-    /// The playing video, if it is `file_id` in `window`.
-    pub(crate) fn video_of(&self, window: WinId, file_id: i32) -> Option<&VideoPlayback> {
-        self.session
-            .video
+    /// The playing video for this message, not another copy of its file.
+    pub(crate) fn video_of(
+        &self,
+        window: WinId,
+        chat_id: i64,
+        message_id: i64,
+        file_id: i32,
+        round: bool,
+    ) -> Option<&VideoPlayback> {
+        self.session.video.as_ref().filter(|v| {
+            v.window == window
+                && v.chat_id == chat_id
+                && v.message_id == message_id
+                && v.file_id == file_id
+                && v.round == round
+        })
+    }
+
+    /// Record only actual preference changes, never a drag tick.
+    pub(super) fn persist_video_volume(&mut self) {
+        let Some(video) = &self.session.video else {
+            return;
+        };
+        let value = VideoVolume {
+            volume: video.player.volume(),
+            unmuted: video.unmuted,
+        };
+        let account = self
+            .settings
+            .accounts
+            .iter_mut()
+            .find(|a| a.slot == self.session.slot);
+        if account
             .as_ref()
-            .filter(|v| v.window == window && v.file_id == file_id)
+            .and_then(|a| a.video_volumes.get(&video.chat_id))
+            .and_then(|chat| chat.get(&video.message_id))
+            .copied()
+            .unwrap_or_default()
+            == value
+        {
+            return;
+        }
+        // A ready session can have no Account entry yet (before TDLib announces
+        // its user); keep the preference with the session's slot nonetheless.
+        let account = match account {
+            Some(account) => account,
+            None => {
+                self.settings.accounts.push(Account {
+                    slot: self.session.slot,
+                    ..Account::default()
+                });
+                self.settings.accounts.last_mut().expect("just inserted")
+            }
+        };
+        account
+            .video_volumes
+            .entry(video.chat_id)
+            .or_default()
+            .insert(video.message_id, value);
+        self.save_settings();
     }
 
     /// A voice message started talking (or resumed): a playing video does
@@ -190,14 +299,12 @@ impl App {
             .as_ref()
             .is_some_and(|v| v.window == window)
         {
+            self.persist_video_volume();
             self.session.video = None;
         }
     }
 
-    /// Same, but only if `window` is actually about to show a different
-    /// chat than the video's: without this, `video_of` (which only checks
-    /// window and file) would show a forwarded copy of the same file in
-    /// the new chat as if it were the old chat's paused/playing player.
+    /// Same, but only if `window` is about to show a different chat.
     pub(super) fn close_video_leaving(&mut self, window: WinId, chat_id: i64) {
         if self
             .session
@@ -205,6 +312,7 @@ impl App {
             .as_ref()
             .is_some_and(|v| v.window == window && v.chat_id != chat_id)
         {
+            self.persist_video_volume();
             self.session.video = None;
         }
     }
@@ -219,6 +327,7 @@ impl App {
         let player = &video.player;
         let picture = shader::Shader::new(VideoProgram {
             id: video.id,
+            round: video.round && !video.expanded,
             player,
             alive: Arc::downgrade(&video.token),
         })
@@ -236,24 +345,24 @@ impl App {
             .on_press(Msg::Video(VideoMsg::TogglePause))
             .interaction(mouse::Interaction::Pointer);
 
-        let position = player.position();
-        let duration = player.duration();
-        let fraction = duration
-            .filter(|d| !d.is_zero())
-            .map_or(0.0, |d| position.as_secs_f32() / d.as_secs_f32());
-        let playing = !player.paused() && !player.ended();
-        let button_style = |theme: &iced::Theme, status| {
-            let mut style = button::text(theme, status);
-            style.text_color = iced::Color::WHITE;
-            style
-        };
-        let time = match duration {
-            Some(d) => format!("{} / {}", mmss(position), mmss(d)),
-            None => mmss(position),
-        };
-        let muted = player.volume() == 0.0;
-        let controls = container(
-            row![
+        let controls = (!video.round || video.expanded || video.controls_hovered).then(|| {
+            let position = player.position();
+            let duration = player.duration();
+            let fraction = duration
+                .filter(|d| !d.is_zero())
+                .map_or(0.0, |d| position.as_secs_f32() / d.as_secs_f32());
+            let playing = !player.paused() && !player.ended();
+            let button_style = |theme: &iced::Theme, status| {
+                let mut style = button::text(theme, status);
+                style.text_color = iced::Color::WHITE;
+                style
+            };
+            let time = match duration {
+                Some(d) => format!("{} / {}", mmss(position), mmss(d)),
+                None => mmss(position),
+            };
+            let muted = player.volume() == 0.0;
+            let seek = row![
                 button(text(if playing { "⏸" } else { "▶" }).size(14))
                     .padding([2, 6])
                     .style(button_style)
@@ -262,6 +371,10 @@ impl App {
                     .step(0.001_f32)
                     .width(Fill),
                 text(time).size(11).color(iced::Color::WHITE),
+            ]
+            .spacing(4)
+            .align_y(iced::Center);
+            let volume = row![
                 button(
                     text(if muted { "🔇" } else { "🔊" })
                         .size(12)
@@ -270,6 +383,12 @@ impl App {
                 .padding([2, 4])
                 .style(button_style)
                 .on_press(Msg::Video(VideoMsg::ToggleMute)),
+                slider(0.0..=1.0, player.volume(), |v| Msg::Video(
+                    VideoMsg::Volume(v)
+                ))
+                .step(0.01_f32)
+                .on_release(Msg::Video(VideoMsg::VolumeReleased))
+                .width(Fill),
                 button(text(if video.expanded { "⤡" } else { "⤢" }).size(14))
                     .padding([2, 4])
                     .style(button_style)
@@ -279,12 +398,17 @@ impl App {
                     .style(button_style)
                     .on_press(Msg::Video(VideoMsg::Close)),
             ]
-            .spacing(6)
-            .align_y(iced::Center),
-        )
-        .padding([2, 6])
-        .style(|_| container::background(iced::Color::from_rgba8(0, 0, 0, 0.55)));
-
+            .spacing(4)
+            .align_y(iced::Center);
+            container(column![seek, volume].spacing(2))
+                .width(if video.round && !video.expanded {
+                    iced::Length::Fixed(w - 44.0)
+                } else {
+                    Fill
+                })
+                .padding([2, 6])
+                .style(|_| container::background(iced::Color::from_rgba8(0, 0, 0, 0.7)))
+        });
         let mut notice: Element<'a, Msg> = space().into();
         if let Some(e) = player.error() {
             notice = container(text(e).size(12).color(iced::Color::WHITE))
@@ -297,24 +421,41 @@ impl App {
                 .style(|_| container::background(iced::Color::from_rgba8(0, 0, 0, 0.55)))
                 .into();
         }
-        stack![
+        let mut layers = stack![
             container(clickable)
-                .style(|_| container::background(iced::Color::BLACK))
+                .style(move |_| {
+                    let mut style = container::background(iced::Color::BLACK);
+                    if video.round && !video.expanded {
+                        style.border.radius = (w / 2.0).into();
+                    }
+                    style
+                })
                 .center(Fill),
             container(notice).center(Fill),
-            column![space().height(Fill), controls],
-        ]
-        .width(if video.expanded {
-            Fill
-        } else {
-            iced::Length::Fixed(w)
-        })
-        .height(if video.expanded {
-            Fill
-        } else {
-            iced::Length::Fixed(h)
-        })
-        .into()
+        ];
+        if let Some(controls) = controls {
+            layers = layers.push(column![
+                space().height(Fill),
+                container(controls).center_x(Fill),
+                space().height(if video.round && !video.expanded {
+                    44.0
+                } else {
+                    0.0
+                }),
+            ]);
+        }
+        layers
+            .width(if video.expanded {
+                Fill
+            } else {
+                iced::Length::Fixed(w)
+            })
+            .height(if video.expanded {
+                Fill
+            } else {
+                iced::Length::Fixed(h)
+            })
+            .into()
     }
 
     /// The expanded player over the whole window.
@@ -360,13 +501,20 @@ fn mmss(d: Duration) -> String {
 
 struct VideoProgram<'a> {
     id: u64,
+    round: bool,
     player: &'a Player,
     /// See `Planes::alive`.
     alive: Weak<()>,
 }
 
-impl<'a, Message> shader::Program<Message> for VideoProgram<'a> {
-    type State = ();
+#[derive(Default)]
+struct VideoHoverState {
+    id: Option<u64>,
+    hovered: bool,
+}
+
+impl shader::Program<Msg> for VideoProgram<'_> {
+    type State = VideoHoverState;
     type Primitive = VideoPrimitive;
 
     /// Frames do not arrive as application messages any more: on every
@@ -378,18 +526,54 @@ impl<'a, Message> shader::Program<Message> for VideoProgram<'a> {
     /// to not be true).
     fn update(
         &self,
-        _state: &mut (),
+        state: &mut VideoHoverState,
         event: &Event,
-        _bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Option<Action<Message>> {
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<Action<Msg>> {
+        if state.id != Some(self.id) {
+            state.id = Some(self.id);
+            state.hovered = false;
+        }
+
+        if self.round {
+            // A stacked control can make the shader's cursor levitate; its
+            // physical position still counts as hovering over the picture.
+            let position = match cursor {
+                mouse::Cursor::Available(position) | mouse::Cursor::Levitating(position) => {
+                    Some(position)
+                }
+                mouse::Cursor::Unavailable => None,
+            };
+            let hovered = position.is_some_and(|position| {
+                let radius = bounds.width.min(bounds.height) / 2.0;
+                let dx = position.x - (bounds.x + bounds.width / 2.0);
+                let dy = position.y - (bounds.y + bounds.height / 2.0);
+                dx * dx + dy * dy <= radius * radius
+            });
+            if hovered != state.hovered {
+                state.hovered = hovered;
+                // Publishing also schedules a redraw, including when this
+                // transition coincides with an active player's redraw.
+                return Some(Action::publish(Msg::Video(VideoMsg::HoverControls(hovered))));
+            }
+        } else {
+            state.hovered = false;
+        }
+
         let redrawing = matches!(event, Event::Window(window::Event::RedrawRequested(_)));
         (redrawing && player_active(self.player)).then(Action::request_redraw)
     }
 
-    fn draw(&self, _state: &(), _cursor: mouse::Cursor, _bounds: Rectangle) -> VideoPrimitive {
+    fn draw(
+        &self,
+        _state: &VideoHoverState,
+        _cursor: mouse::Cursor,
+        _bounds: Rectangle,
+    ) -> VideoPrimitive {
         VideoPrimitive {
             id: self.id,
+            round: self.round,
             frame: self.player.frame(),
             alive: self.alive.clone(),
         }
@@ -406,6 +590,7 @@ fn player_active(player: &Player) -> bool {
 #[derive(Debug)]
 pub(crate) struct VideoPrimitive {
     id: u64,
+    round: bool,
     frame: Option<Arc<Frame>>,
     alive: Weak<()>,
 }
@@ -438,7 +623,7 @@ pub(crate) struct VideoPipeline {
 }
 
 const SHADER: &str = r#"
-struct Uniforms { scale: vec2<f32>, srgb: f32, _pad: f32 };
+struct Uniforms { scale: vec2<f32>, srgb: f32, round: f32 };
 @group(0) @binding(0) var ty: texture_2d<f32>;
 @group(0) @binding(1) var tu: texture_2d<f32>;
 @group(0) @binding(2) var tv: texture_2d<f32>;
@@ -458,6 +643,12 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 }
 
 @fragment fn fs(in: Out) -> @location(0) vec4<f32> {
+    if (u.round > 0.5) {
+        let center = in.uv * 2.0 - vec2(1.0);
+        if (dot(center, center) > 1.0) {
+            discard;
+        }
+    }
     // BT.709, limited range (what phone videos use).
     let y = (textureSample(ty, samp, in.uv).r - 0.0627) * 1.1644;
     let cb = textureSample(tu, samp, in.uv).r - 0.5;
@@ -634,9 +825,12 @@ impl shader::Primitive for VideoPrimitive {
             scale[0],
             scale[1],
             if pipeline.srgb { 1.0 } else { 0.0 },
-            0.0,
+            if self.round { 1.0 } else { 0.0 },
         ];
-        let bytes: Vec<u8> = uniforms.iter().flat_map(|f| f.to_ne_bytes()).collect();
+        let mut bytes = [0u8; 16];
+        for (chunk, value) in bytes.chunks_exact_mut(4).zip(uniforms) {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
         queue.write_buffer(&planes.uniforms, 0, &bytes);
     }
 
@@ -728,6 +922,73 @@ mod tests {
     use super::*;
     use iced::widget::shader::{Pipeline as _, Primitive as _, Program as _};
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_to_tray_closing_main_stops_only_its_video() {
+        use std::sync::atomic::Ordering;
+
+        // Check the other window first so this side of the ownership contract
+        // runs even while the main-window cleanup is still missing.
+        for main_owns_video in [false, true] {
+            let mut app = crate::app::tests::app();
+            let main = app.main_window;
+            let second = WinId::unique();
+            app.session
+                .panes
+                .insert(second, crate::app::pane::ChatPane::default());
+            let owner = if main_owns_video { main } else { second };
+            let stop = Arc::new(AtomicBool::new(false));
+            let token = Arc::new(());
+            app.session.video = Some(VideoPlayback {
+                window: owner,
+                chat_id: 1,
+                message_id: 1,
+                file_id: 1,
+                round: false,
+                player: Player::open(
+                    std::io::Cursor::new(vec![0x1a, 0x45, 0xdf, 0xa3, 1, 2, 3]),
+                    None,
+                    false,
+                ),
+                stop: Arc::clone(&stop),
+                expanded: false,
+                controls_hovered: false,
+                unmuted: 1.0,
+                id: 1,
+                token: Arc::clone(&token),
+            });
+
+            let _ = app.update(Msg::WindowClosed(main));
+
+            assert!(
+                app.session.panes.contains_key(&main),
+                "main pane stays for tray restore"
+            );
+            if main_owns_video {
+                assert!(
+                    app.session.video.is_none(),
+                    "closed main must release its video"
+                );
+                assert!(
+                    stop.load(Ordering::Relaxed),
+                    "the released video must stop its reader"
+                );
+            } else {
+                let video = app
+                    .session
+                    .video
+                    .as_ref()
+                    .expect("other window's video survives");
+                assert_eq!(video.window, second);
+                assert!(Arc::ptr_eq(&video.token, &token), "same video must survive");
+                assert!(
+                    !stop.load(Ordering::Relaxed),
+                    "other window's reader must not stop"
+                );
+            }
+        }
+    }
+
     /// Draws one solid-color frame into an offscreen texture on the real
     /// GPU and reads it back: the pipeline, the upload and the YUV → RGB
     /// conversion all run. Skipped (passes) where no adapter exists.
@@ -754,99 +1015,113 @@ mod tests {
             ((32, 240, 118), [0, 0, 255]),
             ((235, 128, 128), [255, 255, 255]),
         ] {
-            let (w, h) = (8u32, 8u32);
-            let frame = Arc::new(Frame {
-                width: w,
-                height: h,
-                y: vec![y; (w * h) as usize],
-                u: vec![cb; (w * h / 4) as usize],
-                v: vec![cr; (w * h / 4) as usize],
-                pts: Duration::ZERO,
-                serial: crate::av::player::next_serial(),
-            });
-            let primitive = VideoPrimitive {
-                id: 1,
-                frame: Some(frame),
-                alive: Weak::new(),
-            };
-            let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(w as f32, h as f32));
-            let viewport = Viewport::with_physical_size(iced::Size::new(w, h), 1.0);
-            primitive.prepare(&mut pipeline, &device, &queue, &bounds, &viewport);
-
-            let target = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d {
+            // Rectangular (including expanded) video keeps its corners;
+            // round bubble video masks only the corners, not its center.
+            for round in [false, true] {
+                let (w, h) = (8u32, 8u32);
+                let frame = Arc::new(Frame {
                     width: w,
                     height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let view = target.create_view(&Default::default());
-            // Rows of a copy are padded to 256 bytes.
-            let readback = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: 256 * u64::from(h),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            let mut encoder = device.create_command_encoder(&Default::default());
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: None,
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
+                    y: vec![y; (w * h) as usize],
+                    u: vec![cb; (w * h / 4) as usize],
+                    v: vec![cr; (w * h / 4) as usize],
+                    pts: Duration::ZERO,
+                    serial: crate::av::player::next_serial(),
                 });
-                assert!(primitive.draw(&pipeline, &mut pass));
-            }
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &target,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(256),
-                        rows_per_image: Some(h),
+                let primitive = VideoPrimitive {
+                    id: 1,
+                    round,
+                    frame: Some(frame),
+                    alive: Weak::new(),
+                };
+                let bounds =
+                    Rectangle::new(iced::Point::ORIGIN, iced::Size::new(w as f32, h as f32));
+                let viewport = Viewport::with_physical_size(iced::Size::new(w, h), 1.0);
+                primitive.prepare(&mut pipeline, &device, &queue, &bounds, &viewport);
+
+                let target = device.create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
                     },
-                },
-                wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-            );
-            queue.submit([encoder.finish()]);
-            readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .expect("poll");
-            let data = readback.slice(..).get_mapped_range();
-            let center = &data[(4 * 256 + 4 * 4) as usize..(4 * 256 + 4 * 4 + 3) as usize];
-            for (got, want) in center.iter().zip(rgb) {
-                assert!(got.abs_diff(want) <= 6, "{center:?} instead of {rgb:?}");
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                let view = target.create_view(&Default::default());
+                // Rows of a copy are padded to 256 bytes.
+                let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: 256 * u64::from(h),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let mut encoder = device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    assert!(primitive.draw(&pipeline, &mut pass));
+                }
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &target,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(256),
+                            rows_per_image: Some(h),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                queue.submit([encoder.finish()]);
+                readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+                device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .expect("poll");
+                let data = readback.slice(..).get_mapped_range();
+                let center = &data[(4 * 256 + 4 * 4) as usize..(4 * 256 + 4 * 4 + 3) as usize];
+                for (got, want) in center.iter().zip(rgb) {
+                    assert!(got.abs_diff(want) <= 6, "{center:?} instead of {rgb:?}");
+                }
+                let corner = &data[..3];
+                let expected = if round { [0, 0, 0] } else { rgb };
+                for (got, want) in corner.iter().zip(expected) {
+                    assert!(
+                        got.abs_diff(want) <= 6,
+                        "round={round}: corner {corner:?} instead of {expected:?}"
+                    );
+                }
+                drop(data);
+                readback.unmap();
             }
-            drop(data);
-            readback.unmap();
         }
     }
 
@@ -872,12 +1147,13 @@ mod tests {
 
         let program = VideoProgram {
             id: 1,
+            round: false,
             player: &player,
             alive: Weak::new(),
         };
         let redraw = Event::Window(window::Event::RedrawRequested(iced::time::Instant::now()));
-        let action: Option<Action<()>> = program.update(
-            &mut (),
+        let action: Option<Action<Msg>> = program.update(
+            &mut VideoHoverState::default(),
             &redraw,
             Rectangle::default(),
             mouse::Cursor::default(),

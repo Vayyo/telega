@@ -7,7 +7,6 @@ use iced::{Element, Fill, Task};
 
 use super::media::{FileState, Media};
 use super::{App, Msg, WinId};
-use crate::td;
 
 /// Largest side of the decoded picture (about 26 MB of pixels).
 const MAX_SIDE: u32 = 2560;
@@ -68,11 +67,9 @@ impl App {
         } else {
             // Also raised if it is already downloading at the bubble's
             // lower priority (16): TDLib reorders an in-progress download
-            // when asked again with a higher one.
-            Task::perform(
-                td::download_file(self.session.client_id, file_id, 32),
-                Msg::Done,
-            )
+            // when asked again with a higher one. An explicit action, so it
+            // is also what retries a file that failed.
+            self.request_download(file_id, 32)
         }
     }
 

@@ -1,9 +1,10 @@
 use iced::ContentFit;
 use iced::widget::{
-    button, column, container, image, mouse_area, rich_text, row, scrollable, sensor, space, span,
-    stack, text, text_editor, text_input, toggler, tooltip,
+    button, column, container, float, image, mouse_area, pin, responsive, rich_text, row,
+    scrollable, sensor, slider, space, span, stack, text, text_editor, text_input, toggler,
+    tooltip,
 };
-use iced::{Element, Fill};
+use iced::{Element, Fill, Length, Vector};
 use tdlib_rs::enums::MessageSender;
 
 use super::avatars::Peer;
@@ -75,22 +76,31 @@ impl App {
                 return self.view_auth();
             }
             container(text("Нет входа в аккаунт")).center(Fill).into()
-        } else if main && self.session.settings_open {
-            row![
-                self.view_chat_list(window, pane, true),
-                self.view_settings()
-            ]
-            .into()
+        } else if main {
+            let body: Element<'_, Msg> = if self.session.settings_open {
+                row![
+                    self.view_chat_list(window, pane, true),
+                    self.view_settings()
+                ]
+                .into()
+            } else if let Some(panel) = pane.list.archive_settings.as_ref() {
+                row![
+                    self.view_chat_list(window, pane, true),
+                    self.view_archive_settings(window, panel)
+                ]
+                .into()
+            } else {
+                row![
+                    self.view_chat_list(window, pane, true),
+                    self.view_chat(window, pane, true)
+                ]
+                .into()
+            };
+            column![self.view_main_header(), body].into()
         } else if let Some(panel) = pane.list.archive_settings.as_ref() {
             row![
-                self.view_chat_list(window, pane, main),
+                self.view_chat_list(window, pane, false),
                 self.view_archive_settings(window, panel)
-            ]
-            .into()
-        } else if main {
-            row![
-                self.view_chat_list(window, pane, true),
-                column![self.view_tab_bar(), self.view_chat(window, pane, true)]
             ]
             .into()
         } else {
@@ -103,8 +113,15 @@ impl App {
         // An open menu closes on any click that no widget handled. The area is
         // always present: swapping the root widget would reset scroll state.
         let mut area = mouse_area(screen);
-        if pane.menu.is_some() || pane.text_selection.is_some() {
-            let close = Msg::Pane(window, PaneMsg::ClickOutside);
+        if pane.menu.is_some()
+            || pane.text_selection.is_some()
+            || (main && (self.session.accounts_open || self.session.confirm_logout))
+        {
+            let close = if main && (self.session.accounts_open || self.session.confirm_logout) {
+                Msg::DismissAccountPopup
+            } else {
+                Msg::Pane(window, PaneMsg::ClickOutside)
+            };
             area = area.on_press(close.clone()).on_right_press(close);
         }
         // The photo viewer lies over everything; the stack is always there
@@ -114,7 +131,125 @@ impl App {
             .or_else(|| self.view_video_overlay(window))
             .or_else(|| self.view_card(window))
             .unwrap_or_else(|| space().into());
-        stack![area, overlay].into()
+        stack![
+            area,
+            if main {
+                self.view_account_popup()
+            } else {
+                space().into()
+            },
+            overlay
+        ]
+        .into()
+    }
+
+    /// Controls stay fixed on the left; only the tabs consume the remaining width.
+    fn view_main_header(&self) -> Element<'_, Msg> {
+        let name = self.account_name(self.session.slot);
+        let id = self
+            .session
+            .my_id
+            .or_else(|| {
+                self.settings
+                    .accounts
+                    .iter()
+                    .find(|a| a.slot == self.session.slot)
+                    .and_then(|a| a.user_id)
+            })
+            .unwrap_or_default();
+        let profile = button(self.avatar(Peer::User(id), name, 30.0))
+            .padding([2, 5])
+            .style(button::text)
+            .on_press(Msg::ToggleAccounts);
+        let settings = tooltip(
+            button(text("⚙").size(23))
+                .padding([2, 7])
+                .style(button::text)
+                .on_press(Msg::OpenSettings),
+            "Настройки",
+            tooltip::Position::Bottom,
+        );
+        let trash = tooltip(
+            button(image(super::icons::TRASH.clone()).width(18).height(18))
+                .padding([6, 8])
+                .style(button::text)
+                .on_press(Msg::CloseAllTabs),
+            "Закрыть незакреплённые вкладки",
+            tooltip::Position::Bottom,
+        );
+        container(
+            row![profile, settings, trash, self.view_tab_bar()]
+                .spacing(4)
+                .align_y(iced::Center),
+        )
+        .width(Fill)
+        .style(move |_: &iced::Theme| container::background(self.look.sidebar))
+        .into()
+    }
+
+    /// Account panels are overlays: neither one changes the sidebar's height or scroll identity.
+    fn view_account_popup(&self) -> Element<'_, Msg> {
+        if !self.session.accounts_open && !self.session.confirm_logout {
+            return space().into();
+        }
+        responsive(|size| {
+            let width = (size.width - 12.0).clamp(0.0, 280.0);
+            let name = self.account_name(self.session.slot);
+            let id = self
+                .session
+                .my_id
+                .or_else(|| {
+                    self.settings
+                        .accounts
+                        .iter()
+                        .find(|a| a.slot == self.session.slot)
+                        .and_then(|a| a.user_id)
+                })
+                .unwrap_or_default();
+            let panel: Element<'_, Msg> = if self.session.confirm_logout {
+                column![
+                    text(format!("Выйти из «{name}»?")).size(15),
+                    row![
+                        button("Да")
+                            .style(button::danger)
+                            .on_press(Msg::ConfirmLogOut(true)),
+                        button("Нет")
+                            .style(button::secondary)
+                            .on_press(Msg::ConfirmLogOut(false))
+                    ]
+                    .spacing(8)
+                ]
+                .spacing(12)
+                .into()
+            } else {
+                column![
+                    row![
+                        self.avatar(Peer::User(id), name, 42.0),
+                        column![
+                            text(name).size(16),
+                            button("Выйти").style(button::text).on_press(Msg::LogOut)
+                        ]
+                        .spacing(2)
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Center),
+                    self.view_accounts()
+                ]
+                .spacing(8)
+                .into()
+            };
+            let popup = container(panel)
+                .padding(10)
+                .width(width)
+                .style(container::bordered_box);
+            pin(float(
+                container(scrollable(popup).height(Length::Shrink))
+                    .max_height((size.height - 48.0).max(0.0)),
+            )
+            .translate(|_, _| Vector::new(6.0, 42.0)))
+            .into()
+        })
+        .into()
     }
 
     /// Recent chats as browser-like tabs; scrolls sideways when they do not fit.
@@ -143,6 +278,9 @@ impl App {
             ]
             .spacing(6)
             .align_y(iced::Center);
+            if self.is_bot_chat(chat_id) {
+                content = content.push(text("Bot").size(11));
+            }
             if let Some(chat) = self.session.chats.get(&chat_id)
                 && chat.unread > 0
             {
@@ -171,12 +309,6 @@ impl App {
             .on_right_press(Msg::TogglePin(chat_id))
             .into()
         });
-        // First slot: the red trash can closes all (unpinned) tabs.
-        let trash = button(image(super::icons::TRASH.clone()).width(18).height(18))
-            .padding([4, 6])
-            .style(button::text)
-            .on_press(Msg::CloseAllTabs);
-        let tabs = std::iter::once(trash.into()).chain(tabs);
         let bar = scrollable(row(tabs).spacing(4).padding([4, 6]))
             .id(iced::widget::Id::new(TAB_BAR))
             .direction(scrollable::Direction::Horizontal(
@@ -433,9 +565,40 @@ impl App {
             list_visible_rows(chat_offset.max(0.0), viewport_height, ids.len(), row_height);
         let items = ids[visible.start..visible.end].iter().filter_map(|&id| {
             let chat = self.session.chats.get(&id)?;
-            let mut title = row![text(&chat.title).size(15).width(Fill)]
+            let bot = self.is_bot_chat(id);
+            let mut title = if bot {
+                // Inline spans keep the label beside short names; truncate
+                // long names before the badge so it stays visible in compact lists.
+                let limit = if full { 18 } else { 6 };
+                let name = if chat.title.chars().count() > limit {
+                    let (mut short, cut) = take_clusters(&chat.title, limit);
+                    if cut {
+                        short.push('…');
+                        std::borrow::Cow::Owned(short)
+                    } else {
+                        std::borrow::Cow::Borrowed(chat.title.as_str())
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(chat.title.as_str())
+                };
+                row![
+                    container(
+                        rich_text::<(), _, _, _>([span(name), span(" Bot").size(11)])
+                            .size(15)
+                            .wrapping(text::Wrapping::None)
+                            .width(Fill)
+                    )
+                    .width(Fill)
+                    .clip(true)
+                ]
                 .spacing(4)
-                .align_y(iced::Center);
+                .align_y(iced::Center)
+                .width(Fill)
+            } else {
+                row![text(&chat.title).size(15).width(Fill)]
+                    .spacing(4)
+                    .align_y(iced::Center)
+            };
             if chat.muted() {
                 title = title.push(text("🔇").size(11).font(rich::EMOJI_FONT));
             }
@@ -615,18 +778,16 @@ impl App {
                         .chats
                         .get(&m.chat_id)
                         .map_or("", |c| c.title.as_str());
+                    let mut name = row![text(chat).size(12)].spacing(4).align_y(iced::Center);
+                    if self.is_bot_chat(m.chat_id) {
+                        name = name.push(text("Bot").size(11).style(text::primary));
+                    }
                     list = list.push(
-                        button(
-                            column![
-                                text(chat).size(12),
-                                text(one_line(&m.preview(), 40)).size(12)
-                            ]
-                            .spacing(1),
-                        )
-                        .width(Fill)
-                        .height(SEARCH_ROW_HEIGHT - 2.0)
-                        .style(button::text)
-                        .on_press(Msg::OpenFound(window, m.chat_id, m.id)),
+                        button(column![name, text(one_line(&m.preview(), 40)).size(12)].spacing(1))
+                            .width(Fill)
+                            .height(SEARCH_ROW_HEIGHT - 2.0)
+                            .style(button::text)
+                            .on_press(Msg::OpenFound(window, m.chat_id, m.id)),
                     );
                 }
                 list = list.push(space().height(visible.below));
@@ -789,60 +950,7 @@ impl App {
         if !full {
             return container(list).width(220).height(Fill).style(panel).into();
         }
-        let header: Element<'_, Msg> = if self.session.confirm_logout {
-            row![
-                text(format!(
-                    "Выйти из «{}»?",
-                    self.account_name(self.session.slot)
-                ))
-                .width(Fill),
-                button("Да")
-                    .style(button::danger)
-                    .on_press(Msg::ConfirmLogOut(true)),
-                button("Нет")
-                    .style(button::secondary)
-                    .on_press(Msg::ConfirmLogOut(false)),
-            ]
-            .spacing(6)
-            .align_y(iced::Center)
-            .into()
-        } else {
-            row![
-                button(
-                    row![
-                        text(self.account_name(self.session.slot)).size(16),
-                        text(if self.session.accounts_open {
-                            "▴"
-                        } else {
-                            "▾"
-                        })
-                        .size(14),
-                    ]
-                    .spacing(6),
-                )
-                .style(button::text)
-                .on_press(Msg::ToggleAccounts),
-                space().width(Fill),
-                button("Настройки")
-                    .style(button::secondary)
-                    .on_press(Msg::OpenSettings),
-                button("Выйти")
-                    .style(button::secondary)
-                    .on_press(Msg::LogOut),
-            ]
-            .spacing(6)
-            .align_y(iced::Center)
-            .into()
-        };
-        let mut top = column![container(header).padding(6)];
-        if self.session.accounts_open {
-            top = top.push(self.view_accounts());
-        }
-        container(column![top, list])
-            .width(300)
-            .height(Fill)
-            .style(panel)
-            .into()
+        container(list).width(300).height(Fill).style(panel).into()
     }
 
     /// Tabs of Telegram folders above the chat list, with unread counters.
@@ -1153,17 +1261,20 @@ impl App {
     /// Account switcher: the added accounts and "add".
     fn view_accounts(&self) -> Element<'_, Msg> {
         let mut list = column![].spacing(2).padding([0, 6]);
-        for account in self.logged_in() {
-            let current = account.slot == self.session.slot;
+        for account in self.logged_in().filter(|a| a.slot != self.session.slot) {
+            let name = self.account_name(account.slot);
             list = list.push(
-                button(text(self.account_name(account.slot)).size(14))
-                    .width(Fill)
-                    .style(if current {
-                        button::primary
-                    } else {
-                        button::text
-                    })
-                    .on_press_maybe((!current).then_some(Msg::SwitchAccount(account.slot))),
+                button(
+                    row![
+                        self.account_avatar(account.slot, account.user_id.unwrap(), name, 30.0),
+                        text(name).size(14)
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Center),
+                )
+                .width(Fill)
+                .style(button::text)
+                .on_press(Msg::SwitchAccount(account.slot)),
             );
         }
         if self.archive_collapsed() {
@@ -1239,6 +1350,44 @@ impl App {
         .into()
     }
 
+    fn view_cache_settings(&self) -> Element<'_, Msg> {
+        let limits = self.settings.cache;
+        column![
+            text("Хранилище").size(16),
+            text(format!("Размер кэша: {} ГБ", limits.gib() as u32)).size(14),
+            slider(1.0_f32..=100.0, limits.gib(), move |gib| {
+                Msg::SetCachePolicy(crate::settings::CacheLimits::from_sliders(
+                    gib,
+                    limits.months(),
+                ))
+            })
+            .step(1.0_f32)
+            .on_release(Msg::ApplyCachePolicy),
+            text(format!("Срок хранения: {} мес.", limits.months() as u32)).size(14),
+            slider(1.0_f32..=12.0, limits.months(), move |months| {
+                Msg::SetCachePolicy(crate::settings::CacheLimits::from_sliders(
+                    limits.gib(),
+                    months,
+                ))
+            })
+            .step(1.0_f32)
+            .on_release(Msg::ApplyCachePolicy),
+            text(
+                "Лимит файлов TDLib действует отдельно для каждого аккаунта; \
+                 такой же отдельный лимит — для общего кэша декодированных аватаров."
+            )
+            .size(12),
+            text(
+                "Фото профилей, стикеры, миниатюры и обои TDLib может защищать от очистки. \
+                 База данных, архив и плагины не входят в лимит. Очистка проходит при \
+                 очередном обычном обслуживании, не сразу после изменения."
+            )
+            .size(12),
+        ]
+        .spacing(8)
+        .into()
+    }
+
     fn view_settings(&self) -> Element<'_, Msg> {
         if self.session.plugin_help_open {
             return self.view_plugin_help();
@@ -1269,6 +1418,7 @@ impl App {
             notifications,
             keep_deleted,
             self.view_look_settings(),
+            self.view_cache_settings(),
             self.view_password_settings(),
             self.view_plugins(),
         ]
@@ -1392,16 +1542,17 @@ impl App {
             .get(&chat_id)
             .map_or("", |c| c.title.as_str());
         let on_pane = move |msg| Msg::Pane(window, msg);
+        let mut chat_name = row![text(title).size(18)].spacing(4).align_y(iced::Center);
+        if self.is_bot_chat(chat_id) {
+            chat_name = chat_name.push(text("Bot").size(11).style(text::primary));
+        }
 
         // Avatar and title open the profile panel.
         let mut header = row![
             button(
-                row![
-                    self.avatar(Peer::Chat(chat_id), title, 32.0),
-                    text(title).size(18)
-                ]
-                .spacing(8)
-                .align_y(iced::Center),
+                row![self.avatar(Peer::Chat(chat_id), title, 32.0), chat_name]
+                    .spacing(8)
+                    .align_y(iced::Center),
             )
             .padding(0)
             .style(button::text)
@@ -1666,12 +1817,19 @@ impl App {
             self.view_bubble(window, pane, &pane.messages[i], prev)
         });
 
+        // A loading label has a fixed row height so its contribution to
+        // scroll content and the popup anchor is identical.
+        const LOADING_ROW_HEIGHT: f32 = 16.0;
         // A plain column: its diff checks widget types. iced's keyed column
         // hands child state to a different widget type when several rows
         // change at once (panicked with "Downcast on stateless state").
         let mut history = column![].spacing(SPACING).padding(HISTORY_PADDING);
         if pane.loading_older && visible.start == 0 {
-            history = history.push(container(text("Загрузка…").size(12)).center_x(Fill));
+            history = history.push(
+                container(text("Загрузка…").size(12))
+                    .center_x(Fill)
+                    .height(LOADING_ROW_HEIGHT),
+            );
         }
         let mut history = history
             .push(space().height(visible.above))
@@ -1680,14 +1838,104 @@ impl App {
             // Room for the "печатает…" line, so it never covers the last message.
             .push(space().height(TYPING_ROOM));
         if pane.loading_newer {
-            history = history.push(container(text("Загрузка…").size(12)).center_x(Fill));
+            history = history.push(
+                container(text("Загрузка…").size(12))
+                    .center_x(Fill)
+                    .height(LOADING_ROW_HEIGHT),
+            );
         }
-        scrollable(history)
+        let history = scrollable(history)
             .id(pane.scroll_id.clone())
             .anchor_bottom()
             .on_scroll(move |v| on_pane(PaneMsg::Scrolled(v)))
-            .height(Fill)
+            .height(Fill);
+
+        // The popup is a sibling of the scrollable, not part of its measured
+        // rows. Both children remain in place on toggle, preserving scroll
+        // state; responsive gives the real viewport even before on_scroll.
+        let popup = responsive(move |size| {
+            let Some(menu) = pane.menu.as_ref() else {
+                return space().into();
+            };
+            let Some(index) = (visible.start..visible.end)
+                .find(|&index| pane.messages[index].id == menu.message_id)
+            else {
+                return space().into();
+            };
+            let m = &pane.messages[index];
+            let rows = &pane.messages[visible.start..visible.end];
+            let after: f32 = pane.messages[index + 1..visible.end]
+                .iter()
+                .map(|item| pane.height_estimate(item))
+                .sum::<f32>()
+                + visible.below;
+            let bubble_height = pane.height_estimate(m) - SPACING;
+            let newer_height = if pane.loading_newer {
+                LOADING_ROW_HEIGHT + SPACING
+            } else {
+                0.0
+            };
+            let older_height = if pane.loading_older && visible.start == 0 {
+                LOADING_ROW_HEIGHT + SPACING
+            } else {
+                0.0
+            };
+            // Measured rows include day/unread separators. Empty off-screen
+            // spacers and the two gaps around them are real column children.
+            let content_height = visible.above
+                + visible.below
+                + rows
+                    .iter()
+                    .map(|item| pane.height_estimate(item))
+                    .sum::<f32>()
+                + TYPING_ROOM
+                + 2.0 * (HISTORY_PADDING + SPACING)
+                + older_height
+                + newer_height;
+            let offset = pane
+                .scroll
+                .map_or(0.0, |offset| offset.y)
+                .clamp(0.0, (content_height - size.height).max(0.0));
+            let bubble_bottom = size.height.min(content_height) + offset
+                - TYPING_ROOM
+                - HISTORY_PADDING
+                - 2.0 * SPACING
+                - newer_height
+                - after;
+            let bubble_top = bubble_bottom - bubble_height;
+            if bubble_bottom <= 0.0 || bubble_top >= size.height {
+                return space().into();
+            }
+            let x = if m.outgoing {
+                (size.width - 260.0).max(0.0)
+            } else if self.shows_sender(m) {
+                42.0
+            } else {
+                10.0
+            };
+            let menu = container(
+                scrollable(view_menu(window, m, menu, pane.pinned_locally(m.id)))
+                    .height(Length::Shrink)
+                    .width(250),
+            )
+            .max_height(size.height);
+            pin(float(menu).translate(move |bounds, _viewport| {
+                let h = bounds.height;
+                let y = if bubble_bottom + h <= size.height {
+                    bubble_bottom
+                } else if bubble_top >= h {
+                    bubble_top - h
+                } else {
+                    bubble_bottom.min(size.height - h)
+                };
+                Vector::new(
+                    x.min((size.width - bounds.width).max(0.0)) + 0.01,
+                    y.max(0.0) + 0.01,
+                )
+            }))
             .into()
+        });
+        stack![history, popup].into()
     }
 
     fn view_bubble<'a>(
@@ -1722,6 +1970,11 @@ impl App {
                     .into(),
             };
             let mut name = row![label].spacing(6).align_y(iced::Center);
+            if let MessageSender::User(u) = &m.sender
+                && self.is_bot_user(u.user_id)
+            {
+                name = name.push(text("Bot").size(11).style(text::primary));
+            }
             // Roles in the accent, plain member tags faded, like Telegram.
             if let Some((tag, role)) = self.sender_badge(m) {
                 name = name.push(text(tag).size(11).style(move |theme: &iced::Theme| {
@@ -1885,12 +2138,6 @@ impl App {
         } else {
             bubble
         };
-        let mut stack = column![bubble].spacing(4);
-        if let Some(menu) = &pane.menu
-            && menu.message_id == m.id
-        {
-            stack = stack.push(view_menu(window, m, menu, pane.pinned_locally(m.id)));
-        }
         let stack: Element<'a, Msg> = if group_incoming {
             let side: Element<'a, Msg> = if run_start {
                 let peer = match &m.sender {
@@ -1908,9 +2155,9 @@ impl App {
             } else {
                 space().width(30).into()
             };
-            row![side, stack].spacing(6).into()
+            row![side, bubble].spacing(6).into()
         } else {
-            stack.into()
+            bubble.into()
         };
         let aligned = container(stack).width(Fill);
         let aligned = if m.outgoing {
@@ -1971,6 +2218,10 @@ impl App {
             .chats
             .get(&chat_id)
             .map_or("", |c| c.title.as_str());
+        let mut profile_name = row![text(title).size(18)].spacing(4).align_y(iced::Center);
+        if self.is_bot_chat(chat_id) {
+            profile_name = profile_name.push(text("Bot").size(11).style(text::primary));
+        }
         let mut head = column![
             row![
                 space().width(Fill),
@@ -1979,7 +2230,7 @@ impl App {
                     .on_press(Msg::ToggleProfile(window)),
             ],
             container(self.avatar(Peer::Chat(chat_id), title, 96.0)).center_x(Fill),
-            container(text(title).size(18)).center_x(Fill),
+            container(profile_name).center_x(Fill),
         ]
         .spacing(6);
         let mut body = column![].spacing(10);
@@ -2839,6 +3090,7 @@ impl App {
             } => {
                 let (w, h) = media.display_box().unwrap_or((PHOTO_MAX_W, PHOTO_MAX_H));
                 let animated = matches!(media, Media::Animation { .. });
+                let round = matches!(media, Media::Video { round: true, .. });
                 if *spoiler && !pane.revealed.contains(&m.id) {
                     return spoiler_cover(window, m.id, mini.as_ref(), w, h);
                 }
@@ -2857,6 +3109,7 @@ impl App {
                         .width(w)
                         .height(h)
                         .content_fit(ContentFit::Cover)
+                        .border_radius(if round { w / 2.0 } else { 0.0 })
                 };
                 let picture: Element<'_, Msg> = match frame {
                     Some(handle) => match under {
@@ -2866,7 +3119,13 @@ impl App {
                     None => container(space())
                         .width(w)
                         .height(h)
-                        .style(container::dark)
+                        .style(move |theme| {
+                            let mut style = container::dark(theme);
+                            if round {
+                                style.border.radius = (w / 2.0).into();
+                            }
+                            style
+                        })
                         .into(),
                 };
                 let mut label = if animated {
@@ -2893,7 +3152,7 @@ impl App {
                 // A video playing here is drawn by the player (unless it
                 // is expanded over the window).
                 if !animated
-                    && let Some(video) = self.video_of(window, file_id)
+                    && let Some(video) = self.video_of(window, m.chat_id, m.id, file_id, round)
                     && !video.expanded
                 {
                     return self.view_video(video, w, h);
@@ -2903,7 +3162,9 @@ impl App {
                 let play = if animated {
                     Msg::PlayVideo(file_id)
                 } else {
-                    Msg::Video(super::video::VideoMsg::Play(window, m.chat_id, file_id))
+                    Msg::Video(super::video::VideoMsg::Play(
+                        window, m.chat_id, m.id, file_id, round,
+                    ))
                 };
                 let clickable = mouse_area(layers)
                     .interaction(iced::mouse::Interaction::Pointer)
