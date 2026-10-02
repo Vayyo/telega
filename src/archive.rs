@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tdlib_rs::enums::MessageSender;
 use tdlib_rs::types::{MessageSenderChat, MessageSenderUser};
 
@@ -18,6 +18,7 @@ pub struct Archive {
     conn: Connection,
     /// With a client password, texts are stored encrypted with this key.
     key: Option<crate::lock::Key>,
+    maintenance_warning: Option<String>,
     /// Plaintext most recently written for a message, so an identical
     /// re-save skips the SQLite write instead of opening a transaction and
     /// re-encrypting for nothing: TDLib reports the same message through
@@ -73,7 +74,7 @@ impl Archive {
     fn open(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+             PRAGMA synchronous = FULL;
              PRAGMA secure_delete = ON;
              CREATE TABLE IF NOT EXISTS messages (
                  chat_id     INTEGER NOT NULL,
@@ -109,6 +110,12 @@ impl Archive {
                  PRIMARY KEY (list, chat_id)
              ) WITHOUT ROWID;",
         )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS archive_key (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 key_check TEXT NOT NULL
+             );",
+        )?;
         // Archives made before send times were kept get the column.
         let has_date = conn
             .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'date'")?
@@ -119,6 +126,7 @@ impl Archive {
         Ok(Self {
             conn,
             key: None,
+            maintenance_warning: None,
             dedup: HashMap::new(),
             dedup_order: VecDeque::new(),
         })
@@ -134,65 +142,120 @@ impl Archive {
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))
     }
 
-    /// Re-stores every text under `new` (a password set, changed or
-    /// removed), in one transaction: all or nothing.
-    pub fn rekey(&mut self, new: Option<crate::lock::Key>) -> rusqlite::Result<()> {
-        let old = self.key;
+    /// Actual-used restart seam: identify either committed source, then move
+    /// forward to target without partial row writes.
+    pub fn recover_rekey(
+        &mut self,
+        old: Option<crate::lock::Key>,
+        target: Option<crate::lock::Key>,
+    ) -> rusqlite::Result<()> {
+        let source = match self.verify_key(old.as_ref()) {
+            Ok(()) => old,
+            Err(rusqlite::Error::InvalidQuery | rusqlite::Error::ToSqlConversionFailure(_)) => {
+                self.verify_key(target.as_ref())?;
+                target.clone()
+            }
+            Err(e) => return Err(e),
+        };
+        if source == target {
+            let has_marker = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM archive_key WHERE id = 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !has_marker {
+                let tx = self.conn.transaction()?;
+                let marker = Self::key_marker(target.as_ref())?;
+                tx.execute(
+                    "INSERT INTO archive_key (id, key_check) VALUES (1, ?1)",
+                    [marker],
+                )?;
+                tx.commit()?;
+            }
+            self.key = target;
+            return Ok(());
+        }
         let tx = self.conn.transaction()?;
-        {
+        for (select, update_sql) in [
+            (
+                "SELECT chat_id, id, text FROM messages",
+                "UPDATE messages SET text = ?3 WHERE chat_id = ?1 AND id = ?2",
+            ),
+            (
+                "SELECT chat_id, id, text FROM local_pins",
+                "UPDATE local_pins SET text = ?3 WHERE chat_id = ?1 AND id = ?2",
+            ),
+        ] {
             let rows: Vec<(i64, i64, String)> = tx
-                .prepare("SELECT chat_id, id, text FROM messages")?
+                .prepare(select)?
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite::Result<_>>()?;
-            let mut update =
-                tx.prepare("UPDATE messages SET text = ?3 WHERE chat_id = ?1 AND id = ?2")?;
+            let mut update = tx.prepare(update_sql)?;
             for (chat_id, id, text) in rows {
-                let plain = crate::lock::open(old.as_ref(), &text).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        e.into(),
-                    )
-                })?;
-                let restored = match &new {
-                    Some(key) => crate::lock::seal(key, plain.as_bytes())
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?,
-                    None => crate::lock::mark_plain(&plain),
-                };
+                let plain = crate::lock::open(source.as_ref(), &text)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                let restored = crate::lock::store(target.as_ref(), &plain)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
                 update.execute(params![chat_id, id, restored])?;
             }
         }
-        {
-            let pins: Vec<(i64, i64, String)> = tx
-                .prepare("SELECT chat_id, id, text FROM local_pins")?
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            let mut update =
-                tx.prepare("UPDATE local_pins SET text = ?3 WHERE chat_id = ?1 AND id = ?2")?;
-            for (chat_id, id, text) in pins {
-                let plain = crate::lock::open(old.as_ref(), &text).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        e.into(),
-                    )
-                })?;
-                let restored = match &new {
-                    Some(key) => crate::lock::seal(key, plain.as_bytes())
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?,
-                    None => crate::lock::mark_plain(&plain),
-                };
-                update.execute(params![chat_id, id, restored])?;
-            }
-        }
+        let marker = Self::key_marker(target.as_ref())?;
+        tx.execute(
+            "INSERT INTO archive_key (id, key_check) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET key_check = excluded.key_check",
+            [marker],
+        )?;
         tx.commit()?;
-        self.key = new;
-        // Old plaintext or ciphertext left behind by the UPDATEs above must
-        // not linger in freed pages or WAL frames now that the archive is
-        // meant to be encrypted (or, on removal, no longer needs to be).
-        self.conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        self.key = target;
+        self.dedup.clear();
+        self.dedup_order.clear();
+        self.maintenance_warning = self
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+            .err()
+            .map(|e| e.to_string());
         Ok(())
+    }
+
+    fn key_marker(key: Option<&crate::lock::Key>) -> rusqlite::Result<String> {
+        crate::lock::store(key, "telega archive key marker v1")
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))
+    }
+
+    /// An older archive without a marker must validate all encrypted rows;
+    /// legacy plaintext never authenticates an allegedly encrypted key.
+    pub fn verify_key(&self, key: Option<&crate::lock::Key>) -> rusqlite::Result<()> {
+        let marker: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT key_check FROM archive_key WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(marker) = &marker
+            && (marker.starts_with("enc:") != key.is_some()
+                || crate::lock::open(key, marker).as_deref() != Ok("telega archive key marker v1"))
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        for select in ["SELECT text FROM messages", "SELECT text FROM local_pins"] {
+            let mut query = self.conn.prepare(select)?;
+            let rows = query.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let row = row?;
+                if marker.is_none() && key.is_some() && !row.starts_with("enc:") {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                crate::lock::open(key, &row)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn maintenance_warning(&self) -> Option<&str> {
+        self.maintenance_warning.as_deref()
     }
 
     /// Pins a message for the user only; the text is kept (sealed with the
@@ -411,10 +474,16 @@ impl Archive {
         for &id in ids {
             self.forget_dedup(chat_id, id);
         }
-        // The deleted text must not survive in freed pages or WAL frames:
-        // the point of purging is that it is gone for good.
-        self.conn
+        // The row deletion has already committed. Maintenance failure must
+        // warn the caller, not turn a successful purge into failed recovery.
+        if let Err(e) = self
+            .conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+        {
+            self.maintenance_warning
+                .get_or_insert_with(|| e.to_string());
+        }
+        Ok(())
     }
 
     /// Deleted messages of the chat with `min_id <= id < max_id`.
@@ -470,7 +539,7 @@ impl Archive {
 mod tests {
     use super::*;
 
-    fn msg(id: i64, text: &str) -> MsgItem {
+    pub(super) fn msg(id: i64, text: &str) -> MsgItem {
         MsgItem {
             chat_id: 1,
             id,
@@ -531,7 +600,9 @@ mod tests {
         m.deleted = true;
         archive.save([&msg(4, "открытый")]).unwrap();
         let key = crate::lock::derive("пароль", "соль-соль").unwrap();
-        archive.rekey(Some(key)).unwrap();
+        archive
+            .recover_rekey(archive.key.clone(), Some(key.clone()))
+            .unwrap();
         archive.save([&m]).unwrap();
         archive.mark_deleted(1, &[4, 5]).unwrap();
         let raw: Vec<String> = archive
@@ -557,7 +628,7 @@ mod tests {
         assert_eq!(texts(&archive), ["[зашифровано]", "[зашифровано]"]);
         // Password removed: back to plain text.
         archive.set_key(Some(key));
-        archive.rekey(None).unwrap();
+        archive.recover_rekey(archive.key.clone(), None).unwrap();
         archive.set_key(None);
         assert_eq!(texts(&archive), ["открытый", "секрет"]);
     }
@@ -573,7 +644,9 @@ mod tests {
         // leaving TDLib re-keyed while the archive (and so the password)
         // never got enabled.
         let key = crate::lock::derive("пароль", "соль-соль").unwrap();
-        archive.rekey(Some(key)).unwrap();
+        archive
+            .recover_rekey(archive.key.clone(), Some(key))
+            .unwrap();
         let text = archive.deleted(1, 0, 10).unwrap()[0].text.clone();
         assert_eq!(text, "enc:это выглядит как шифротекст, но нет");
     }
@@ -593,7 +666,9 @@ mod tests {
         assert!(archive.local_pins(2).unwrap().is_empty());
 
         let key = crate::lock::derive("пароль", "соль-соль").unwrap();
-        archive.rekey(Some(key)).unwrap();
+        archive
+            .recover_rekey(archive.key.clone(), Some(key.clone()))
+            .unwrap();
         assert_eq!(archive.local_pins(1).unwrap()[1].text, "первое");
         archive.set_key(None);
         assert_eq!(archive.local_pins(1).unwrap()[1].text, "[зашифровано]");
@@ -725,5 +800,238 @@ mod tests {
         assert_eq!(count(&a), 0, "purged row is gone");
         a.save(&[msg(1, "world")]).unwrap();
         assert_eq!(count(&a), 1, "resave after purge must reinsert the row");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod security_probes {
+    use super::*;
+    use std::ffi::{c_char, c_int, c_void};
+
+    // SQLite's VACUUM creates an internal temporary database with ATTACH.
+    // Only this in-memory archive connection gets the callback. The callback
+    // has no user-data pointer, never dereferences SQLite arguments and is
+    // removed before the connection is dropped (including on assertion panic).
+    unsafe extern "C" fn deny_vacuum_attach(
+        _: *mut c_void,
+        action: c_int,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+    ) -> c_int {
+        if action == rusqlite::ffi::SQLITE_ATTACH {
+            rusqlite::ffi::SQLITE_DENY
+        } else {
+            rusqlite::ffi::SQLITE_OK
+        }
+    }
+
+    pub(crate) struct ScopedAuthorizer(*mut rusqlite::ffi::sqlite3);
+
+    impl ScopedAuthorizer {
+        fn on(conn: &Connection) -> Self {
+            // SAFETY: the archive connection outlives this guard; only this
+            // test uses it, on this thread, and the callback accesses no data.
+            let db = unsafe { conn.handle() };
+            let rc = unsafe {
+                rusqlite::ffi::sqlite3_set_authorizer(
+                    db,
+                    Some(deny_vacuum_attach),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+            Self(db)
+        }
+    }
+
+    impl Drop for ScopedAuthorizer {
+        fn drop(&mut self) {
+            // SAFETY: the archive is still alive; remove the callback before
+            // any further SQLite operation or connection teardown.
+            let rc = unsafe {
+                rusqlite::ffi::sqlite3_set_authorizer(self.0, None, std::ptr::null_mut())
+            };
+            assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+        }
+    }
+
+    impl Archive {
+        pub(crate) fn block_vacuum_for_test(&self) -> ScopedAuthorizer {
+            ScopedAuthorizer::on(&self.conn)
+        }
+    }
+
+    #[test]
+    fn security_fix_rekey_committed_new_key_remains_successful_when_vacuum_fails() {
+        let mut archive = Archive::in_memory();
+        let old = crate::lock::derive("synthetic-old-key", "synthetic-old-salt").unwrap();
+        let new = crate::lock::derive("synthetic-new-key", "synthetic-new-salt").unwrap();
+        archive.set_key(Some(old.clone()));
+        let item = MsgItem {
+            chat_id: 923,
+            id: 1,
+            sender: MessageSender::User(MessageSenderUser { user_id: 19 }),
+            text: "synthetic audit text".into(),
+            outgoing: false,
+            deleted: false,
+            media: None,
+            pending: false,
+            failed: false,
+            rich: Vec::new(),
+            reply_to: None,
+            date: 0,
+            edited: false,
+            reactions: Vec::new(),
+            forwarded: None,
+            extra: None,
+            sender_tag: String::new(),
+        };
+        archive.save([&item]).unwrap();
+        archive.mark_deleted(923, &[1]).unwrap();
+        archive.pin_local(&item, 1).unwrap();
+
+        let blocker = ScopedAuthorizer::on(&archive.conn);
+        let result = archive.recover_rekey(archive.key.clone(), Some(new.clone()));
+        drop(blocker);
+        let stored: String = archive
+            .conn
+            .query_row("SELECT text FROM messages", [], |r| r.get(0))
+            .unwrap();
+        let pinned: String = archive
+            .conn
+            .query_row("SELECT text FROM local_pins", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(crate::lock::open(Some(&new), &stored).unwrap(), item.text);
+        assert_eq!(crate::lock::open(Some(&new), &pinned).unwrap(), item.text);
+        assert!(crate::lock::open(Some(&old), &stored).is_err());
+        assert!(crate::lock::open(Some(&old), &pinned).is_err());
+        assert_eq!(archive.deleted(923, 0, 2).unwrap()[0].text, item.text);
+        assert_eq!(archive.local_pins(923).unwrap()[0].text, item.text);
+        assert!(
+            result.is_ok(),
+            "a committed rekey must not report failed just because VACUUM was denied: {result:?}"
+        );
+        assert!(archive.maintenance_warning().is_some());
+        archive
+            .recover_rekey(Some(old.clone()), Some(new.clone()))
+            .unwrap();
+        assert_eq!(archive.deleted(923, 0, 2).unwrap()[0].text, item.text);
+        assert!(archive.verify_key(Some(&old)).is_err());
+        assert!(archive.verify_key(Some(&new)).is_ok());
+    }
+
+    #[test]
+    fn security_fix_rekey_precommit_failure_preserves_old_messages_pins_and_key() {
+        let mut archive = Archive::in_memory();
+        let old = crate::lock::derive("synthetic-old-key", "synthetic-old-salt").unwrap();
+        let new = crate::lock::derive("synthetic-new-key", "synthetic-new-salt").unwrap();
+        archive.set_key(Some(old.clone()));
+        let item = MsgItem {
+            chat_id: 923,
+            id: 1,
+            sender: MessageSender::User(MessageSenderUser { user_id: 19 }),
+            text: "retained after rollback".into(),
+            outgoing: false,
+            deleted: false,
+            media: None,
+            pending: false,
+            failed: false,
+            rich: Vec::new(),
+            reply_to: None,
+            date: 0,
+            edited: false,
+            reactions: Vec::new(),
+            forwarded: None,
+            extra: None,
+            sender_tag: String::new(),
+        };
+        archive.save([&item]).unwrap();
+        archive.mark_deleted(923, &[1]).unwrap();
+        archive.pin_local(&item, 1).unwrap();
+        let message_before: String = archive
+            .conn
+            .query_row("SELECT text FROM messages", [], |r| r.get(0))
+            .unwrap();
+        let pin_before: String = archive
+            .conn
+            .query_row("SELECT text FROM local_pins", [], |r| r.get(0))
+            .unwrap();
+        archive
+            .conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER block_pin_rekey BEFORE UPDATE ON local_pins
+                 BEGIN SELECT RAISE(ABORT, 'synthetic precommit failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            archive
+                .recover_rekey(archive.key.clone(), Some(new.clone()))
+                .is_err()
+        );
+        let message_after: String = archive
+            .conn
+            .query_row("SELECT text FROM messages", [], |r| r.get(0))
+            .unwrap();
+        let pin_after: String = archive
+            .conn
+            .query_row("SELECT text FROM local_pins", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            message_after, message_before,
+            "the transaction must roll back"
+        );
+        assert_eq!(pin_after, pin_before);
+        assert_eq!(archive.deleted(923, 0, 2).unwrap()[0].text, item.text);
+        assert_eq!(archive.local_pins(923).unwrap()[0].text, item.text);
+        assert!(crate::lock::open(Some(&new), &message_after).is_err());
+        assert!(crate::lock::open(Some(&new), &pin_after).is_err());
+    }
+
+    #[test]
+    fn security_fix_archive_restart_detects_old_or_committed_new_key_and_moves_forward() {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "telega-security-fix-archive-{}-{n}",
+            std::process::id()
+        ));
+        struct OwnedDir(std::path::PathBuf);
+        impl Drop for OwnedDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        std::fs::create_dir(&dir).unwrap();
+        let dir = OwnedDir(dir);
+        let path = dir.0.join("archive.db");
+        let old = crate::lock::derive("synthetic-old-key", "synthetic-old-salt").unwrap();
+        let new = crate::lock::derive("synthetic-new-key", "synthetic-new-salt").unwrap();
+        let item = super::tests::msg(1, "recoverable deleted message and pin");
+        {
+            let mut archive = Archive::open(Connection::open(&path).unwrap()).unwrap();
+            archive.set_key(Some(old.clone()));
+            archive.save([&item]).unwrap();
+            archive.mark_deleted(1, &[1]).unwrap();
+            archive.pin_local(&item, 1).unwrap();
+        }
+        {
+            let mut restarted = Archive::open(Connection::open(&path).unwrap()).unwrap();
+            assert!(restarted.verify_key(Some(&old)).is_ok());
+            assert!(restarted.verify_key(Some(&new)).is_err());
+            restarted
+                .recover_rekey(Some(old.clone()), Some(new.clone()))
+                .unwrap();
+            assert_eq!(restarted.deleted(1, 0, 2).unwrap()[0].text, item.text);
+            assert_eq!(restarted.local_pins(1).unwrap()[0].text, item.text);
+        }
+        let mut restarted = Archive::open(Connection::open(&path).unwrap()).unwrap();
+        assert!(restarted.verify_key(Some(&old)).is_err());
+        assert!(restarted.verify_key(Some(&new)).is_ok());
+        restarted.recover_rekey(Some(old), Some(new)).unwrap();
+        assert_eq!(restarted.deleted(1, 0, 2).unwrap()[0].text, item.text);
+        assert_eq!(restarted.local_pins(1).unwrap()[0].text, item.text);
     }
 }

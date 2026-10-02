@@ -9,6 +9,7 @@
 // except according to those terms.
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int};
+use zeroize::Zeroize;
 
 unsafe extern "C" {
     fn td_create_client_id() -> c_int;
@@ -20,9 +21,12 @@ pub(crate) fn create_client() -> i32 {
     unsafe { td_create_client_id() }
 }
 
-pub(crate) fn send(client_id: i32, request: String) {
-    let cstring = CString::new(request).unwrap();
+pub(crate) fn send(client_id: i32, mut request: String) {
+    let cstring = CString::new(request.as_str()).expect("serialized JSON has no interior NUL");
     unsafe { td_send(client_id, cstring.as_ptr()) }
+    let mut bytes = cstring.into_bytes_with_nul();
+    bytes.zeroize();
+    request.zeroize();
 }
 
 pub(crate) fn receive(timeout: f64) -> Option<String> {

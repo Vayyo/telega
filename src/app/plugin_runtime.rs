@@ -3,7 +3,7 @@ use tdlib_rs::enums::MessageSender;
 use tdlib_rs::types::Message;
 
 use super::{App, Auth, Msg};
-use crate::plugins::{self, Action, HostCmd, HostEvent};
+use crate::plugins::{self, Action, HostCmd, HostEvent, Origin, Permission};
 use crate::settings;
 use crate::td;
 
@@ -47,33 +47,55 @@ impl App {
                 }
             }
             HostEvent::Log(id, line) => self.plugin_log(id, line),
-            HostEvent::Action(id, action) => return self.run_plugin_action(id, action),
+            HostEvent::Action(origin, id, action) => {
+                return self.run_plugin_action(origin, id, action);
+            }
         }
         Task::none()
     }
 
-    /// Executes a plugin request through the client's own paths.
-    fn run_plugin_action(&mut self, id: String, action: Action) -> Task<Msg> {
-        // Defense in depth: the host already gates this on `enabled` and
-        // granted permissions, but a `Configure` round trip in flight must
-        // not let a stale action through here either.
-        let allowed = self
-            .plugin_infos
+    /// Never derive an action's origin from the consumer session: the action
+    /// may have spent time in the worker and UI queues before arriving here.
+    fn plugin_origin(&self) -> Option<Origin> {
+        match (&self.session.auth, self.session.my_id) {
+            (Auth::Ready, Some(account_id)) => Some(Origin {
+                client_id: self.session.client_id,
+                account_id,
+            }),
+            _ => None,
+        }
+    }
+
+    fn plugin_allows(&self, origin: Origin, id: &str, action: &Action) -> bool {
+        if self.plugin_origin() != Some(origin) {
+            return false;
+        }
+        let permission = match action {
+            Action::Delete { .. } => Permission::DeleteOwn,
+            Action::Send { .. } => Permission::Send,
+        };
+        self.plugin_infos
             .iter()
-            .find(|i| i.id == id)
+            .find(|info| info.id == id)
             .is_some_and(|info| {
-                self.settings.plugins.get(&id).is_some_and(|c| {
-                    c.enabled
-                        && info
-                            .permissions
-                            .iter()
-                            .all(|p| c.granted.iter().any(|g| g == p.name()))
-                })
-            });
-        if !allowed {
+                info.error.is_none()
+                    && info.permissions.contains(&permission)
+                    && self.settings.plugins.get(id).is_some_and(|config| {
+                        config.enabled
+                            && !config.dry_run
+                            && info
+                                .permissions
+                                .iter()
+                                .all(|p| config.granted.iter().any(|g| g == p.name()))
+                    })
+            })
+    }
+
+    /// Executes a plugin request through the client's own paths.
+    fn run_plugin_action(&mut self, origin: Origin, id: String, action: Action) -> Task<Msg> {
+        if !self.plugin_allows(origin, &id, &action) {
             return Task::none();
         }
-        let client_id = self.session.client_id;
         let original = action.clone();
         match action {
             Action::Delete {
@@ -83,18 +105,24 @@ impl App {
             } => {
                 // Only the user's own messages, checked with TDLib first.
                 Task::perform(
-                    td::own_messages(client_id, chat_id, ids),
+                    td::own_messages(origin.client_id, chat_id, ids),
                     move |r| match r {
-                        Ok(own) => {
-                            Msg::PluginDeleteOwn(id.clone(), chat_id, own, revoke, original.clone())
-                        }
-                        Err(e) => Msg::PluginDone(id.clone(), original.clone(), Err(e)),
+                        Ok(own) => Msg::PluginDeleteOwn(
+                            origin,
+                            id.clone(),
+                            chat_id,
+                            own,
+                            revoke,
+                            original.clone(),
+                        ),
+                        Err(e) => Msg::PluginDone(origin, id.clone(), original.clone(), Err(e)),
                     },
                 )
             }
             Action::Send { chat_id, text } => {
-                Task::perform(td::send_plain(client_id, chat_id, text), move |r| {
+                Task::perform(td::send_plain(origin.client_id, chat_id, text), move |r| {
                     Msg::PluginDone(
+                        origin,
                         id,
                         original,
                         r.map(|()| format!("отправлено в чат {chat_id}")),
@@ -102,6 +130,93 @@ impl App {
                 })
             }
         }
+    }
+
+    /// A completed request may belong to a replaced TDLib client. Such
+    /// completions must not log, pause or requeue anything in the new session.
+    pub(super) fn plugin_done(
+        &mut self,
+        origin: Origin,
+        id: String,
+        action: Action,
+        result: Result<String, String>,
+    ) -> Task<Msg> {
+        if !self.plugin_allows(origin, &id, &action) {
+            return Task::none();
+        }
+        let line = match result {
+            Ok(line) => line,
+            Err(error) => {
+                if let (Some(secs), Some(host)) = (td::flood_wait(&error), &self.plugin_host) {
+                    host.send(HostCmd::FloodWait(origin, secs));
+                    host.send(HostCmd::Requeue(origin, id.clone(), action));
+                }
+                format!("ошибка: {error}")
+            }
+        };
+        self.plugin_log(id, line);
+        Task::none()
+    }
+
+    /// Recheck policy after the asynchronous own-message lookup, before
+    /// mutating self_deleted or issuing a TDLib deletion.
+    pub(super) fn plugin_delete_own(
+        &mut self,
+        origin: Origin,
+        plugin: String,
+        chat_id: i64,
+        own: Vec<i64>,
+        revoke: bool,
+        action: Action,
+    ) -> Task<Msg> {
+        if !self.plugin_allows(origin, &plugin, &action) {
+            return Task::none();
+        }
+        if own.is_empty() {
+            self.plugin_log(plugin, "нечего удалять: сообщения не ваши".into());
+            return Task::none();
+        }
+        self.session
+            .self_deleted
+            .extend(own.iter().map(|&message| (chat_id, message)));
+        let ids = own.clone();
+        Task::perform(
+            td::delete_messages(origin.client_id, chat_id, own, revoke),
+            move |result| {
+                Msg::PluginDeleted(
+                    origin,
+                    plugin.clone(),
+                    chat_id,
+                    ids.clone(),
+                    action.clone(),
+                    result,
+                )
+            },
+        )
+    }
+
+    pub(super) fn plugin_deleted(
+        &mut self,
+        origin: Origin,
+        plugin: String,
+        chat_id: i64,
+        ids: Vec<i64>,
+        action: Action,
+        result: Result<(), String>,
+    ) -> Task<Msg> {
+        if self.plugin_origin() != Some(origin) {
+            return Task::none();
+        }
+        let line = match result {
+            Ok(()) => Ok(format!("удалено {} сообщ. в чате {chat_id}", ids.len())),
+            Err(error) => {
+                for id in &ids {
+                    self.session.self_deleted.remove(&(chat_id, *id));
+                }
+                Err(error)
+            }
+        };
+        self.plugin_done(origin, plugin, action, line)
     }
 
     pub(super) fn plugin_log(&mut self, id: String, line: String) {
@@ -130,16 +245,14 @@ impl App {
 
     /// Plugins act only for a logged-in account.
     pub(super) fn announce_account(&self) {
-        if let (Some(host), Some(id), Auth::Ready) =
-            (&self.plugin_host, self.session.my_id, &self.session.auth)
-        {
-            host.send(HostCmd::Account(Some(id)));
+        if let Some(host) = &self.plugin_host {
+            host.send(HostCmd::Account(self.plugin_origin()));
         }
     }
 
     pub(super) fn plugin_event(&self, event: plugins::Event) {
-        if let Some(host) = &self.plugin_host {
-            host.send(HostCmd::Event(event));
+        if let (Some(host), Some(origin)) = (&self.plugin_host, self.plugin_origin()) {
+            host.send(HostCmd::Event(origin, event));
         }
     }
 }

@@ -4,7 +4,8 @@
 
 use iced::Task;
 
-use super::{App, Msg};
+use super::{App, Auth, Msg};
+use crate::plugins::HostCmd;
 use crate::settings::Account;
 use crate::td;
 
@@ -45,19 +46,24 @@ impl App {
 
     pub(crate) fn switch_account(&mut self, slot: u32) -> Task<Msg> {
         self.session.accounts_open = false;
-        if slot == self.session.slot || self.session.leave.is_some() {
+        if slot == self.session.slot || self.session.leave.is_some() || self.key_transition_active()
+        {
             return Task::none();
         }
         self.session.leave = Some(Leave {
             to: slot,
             forget: false,
         });
+        self.session.auth = Auth::LoggingOut;
+        if let Some(host) = &self.plugin_host {
+            host.send(HostCmd::Account(None));
+        }
         Task::perform(td::close(self.session.client_id), Msg::Done)
     }
 
     /// A fresh slot with a login screen; the current account stays.
     pub(crate) fn add_account(&mut self) -> Task<Msg> {
-        if self.session.leave.is_some() {
+        if self.session.leave.is_some() || self.key_transition_active() {
             return Task::none();
         }
         let used = self.settings.accounts.iter().map(|a| a.slot);
@@ -80,10 +86,14 @@ impl App {
         let Some(to) = self.other_account() else {
             return Task::none();
         };
-        if self.session.leave.is_some() {
+        if self.session.leave.is_some() || self.key_transition_active() {
             return Task::none();
         }
         self.session.leave = Some(Leave { to, forget: true });
+        self.session.auth = Auth::LoggingOut;
+        if let Some(host) = &self.plugin_host {
+            host.send(HostCmd::Account(None));
+        }
         Task::perform(td::close(self.session.client_id), Msg::Done)
     }
 
@@ -96,11 +106,18 @@ impl App {
             .find(|a| a.user_id == Some(user_id) && a.slot != slot)
             .map(|a| a.slot);
         if let Some(existing) = existing {
-            self.error = Some("этот аккаунт уже добавлен".into());
+            if self.key_transition_active() {
+                self.error = Some("сначала завершите смену ключа".into());
+                return Task::none();
+            }
             self.session.leave = Some(Leave {
                 to: existing,
                 forget: true,
             });
+            self.session.auth = Auth::LoggingOut;
+            if let Some(host) = &self.plugin_host {
+                host.send(HostCmd::Account(None));
+            }
             return Task::perform(td::log_out(self.session.client_id), Msg::Done);
         }
         let name = self
@@ -185,22 +202,29 @@ impl App {
     /// request, after a log out (here or from another device) the account is
     /// forgotten and another one, if any, opens.
     pub(crate) fn after_close(&mut self) -> u32 {
-        let logged_out = std::mem::take(&mut self.session.logging_out);
-        let leave = self.session.leave.take().unwrap_or_else(|| {
-            if logged_out {
-                Leave {
-                    to: self.other_account().unwrap_or(self.session.slot),
-                    forget: true,
-                }
-            } else {
-                // Closed for another reason: the same account starts again,
-                // its data untouched.
-                Leave {
-                    to: self.session.slot,
-                    forget: false,
-                }
+        let active = self.key_transition_active();
+        let logged_out = std::mem::take(&mut self.session.logging_out) && !active;
+        let leave = if active {
+            Leave {
+                to: self.session.slot,
+                forget: false,
             }
-        });
+        } else {
+            self.session.leave.take().unwrap_or_else(|| {
+                if logged_out {
+                    Leave {
+                        to: self.other_account().unwrap_or(self.session.slot),
+                        forget: true,
+                    }
+                } else {
+                    // Closed for another reason: restart the same account.
+                    Leave {
+                        to: self.session.slot,
+                        forget: false,
+                    }
+                }
+            })
+        };
         if !leave.forget {
             self.persist_video_volume();
         }

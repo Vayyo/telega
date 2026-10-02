@@ -26,6 +26,9 @@ pub(crate) struct ChatPane {
     /// Draft; every window keeps its own. Multi-line: Shift+Enter breaks
     /// the line, Enter sends.
     pub(crate) compose: iced::widget::text_editor::Content,
+    /// Stable widget identities for focus operations confined to this window.
+    pub(crate) root_id: Id,
+    pub(crate) compose_id: Id,
     /// The input field was typed in (or got a loaded draft) since the chat
     /// opened: only then is its text saved as the chat's draft, so an
     /// untouched empty field never wipes a draft made elsewhere.
@@ -113,6 +116,8 @@ impl Default for ChatPane {
             chat_id: None,
             messages: Vec::new(),
             compose: iced::widget::text_editor::Content::new(),
+            root_id: Id::unique(),
+            compose_id: Id::unique(),
             editing: None,
             compose_touched: false,
             reply_to: None,
@@ -401,9 +406,13 @@ impl ChatPane {
     /// except the window's chat list filter.
     pub(crate) fn switch_to(&mut self, chat_id: i64) {
         let list = std::mem::take(&mut self.list);
+        let root_id = self.root_id.clone();
+        let compose_id = self.compose_id.clone();
         *self = Self {
             chat_id: Some(chat_id),
             list,
+            root_id,
+            compose_id,
             ..Self::default()
         };
     }

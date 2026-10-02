@@ -1,7 +1,7 @@
 //! Client settings, stored as JSON next to the TDLib data. Settings belong to
 //! the client, not to an account, so they survive log out.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -89,8 +89,98 @@ pub struct Account {
     /// password itself is never stored).
     pub lock_salt: Option<String>,
     pub lock_check: Option<String>,
+    /// Forward-only key transition; both candidate credentials survive a crash.
+    pub pending_key_change: Option<PendingKeyChange>,
     /// Per chat and message, independent of the TDLib file identifier.
     pub video_volumes: BTreeMap<i64, BTreeMap<i64, VideoVolume>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingKeyChange {
+    pub old_salt: Option<String>,
+    pub old_check: Option<String>,
+    pub new_salt: Option<String>,
+    pub new_check: Option<String>,
+    /// Only password-to-password changes need cross-sealed keys. Never plaintext.
+    pub new_sealed_by_old: Option<String>,
+    pub old_sealed_by_new: Option<String>,
+    /// Permanent server deletions received while archive rekey owns the handle.
+    /// Only ids are persisted; no message text is written to settings.
+    #[serde(default)]
+    pub deleted_ids: BTreeMap<i64, BTreeSet<i64>>,
+    #[serde(default)]
+    pub purged_ids: BTreeMap<i64, BTreeSet<i64>>,
+}
+
+impl PendingKeyChange {
+    pub fn new(
+        old_salt: Option<String>,
+        old_check: Option<String>,
+        new_salt: Option<String>,
+        new_check: Option<String>,
+        old_key: Option<&crate::lock::Key>,
+        new_key: Option<&crate::lock::Key>,
+    ) -> Result<Self, String> {
+        if old_salt.is_some() != old_check.is_some()
+            || new_salt.is_some() != new_check.is_some()
+            || old_salt.is_some() != old_key.is_some()
+            || new_salt.is_some() != new_key.is_some()
+            || old_key.is_some_and(|k| Some(crate::lock::check_value(k)) != old_check)
+            || new_key.is_some_and(|k| Some(crate::lock::check_value(k)) != new_check)
+        {
+            return Err("несогласованные ключи перехода".into());
+        }
+        let (new_sealed_by_old, old_sealed_by_new) = match (old_key, new_key) {
+            (Some(old), Some(new)) => (
+                Some(crate::lock::seal(old, &new[..])?),
+                Some(crate::lock::seal(new, &old[..])?),
+            ),
+            _ => (None, None),
+        };
+        Ok(Self {
+            old_salt,
+            old_check,
+            new_salt,
+            new_check,
+            new_sealed_by_old,
+            old_sealed_by_new,
+            deleted_ids: BTreeMap::new(),
+            purged_ids: BTreeMap::new(),
+        })
+    }
+
+    /// The unlock password may be either side of the transition. Returns both
+    /// candidates without ever writing either plaintext key to settings.
+    pub fn keys(
+        &self,
+        password: &str,
+    ) -> Result<(Option<crate::lock::Key>, Option<crate::lock::Key>), String> {
+        let derive = |salt: &Option<String>, check: &Option<String>| -> Option<crate::lock::Key> {
+            let key = crate::lock::derive(password, salt.as_deref()?).ok()?;
+            (Some(crate::lock::check_value(&key)) == *check).then_some(key)
+        };
+        if let Some(old) = derive(&self.old_salt, &self.old_check) {
+            let new = match &self.new_sealed_by_old {
+                Some(sealed) => Some(crate::lock::open_key(&old, sealed)?),
+                None => None,
+            };
+            if new.as_ref().map(crate::lock::check_value) != self.new_check {
+                return Err("повреждён журнал перехода".into());
+            }
+            return Ok((Some(old), new));
+        }
+        if let Some(new) = derive(&self.new_salt, &self.new_check) {
+            let old = match &self.old_sealed_by_new {
+                Some(sealed) => Some(crate::lock::open_key(&new, sealed)?),
+                None => None,
+            };
+            if old.as_ref().map(crate::lock::check_value) != self.old_check {
+                return Err("повреждён журнал перехода".into());
+            }
+            return Ok((old, Some(new)));
+        }
+        Err("неверный пароль".into())
+    }
 }
 
 /// Playback level and the last audible level (for unmuting after a restart).
@@ -171,11 +261,8 @@ impl Settings {
         }
     }
 
-    /// Writes via a temporary file, `fsync`s it, then renames it over
-    /// `path`: a crash or a full disk leaves the previous file intact
-    /// instead of a truncated or half-written one. `lock_salt`/`lock_check`
-    /// live only here, so a corrupt file would lock the account out for
-    /// good.
+    /// Writes and syncs a temporary file, renames, then syncs its parent.
+    /// A failure after rename is ambiguous: callers retain pending recovery.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(dir).map_err(|e| format!("настройки: {e}"))?;
@@ -206,7 +293,8 @@ impl Settings {
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(tmp, dest)
+        std::fs::rename(tmp, dest)?;
+        std::fs::File::open(dest.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
     }
 }
 

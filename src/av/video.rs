@@ -1,7 +1,8 @@
 //! Video frame decoding via ffmpeg (no audio), scaled down at decode time.
 
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use ffmpeg_next as ff;
@@ -28,6 +29,7 @@ pub struct Frame {
 /// RGBA conversion path used here; such streams decode opaque (alpha = 255).
 pub struct FrameStream {
     path: PathBuf,
+    cancel: Option<Arc<AtomicBool>>,
     ictx: ff::format::context::Input,
     decoder: ff::decoder::Video,
     /// Built from the first decoded frame (the stream header can lie) and
@@ -98,9 +100,39 @@ pub(super) fn valid_frame(format: ff::format::Pixel, width: u32, height: u32) ->
 
 impl FrameStream {
     pub fn open(path: &Path, max_w: u32, max_h: u32) -> Result<FrameStream, String> {
+        Self::open_with_cancel(path, max_w, max_h, None)
+    }
+
+    pub(crate) fn open_cancelable(
+        path: &Path,
+        max_w: u32,
+        max_h: u32,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<FrameStream, String> {
+        Self::open_with_cancel(path, max_w, max_h, Some(cancel))
+    }
+
+    fn open_with_cancel(
+        path: &Path,
+        max_w: u32,
+        max_h: u32,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<FrameStream, String> {
+        Self::check_cancel_flag(cancel.as_deref())?;
         init_ffmpeg();
-        let ictx = ff::format::input_with_dictionary(path, whitelist_options(CONTAINERS, CODECS))
-            .map_err(|e| format!("видео: не удалось открыть файл: {e}"))?;
+        let options = whitelist_options(CONTAINERS, CODECS);
+        let ictx = if let Some(flag) = cancel.as_ref() {
+            let flag = Arc::clone(flag);
+            ff::format::input_with_interrupt_and_dictionary(
+                path,
+                move || flag.load(Ordering::Relaxed),
+                options,
+            )
+        } else {
+            ff::format::input_with_dictionary(path, options)
+        }
+        .map_err(|e| format!("видео: не удалось открыть файл: {e}"))?;
+        Self::check_cancel_flag(cancel.as_deref())?;
         if !CONTAINERS.contains(&ictx.format().name()) {
             return Err(format!(
                 "видео: неподдерживаемый формат {}",
@@ -119,12 +151,15 @@ impl FrameStream {
                 stream.parameters().id()
             ));
         }
+        Self::check_cancel_flag(cancel.as_deref())?;
         let ctx = ff::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| format!("видео: не удалось создать декодер: {e}"))?;
+        Self::check_cancel_flag(cancel.as_deref())?;
         let decoder = ctx
             .decoder()
             .video()
             .map_err(|e| format!("видео: не удалось открыть декодер: {e}"))?;
+        Self::check_cancel_flag(cancel.as_deref())?;
         // libswscale aborts the whole process on an invalid pixel format, so
         // nothing reaches it without these checks.
         if !valid_frame(decoder.format(), decoder.width(), decoder.height()) {
@@ -135,6 +170,7 @@ impl FrameStream {
 
         Ok(FrameStream {
             path: path.to_path_buf(),
+            cancel,
             ictx,
             decoder,
             scaler,
@@ -148,28 +184,49 @@ impl FrameStream {
         })
     }
 
+    fn check_cancel_flag(cancel: Option<&AtomicBool>) -> Result<(), String> {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            Err("видео: воспроизведение отменено".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_cancel(&self) -> Result<(), String> {
+        Self::check_cancel_flag(self.cancel.as_deref())
+    }
+
     /// Output frame size (fit inside the requested box).
     pub fn size(&self) -> (u32, u32) {
         (self.out_w, self.out_h)
     }
 
     pub fn next_frame(&mut self) -> Result<Option<Frame>, String> {
+        self.check_cancel()?;
         let mut decoded = ff::frame::Video::empty();
         loop {
+            self.check_cancel()?;
             if self.decoder.receive_frame(&mut decoded).is_ok() {
-                return self.convert(&decoded).map(Some);
+                self.check_cancel()?;
+                let frame = self.convert(&decoded)?;
+                self.check_cancel()?;
+                return Ok(Some(frame));
             }
             if self.eof_sent {
                 return Ok(None);
             }
             loop {
+                self.check_cancel()?;
                 let mut packet = ff::Packet::empty();
-                match packet.read(&mut self.ictx) {
+                let read = packet.read(&mut self.ictx);
+                self.check_cancel()?;
+                match read {
                     Ok(()) => {
                         if packet.stream() == self.stream_index {
                             self.decoder
                                 .send_packet(&packet)
                                 .map_err(|e| format!("видео: ошибка декодирования: {e}"))?;
+                            self.check_cancel()?;
                             break;
                         }
                     }
@@ -177,6 +234,7 @@ impl FrameStream {
                         self.decoder
                             .send_eof()
                             .map_err(|e| format!("видео: ошибка декодирования: {e}"))?;
+                        self.check_cancel()?;
                         self.eof_sent = true;
                         break;
                     }
@@ -188,15 +246,24 @@ impl FrameStream {
 
     /// Rewinds to the start of the stream, for looping GIF-like animations.
     pub fn rewind(&mut self) -> Result<(), String> {
+        self.check_cancel()?;
         self.decoder.flush();
+        self.check_cancel()?;
         match self.ictx.seek(0, ..) {
             Ok(()) => {
+                self.check_cancel()?;
                 self.eof_sent = false;
                 Ok(())
             }
             Err(_) => {
-                *self = FrameStream::open(&self.path, self.max_w, self.max_h)?;
-                Ok(())
+                self.check_cancel()?;
+                *self = FrameStream::open_with_cancel(
+                    &self.path,
+                    self.max_w,
+                    self.max_h,
+                    self.cancel.clone(),
+                )?;
+                self.check_cancel()
             }
         }
     }

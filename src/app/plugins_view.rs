@@ -10,7 +10,7 @@ use crate::plugins::{self, PluginInfo, SettingKind, SettingSpec};
 use crate::settings::PluginConfig;
 
 /// How many journal lines a plugin card shows.
-const CARD_LOG_LINES: usize = 5;
+pub(super) const CARD_LOG_LINES: usize = 5;
 
 #[derive(Debug, Clone, PartialEq)]
 struct ChatChoice {
@@ -27,7 +27,6 @@ impl std::fmt::Display for ChatChoice {
 impl App {
     pub(super) fn view_plugins(&self) -> Element<'_, Msg> {
         let header = row![
-            text("Плагины").size(16).width(Fill),
             button("Справка по API")
                 .style(button::secondary)
                 .on_press(Msg::OpenPluginHelp(true)),

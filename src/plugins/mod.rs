@@ -13,10 +13,12 @@
 pub mod api;
 mod host;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use iced::futures::{SinkExt, Stream};
 use serde::Serialize;
@@ -162,18 +164,25 @@ pub enum Action {
     },
 }
 
+/// The TDLib client is unique for this process; the account id also isolates
+/// plugin data when a user signs in again with a new client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Origin {
+    pub client_id: i32,
+    pub account_id: i64,
+}
+
 /// Commands from the client to the plugin thread.
 #[derive(Debug, Clone)]
 pub enum HostCmd {
     Configure(BTreeMap<String, PluginConfig>),
     /// Logged-in account (plugin data is per account); `None` pauses tasks.
-    Account(Option<i64>),
-    Event(Event),
-    /// Telegram asked to wait before further requests.
-    FloodWait(u64),
-    /// An action failed (e.g. Telegram's flood wait); put it back at the
-    /// front of the queue instead of losing it.
-    Requeue(String, Action),
+    Account(Option<Origin>),
+    Event(Origin, Event),
+    /// Telegram asked to wait before further requests from this session.
+    FloodWait(Origin, u64),
+    /// A failed action retains the origin of the request that produced it.
+    Requeue(Origin, String, Action),
 }
 
 /// Output of the plugin thread.
@@ -182,22 +191,189 @@ pub enum HostEvent {
     Ready(HostHandle),
     Plugins(Vec<PluginInfo>),
     Log(String, String),
-    Action(String, Action),
+    Action(Origin, String, Action),
+}
+
+/// Configuration and account are latest-value mailboxes, never dropped by
+/// message traffic. Disabling a plugin also retains cancellation intent if
+/// it is re-enabled before the worker can read either configuration.
+#[derive(Default)]
+struct Controls {
+    account: Option<Option<Origin>>,
+    config: Option<BTreeMap<String, PluginConfig>>,
+    last_enabled: BTreeSet<String>,
+    pending_disabled: BTreeSet<String>,
+    disable_all: bool,
+    staged_disable: bool,
+    flood_wait: Option<(Origin, u64)>,
+}
+
+const MAX_PENDING_DISABLED: usize = 256;
+
+struct Transport {
+    controls: Arc<Mutex<Controls>>,
+    events: mpsc::Receiver<(Origin, Event)>,
+    requeues: mpsc::Receiver<(Origin, String, Action)>,
+    wake: mpsc::Receiver<()>,
+}
+
+impl Transport {
+    fn next(&self) -> Option<HostCmd> {
+        {
+            let mut controls = self.controls.lock();
+            if let Some(config) = controls.config.as_ref() {
+                // The ordinary latest-value mailbox must not erase a brief
+                // off/on switch: the intermediate policy cancels scheduled
+                // tasks before the latest enabled policy can run them.
+                if controls.disable_all {
+                    controls.disable_all = false;
+                    controls.pending_disabled.clear();
+                    controls.staged_disable = true;
+                    return Some(HostCmd::Configure(BTreeMap::new()));
+                }
+                if controls
+                    .pending_disabled
+                    .iter()
+                    .any(|id| config.get(id).is_some_and(|plugin| plugin.enabled))
+                {
+                    let mut disabled = (*config).clone();
+                    for id in std::mem::take(&mut controls.pending_disabled) {
+                        if let Some(plugin) = disabled.get_mut(&id) {
+                            plugin.enabled = false;
+                        }
+                    }
+                    controls.staged_disable = true;
+                    return Some(HostCmd::Configure(disabled));
+                }
+                controls.pending_disabled.clear();
+            }
+            // If an account change was also pending, open its database while
+            // the temporary disabled policy is active so its old tasks are
+            // purged before the final enabled configuration takes effect.
+            if controls.staged_disable {
+                controls.staged_disable = false;
+                if let Some(account) = controls.account.take() {
+                    return Some(HostCmd::Account(account));
+                }
+            }
+            if let Some(config) = controls.config.take() {
+                return Some(HostCmd::Configure(config));
+            }
+            if let Some(account) = controls.account.take() {
+                return Some(HostCmd::Account(account));
+            }
+            if let Some((origin, secs)) = controls.flood_wait.take() {
+                return Some(HostCmd::FloodWait(origin, secs));
+            }
+        }
+        if let Ok((origin, id, action)) = self.requeues.try_recv() {
+            return Some(HostCmd::Requeue(origin, id, action));
+        }
+        self.events
+            .try_recv()
+            .ok()
+            .map(|(origin, event)| HostCmd::Event(origin, event))
+    }
 }
 
 #[derive(Clone)]
-pub struct HostHandle(mpsc::Sender<HostCmd>);
+pub struct HostHandle {
+    controls: Arc<Mutex<Controls>>,
+    events: mpsc::SyncSender<(Origin, Event)>,
+    requeues: mpsc::SyncSender<(Origin, String, Action)>,
+    wake: mpsc::SyncSender<()>,
+}
 
 impl HostHandle {
+    fn channel() -> (Self, Transport) {
+        let controls = Arc::new(Mutex::new(Controls::default()));
+        let (events, event_rx) = mpsc::sync_channel(256);
+        let (requeues, requeue_rx) = mpsc::sync_channel(256);
+        let (wake, wake_rx) = mpsc::sync_channel(1);
+        (
+            Self {
+                controls: controls.clone(),
+                events,
+                requeues,
+                wake,
+            },
+            Transport {
+                controls,
+                events: event_rx,
+                requeues: requeue_rx,
+                wake: wake_rx,
+            },
+        )
+    }
+
     pub fn send(&self, cmd: HostCmd) {
-        // The thread only stops with the program.
-        let _ = self.0.send(cmd);
+        match cmd {
+            HostCmd::Configure(config) => {
+                let mut controls = self.controls.lock();
+                let enabled: BTreeSet<String> = config
+                    .iter()
+                    .filter(|(_, plugin)| plugin.enabled)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let previous = std::mem::take(&mut controls.last_enabled);
+                if !controls.disable_all {
+                    for id in previous.difference(&enabled) {
+                        if controls.pending_disabled.len() >= MAX_PENDING_DISABLED {
+                            // A pathological stream of unique plugin ids
+                            // must not grow the control mailbox without bound.
+                            controls.pending_disabled.clear();
+                            controls.disable_all = true;
+                            break;
+                        }
+                        controls.pending_disabled.insert(id.clone());
+                    }
+                }
+                controls.last_enabled = enabled;
+                controls.config = Some(config);
+            }
+            HostCmd::Account(account) => self.controls.lock().account = Some(account),
+            HostCmd::FloodWait(origin, secs) => {
+                let mut controls = self.controls.lock();
+                let wait = &mut controls.flood_wait;
+                *wait = Some(match *wait {
+                    Some((previous, old)) if previous == origin => (origin, old.max(secs)),
+                    _ => (origin, secs),
+                });
+            }
+            HostCmd::Requeue(origin, id, action) => {
+                // Drop newest on overflow: old requests cannot consume more
+                // than 256 slots while the worker is busy.
+                let _ = self.requeues.try_send((origin, id, action));
+            }
+            HostCmd::Event(origin, event) => {
+                // Remote events never block iced or delay a control change.
+                let _ = self.events.try_send((origin, event));
+            }
+        }
+        let _ = self.wake.try_send(());
     }
 
     #[cfg(test)]
-    pub fn for_test() -> (Self, mpsc::Receiver<HostCmd>) {
-        let (tx, rx) = mpsc::channel();
-        (Self(tx), rx)
+    pub fn for_test() -> (Self, TestReceiver) {
+        let (handle, transport) = Self::channel();
+        (handle, TestReceiver(transport))
+    }
+}
+
+/// Inspect the real bounded/coalesced transport without starting Lua.
+#[cfg(test)]
+pub struct TestReceiver(Transport);
+
+#[cfg(test)]
+impl TestReceiver {
+    pub fn try_iter(&self) -> impl Iterator<Item = HostCmd> {
+        std::iter::from_fn(|| self.0.next())
+    }
+
+    /// Exercise the same single worker step used after a wakeup, without
+    /// starting a thread or relying on wall-clock scheduling.
+    pub fn drive_host(&self, host: &mut Host, at: f64) -> bool {
+        drive_host(host, &self.0, at)
     }
 }
 
@@ -244,17 +420,31 @@ fn now() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
+fn pending_control(transport: &Transport) -> bool {
+    let controls = transport.controls.lock();
+    controls.config.is_some() || controls.account.is_some() || controls.flood_wait.is_some()
+}
+
+/// Handle one ready command before running due tasks/actions. The worker and
+/// deterministic transport tests use the exact same dispatch boundary.
+fn drive_host(host: &mut Host, transport: &Transport, at: f64) -> bool {
+    let Some(cmd) = transport.next() else {
+        return false;
+    };
+    host.handle(cmd, at);
+    if !pending_control(transport) {
+        host.tick(at);
+    }
+    true
+}
+
 /// Stream for an iced subscription: starts the plugin thread and yields its
 /// events, the first one being the handle to send commands.
 pub fn run() -> impl Stream<Item = HostEvent> {
     iced::stream::channel(128, async |mut out| {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
-        if out
-            .send(HostEvent::Ready(HostHandle(cmd_tx)))
-            .await
-            .is_err()
-        {
+        let (handle, transport) = HostHandle::channel();
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(256);
+        if out.send(HostEvent::Ready(handle)).await.is_err() {
             return;
         }
         std::thread::Builder::new()
@@ -263,20 +453,32 @@ pub fn run() -> impl Stream<Item = HostEvent> {
                 let mut host = Host::new(sources(&crate::paths::plugins()), now());
                 loop {
                     for event in host.drain() {
-                        if ev_tx.send(event).is_err() {
+                        // Drop newest output on overflow; logs (even a burst
+                        // of them) cannot stall control processing.
+                        if matches!(
+                            ev_tx.try_send(event),
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+                        ) {
                             return;
                         }
+                    }
+                    if drive_host(&mut host, &transport, now()) {
+                        continue;
                     }
                     let t = now();
                     let wait = host.next_wakeup(t).map_or(Duration::from_secs(3600), |at| {
                         Duration::from_secs_f64((at - t).clamp(0.0, 3600.0))
                     });
-                    match cmd_rx.recv_timeout(wait) {
-                        Ok(cmd) => host.handle(cmd, now()),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    match transport.wake.recv_timeout(wait) {
+                        Ok(()) => continue,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if pending_control(&transport) {
+                                continue;
+                            }
+                            host.tick(now());
+                        }
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
-                    host.tick(now());
                 }
             })
             .expect("spawn plugin thread");

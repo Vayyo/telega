@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use mlua::{Function, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value, VmState};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{Action, Event, HostCmd, HostEvent, Permission, PluginInfo, SettingKind, SettingSpec};
+use super::{
+    Action, Event, HostCmd, HostEvent, Origin, Permission, PluginInfo, SettingKind, SettingSpec,
+};
 use crate::settings::PluginConfig;
 
 /// Time budget of one callback (loading, event, task).
@@ -34,6 +36,8 @@ const MAX_HANDLERS: usize = 16;
 /// Actions one call may request and one plugin may have queued.
 const MAX_ACTIONS_PER_CALL: usize = 20;
 const MAX_QUEUED_PER_PLUGIN: usize = 1_000;
+/// Prevent a burst of Lua logs from accumulating between worker drains.
+const MAX_OUTPUT: usize = 256;
 /// Tasks run by one tick; the rest waits for the next one.
 const MAX_TASKS_PER_TICK: usize = 100;
 /// Shortest delay of `telega.after`, so a task cannot reschedule itself into
@@ -111,7 +115,8 @@ struct Plugin {
 pub struct Host {
     plugins: Vec<Plugin>,
     shared: Rc<Shared>,
-    queue: VecDeque<(String, Action)>,
+    queue: VecDeque<(Origin, String, Action)>,
+    origin: Option<Origin>,
     next_action_at: f64,
     paused_until: f64,
     out: Vec<HostEvent>,
@@ -160,6 +165,7 @@ impl Host {
             plugins,
             shared,
             queue: VecDeque::new(),
+            origin: None,
             next_action_at: 0.0,
             paused_until: 0.0,
             out: vec![HostEvent::Plugins(infos)],
@@ -178,21 +184,54 @@ impl Host {
         std::mem::take(&mut self.out)
     }
 
+    fn emit(&mut self, event: HostEvent) {
+        // Drop newest output, including logs; never hold up the host thread.
+        if self.out.len() < MAX_OUTPUT {
+            self.out.push(event);
+        }
+    }
+
     pub fn handle(&mut self, cmd: HostCmd, now: f64) {
         match cmd {
             HostCmd::Configure(configs) => self.configure(configs),
             HostCmd::Account(account) => self.set_account(account),
-            HostCmd::Event(event) => self.deliver(&event, now),
-            HostCmd::FloodWait(secs) => {
+            HostCmd::Event(origin, event) => {
+                if self.origin == Some(origin) {
+                    self.deliver(&event, now);
+                }
+            }
+            HostCmd::FloodWait(origin, secs) if self.origin == Some(origin) => {
                 // A short wait that arrives after a longer one must not cut
                 // the longer pause short.
                 self.paused_until = self.paused_until.max(now + secs as f64);
-                self.out.push(HostEvent::Log(
+                self.emit(HostEvent::Log(
                     String::new(),
                     format!("Telegram просит подождать {secs} с; действия плагинов приостановлены"),
                 ));
             }
-            HostCmd::Requeue(id, action) => self.queue.push_front((id, action)),
+            HostCmd::Requeue(origin, id, action) if self.origin == Some(origin) => {
+                let queued = self
+                    .queue
+                    .iter()
+                    .filter(|(_, queued, _)| *queued == id)
+                    .count();
+                let permission = match &action {
+                    Action::Delete { .. } => Permission::DeleteOwn,
+                    Action::Send { .. } => Permission::Send,
+                };
+                if queued < MAX_QUEUED_PER_PLUGIN
+                    && self.plugins.iter().any(|p| {
+                        let ctx = p.ctx.borrow();
+                        p.info.id == id
+                            && p.info.permissions.contains(&permission)
+                            && ctx.config.enabled
+                            && !ctx.config.dry_run
+                    })
+                {
+                    self.queue.push_front((origin, id, action));
+                }
+            }
+            HostCmd::FloodWait(..) | HostCmd::Requeue(..) => {}
         }
     }
 
@@ -225,7 +264,7 @@ impl Host {
         // Queued actions of plugins now off or in dry run are dropped: the
         // switch must take effect for what is already waiting too.
         let before = self.queue.len();
-        self.queue.retain(|(id, _)| {
+        self.queue.retain(|(_, id, _)| {
             self.plugins.iter().any(|p| {
                 let ctx = p.ctx.borrow();
                 &p.info.id == id && ctx.config.enabled && !ctx.config.dry_run
@@ -233,7 +272,7 @@ impl Host {
         });
         let dropped = before - self.queue.len();
         if dropped > 0 {
-            self.out.push(HostEvent::Log(
+            self.emit(HostEvent::Log(
                 String::new(),
                 format!("отменено {dropped} ожидавших действий плагинов"),
             ));
@@ -268,21 +307,35 @@ impl Host {
         }
     }
 
-    fn set_account(&mut self, account: Option<i64>) {
-        let db = account.and_then(|id| {
-            let conn = Connection::open(self.db_dir.join(format!("plugins-{id}.sqlite")));
+    fn set_account(&mut self, account: Option<Origin>) {
+        if self.origin == account {
+            return;
+        }
+        self.origin = account;
+        // No old-session actions, pauses or pending output may cross a
+        // session boundary, even when the user id has not changed.
+        self.queue.clear();
+        self.paused_until = 0.0;
+        self.next_action_at = 0.0;
+        self.out
+            .retain(|event| matches!(event, HostEvent::Plugins(_)));
+        let db = account.and_then(|origin| {
+            let conn = Connection::open(
+                self.db_dir
+                    .join(format!("plugins-{}.sqlite", origin.account_id)),
+            );
             match conn.and_then(|c| init_db(&c).map(|()| c)) {
                 Ok(c) => Some(c),
                 Err(e) => {
-                    self.out
-                        .push(HostEvent::Log(String::new(), format!("база плагинов: {e}")));
+                    self.emit(HostEvent::Log(String::new(), format!("база плагинов: {e}")));
                     None
                 }
             }
         });
         *self.shared.db.borrow_mut() = db;
-        // Actions belong to the previous account.
-        self.queue.clear();
+        if self.shared.db.borrow().is_none() {
+            self.origin = None;
+        }
         self.purge_disabled_tasks();
     }
 
@@ -368,15 +421,16 @@ impl Host {
         }
 
         while now >= self.next_action_at.max(self.paused_until) {
-            let Some((id, action)) = self.queue.pop_front() else {
+            let Some((origin, id, action)) = self.queue.pop_front() else {
                 break;
             };
-            let allowed = self.plugins.iter().any(|p| {
-                let ctx = p.ctx.borrow();
-                p.info.id == id && ctx.config.enabled && !ctx.config.dry_run
-            });
+            let allowed = self.origin == Some(origin)
+                && self.plugins.iter().any(|p| {
+                    let ctx = p.ctx.borrow();
+                    p.info.id == id && ctx.config.enabled && !ctx.config.dry_run
+                });
             if allowed {
-                self.out.push(HostEvent::Action(id, action));
+                self.emit(HostEvent::Action(origin, id, action));
                 self.next_action_at = now + ACTION_INTERVAL;
             }
         }
@@ -400,8 +454,7 @@ impl Host {
     }
 
     fn log(&mut self, i: usize, line: String) {
-        self.out
-            .push(HostEvent::Log(self.plugins[i].info.id.clone(), line));
+        self.emit(HostEvent::Log(self.plugins[i].info.id.clone(), line));
     }
 
     /// Runs Lua code of plugin `i` under its time budget, then collects the
@@ -428,18 +481,18 @@ impl Host {
         };
         let id = plugin.info.id.clone();
         for line in logs {
-            self.out.push(HostEvent::Log(id.clone(), line));
+            self.emit(HostEvent::Log(id.clone(), line));
         }
         if dropped > 0 {
-            self.out.push(HostEvent::Log(
+            self.emit(HostEvent::Log(
                 id.clone(),
                 format!("… ещё {dropped} строк журнала пропущено"),
             ));
         }
-        let queued = self.queue.iter().filter(|(q, _)| *q == id).count();
+        let queued = self.queue.iter().filter(|(_, q, _)| *q == id).count();
         let room = MAX_QUEUED_PER_PLUGIN.saturating_sub(queued);
         if actions.len() > room {
-            self.out.push(HostEvent::Log(
+            self.emit(HostEvent::Log(
                 id.clone(),
                 format!(
                     "… {} действий отброшено: слишком много в очереди",
@@ -447,8 +500,10 @@ impl Host {
                 ),
             ));
         }
-        for action in actions.into_iter().take(room) {
-            self.queue.push_back((id.clone(), action));
+        if let Some(origin) = self.origin {
+            for action in actions.into_iter().take(room) {
+                self.queue.push_back((origin, id.clone(), action));
+            }
         }
     }
 }

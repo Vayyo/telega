@@ -24,6 +24,21 @@ use super::video::VideoPlayback;
 use super::viewer::PhotoView;
 use super::{Auth, ChatItem, MsgItem, WinId};
 
+/// Sections of the in-session settings accordion.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SettingsSection {
+    General,
+    Messages,
+    Look,
+    Storage,
+    Security,
+    Plugins,
+}
+
+impl SettingsSection {
+    pub(super) const COUNT: usize = 6;
+}
+
 /// One reorder owns the controls until the requested order is observed after
 /// TDLib accepts it, or the user acknowledges the unresolved result.
 pub(super) struct FolderReorder {
@@ -65,10 +80,20 @@ pub(super) struct ListRead {
     pub(super) window: WinId,
 }
 
+/// Coalesces repeated server updates to one row while archive keys transition.
+/// Entries are replayed only after the archive verifies the target key.
+#[derive(Default)]
+pub(super) struct DeferredArchiveRow {
+    pub(super) save: Option<MsgItem>,
+    pub(super) edit: Option<String>,
+    pub(super) deleted: bool,
+    pub(super) purge: bool,
+}
+
 pub(super) struct Session {
     pub(super) client_id: i32,
     pub(super) auth: Auth,
-    pub(super) input: String,
+    pub(super) input: crate::lock::SecretString,
     pub(super) busy: bool,
     /// Option writes start only after parameters have been accepted.
     pub(super) cache_params_accepted: bool,
@@ -124,11 +149,18 @@ pub(super) struct Session {
     pub(super) confirm_logout: bool,
     /// Opened once the account id is known (`my_id` option).
     pub(super) archive: Option<Archive>,
+    /// Never expose a failed verification handle to ordinary archive writers.
+    pub(super) detached_archive: Option<Archive>,
+    /// Transient server events observed while the key is changing. A crash
+    /// loses newly observed cache events, not the durable key recovery journal.
+    pub(super) deferred_archive: HashMap<(i64, i64), DeferredArchiveRow>,
     /// Messages the user deleted from this client: on deletion they are
     /// dropped instead of archived, since the user wanted them gone.
     pub(super) self_deleted: HashSet<(i64, i64)>,
     /// Settings page replaces the chat pane of the main window.
     pub(super) settings_open: bool,
+    /// Transient expansion state; retained while settings and plugin help are closed.
+    pub(super) settings_expanded: [bool; SettingsSection::COUNT],
     /// Raw text typed into numeric plugin settings, keyed by (plugin id,
     /// setting key); shown instead of the reformatted committed value.
     pub(super) plugin_number_drafts: HashMap<(String, String), String>,
@@ -175,6 +207,10 @@ pub(super) struct Session {
     /// Key of the client password of the running account, once unlocked.
     pub(super) db_key: Option<crate::lock::Key>,
     pub(super) password_form: password::Form,
+    /// Unlock derives both keys from the pending journal, kept only in RAM.
+    pub(super) recovery_keys: Option<(Option<crate::lock::Key>, Option<crate::lock::Key>)>,
+    pub(super) recovery_tried_other: bool,
+    pub(super) recovery_ready_pending: bool,
     /// The archive, taken out while a password change re-keys it on a
     /// worker thread; the connection comes back through this channel
     /// rather than through a `Msg` (which must stay `Clone`).
@@ -194,7 +230,7 @@ impl Session {
         Self {
             client_id,
             auth: Auth::Starting,
-            input: String::new(),
+            input: crate::lock::SecretString::default(),
             busy: false,
             cache_params_accepted: false,
             cache_initializing: false,
@@ -230,8 +266,11 @@ impl Session {
             panes: HashMap::from([(main_window, ChatPane::default())]),
             confirm_logout: false,
             archive: None,
+            detached_archive: None,
+            deferred_archive: HashMap::new(),
             self_deleted: HashSet::new(),
             settings_open: false,
+            settings_expanded: [false; SettingsSection::COUNT],
             plugin_number_drafts: HashMap::new(),
             plugin_help_open: false,
             my_id: None,
@@ -258,6 +297,9 @@ impl Session {
             roles: HashMap::new(),
             db_key: None,
             password_form: password::Form::default(),
+            recovery_keys: None,
+            recovery_tried_other: false,
+            recovery_ready_pending: false,
             rekeying_archive: None,
             settings_save_token: 0,
         }

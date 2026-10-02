@@ -8,6 +8,14 @@ tdlib-rs 1.4.0 from crates.io, vendored for TDLib 1.8.67 (member tags):
 - `TDLIB_VERSION` in `build.rs` and `src/build.rs` is 1.8.67.
 - The generator reruns only when `build.rs` changes: touch it after
   editing the schema.
+- Telega's security patches make `src/observer.rs` remove an exact pending
+  subscription when its request future is dropped, including cancellation.
+- `src/response.rs` validates native correlation IDs without panicking,
+  routes correlated replies before update-type validation, and emits only
+  structural diagnostics rather than raw response payloads.
+- `src/lib.rs` and `src/tdjson.rs` wipe Rust-owned request JSON string fields,
+  serialization buffers and native-wire CString buffers after sending.
+  Copies retained by TDLib itself are outside this guarantee.
 
 Upstream tdlib-rs v1.4.0 is dual-licensed MIT OR Apache-2.0; this
 distribution uses its MIT option and includes the upstream notice verbatim

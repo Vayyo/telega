@@ -8,6 +8,19 @@ use serde_json::json;
 use super::*;
 use crate::plugins::BUILTIN;
 
+fn origin() -> crate::plugins::Origin {
+    crate::plugins::Origin {
+        client_id: 1,
+        account_id: 1,
+    }
+}
+
+fn replacement_origin() -> crate::plugins::Origin {
+    crate::plugins::Origin {
+        client_id: 2,
+        account_id: 1,
+    }
+}
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -62,26 +75,29 @@ fn host(
         ),
         0.0,
     );
-    host.handle(HostCmd::Account(Some(1)), 0.0);
+    host.handle(HostCmd::Account(Some(origin())), 0.0);
     host.drain();
     host
 }
 
 fn own_message(chat_id: i64, id: i64) -> HostCmd {
-    HostCmd::Event(Event::New {
-        chat_id,
-        id,
-        text: "hi".into(),
-        outgoing: true,
-        sender_id: 1,
-    })
+    HostCmd::Event(
+        origin(),
+        Event::New {
+            chat_id,
+            id,
+            text: "hi".into(),
+            outgoing: true,
+            sender_id: 1,
+        },
+    )
 }
 
 fn actions(host: &mut Host) -> Vec<Action> {
     host.drain()
         .into_iter()
         .filter_map(|e| match e {
-            HostEvent::Action(_, a) => Some(a),
+            HostEvent::Action(_, _, a) => Some(a),
             _ => None,
         })
         .collect()
@@ -114,13 +130,16 @@ fn autodelete_deletes_own_messages_in_selected_chats_after_delay() {
     // Not selected chat and not own message: ignored.
     host.handle(own_message(6, 11), 1000.0);
     host.handle(
-        HostCmd::Event(Event::New {
-            chat_id: 5,
-            id: 12,
-            text: "x".into(),
-            outgoing: false,
-            sender_id: 2,
-        }),
+        HostCmd::Event(
+            origin(),
+            Event::New {
+                chat_id: 5,
+                id: 12,
+                text: "x".into(),
+                outgoing: false,
+                sender_id: 2,
+            },
+        ),
         1000.0,
     );
 
@@ -289,7 +308,7 @@ fn actions_are_paced_and_flood_wait_pauses_them() {
     host.tick(10.5);
     assert_eq!(actions(&mut host).len(), 1);
 
-    host.handle(HostCmd::FloodWait(30), 10.6);
+    host.handle(HostCmd::FloodWait(origin(), 30), 10.6);
     host.tick(20.0);
     assert!(actions(&mut host).is_empty());
     assert_eq!(host.next_wakeup(20.0), Some(40.6));
@@ -479,10 +498,13 @@ fn per_call_limits_are_enforced() {
         &[("greedy", config(true, false, json!({})))],
     );
     host.handle(
-        HostCmd::Event(Event::Deleted {
-            chat_id: 1,
-            ids: vec![1],
-        }),
+        HostCmd::Event(
+            origin(),
+            Event::Deleted {
+                chat_id: 1,
+                ids: vec![1],
+            },
+        ),
         0.0,
     );
     let lines = logs(&mut host);
@@ -545,4 +567,393 @@ fn tasks_of_a_plugin_that_failed_to_load_are_kept() {
         1,
         "a task must survive its plugin briefly failing to load"
     );
+}
+
+mod security_probes {
+    use super::*;
+    use std::time::Instant;
+
+    const ACTION_LUA: &str = r#"
+        telega.plugin { name = "audit", permissions = { "read", "delete_own" } }
+        telega.on("message_new", function(m) telega.delete(m.chat_id, { m.id }) end)
+    "#;
+
+    fn emitted_action(host: &mut Host) -> Vec<HostEvent> {
+        host.handle(own_message(5, 123), 0.0);
+        host.tick(0.0);
+        host.drain()
+    }
+
+    #[test]
+    #[ignore = "explicit local security audit probe"]
+    fn security_probe_drained_action_survives_dry_run_and_account_change() {
+        for account_change in [false, true] {
+            let dir = TempDir::new();
+            let mut host = host(
+                &dir,
+                vec![plugin("audit", ACTION_LUA)],
+                &[("audit", config(true, false, json!({})))],
+            );
+            let already_drained = emitted_action(&mut host);
+            let emitted = already_drained
+                .iter()
+                .filter(|e| matches!(e, HostEvent::Action(..)))
+                .count();
+            if account_change {
+                host.handle(HostCmd::Account(None), 0.1);
+            } else {
+                host.handle(
+                    HostCmd::Configure([("audit".into(), config(true, true, json!({})))].into()),
+                    0.1,
+                );
+            }
+            host.tick(1.0);
+            let after = host.drain();
+            let later_actions = after
+                .iter()
+                .filter(|e| matches!(e, HostEvent::Action(..)))
+                .count();
+            let previously_emitted_still_owned = already_drained
+                .iter()
+                .any(|e| matches!(e, HostEvent::Action(..)));
+            println!(
+                "security_probe_drained_action: account_removed={} emitted_before_policy={} emitted_after_policy={} prior_event_still_owned={}",
+                account_change, emitted, later_actions, previously_emitted_still_owned
+            );
+            assert_eq!(emitted, 1);
+            assert_eq!(later_actions, 0);
+            assert!(previously_emitted_still_owned);
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit local security audit probe"]
+    fn security_probe_lua_timeout_and_bounded_message_storm() {
+        let dir = TempDir::new();
+        let source = r#"
+            telega.plugin { name = "audit", permissions = { "read" } }
+            telega.on("message_new", function(m)
+                if m.id == 1 then while true do end end
+                telega.log("processed")
+            end)
+        "#;
+        let mut host = host(
+            &dir,
+            vec![plugin("audit", source)],
+            &[("audit", config(true, false, json!({})))],
+        );
+        let started = Instant::now();
+        host.handle(own_message(5, 1), 0.0);
+        let timed_out = host
+            .drain()
+            .iter()
+            .filter(|e| matches!(e, HostEvent::Log(_, line) if line.contains("превышено время")))
+            .count();
+        const EVENTS: i64 = 64;
+        const BYTES_PER_EVENT: usize = 4 * 1024;
+        let mut processed = 0;
+        for id in 2..EVENTS + 2 {
+            host.handle(
+                HostCmd::Event(
+                    origin(),
+                    Event::New {
+                        chat_id: 5,
+                        id,
+                        text: "x".repeat(BYTES_PER_EVENT),
+                        outgoing: true,
+                        sender_id: 1,
+                    },
+                ),
+                1.0,
+            );
+            processed += host
+                .drain()
+                .iter()
+                .filter(|e| matches!(e, HostEvent::Log(_, line) if line == "processed"))
+                .count();
+        }
+        let elapsed = started.elapsed();
+        host.handle(
+            HostCmd::Configure([("audit".into(), config(false, false, json!({})))].into()),
+            2.0,
+        );
+        host.drain();
+        host.handle(own_message(5, EVENTS + 2), 2.0);
+        let disabled_output = host.drain().len();
+        println!(
+            "security_probe_lua_load: timeout_count={} events={} bytes_per_event={} processed={} elapsed_ms={} disabled_output={}",
+            timed_out,
+            EVENTS,
+            BYTES_PER_EVENT,
+            processed,
+            elapsed.as_millis(),
+            disabled_output
+        );
+        assert_eq!(timed_out, 1);
+        assert_eq!(processed, EVENTS as usize);
+        assert_eq!(disabled_output, 0);
+        assert!(elapsed.as_secs() < 15, "local probe time bound exceeded");
+    }
+
+    #[test]
+    fn security_fix_stale_host_backlog_does_not_act_on_same_users_new_client() {
+        let dir = TempDir::new();
+        let src = r#"
+            telega.plugin { name = "sender", permissions = { "read", "send" } }
+            telega.on("message_new", function(m) telega.send(m.chat_id, "reply") end)
+        "#;
+        let mut host = host(
+            &dir,
+            vec![plugin("sender", src)],
+            &[("sender", config(true, false, json!({})))],
+        );
+        host.handle(HostCmd::Account(Some(replacement_origin())), 0.1);
+        host.handle(own_message(5, 21), 0.2);
+        host.tick(0.2);
+        assert!(
+            !host
+                .drain()
+                .iter()
+                .any(|e| matches!(e, HostEvent::Action(..))),
+            "an event queued before account replacement must not act for its new client"
+        );
+
+        host.handle(
+            HostCmd::Event(
+                replacement_origin(),
+                Event::New {
+                    chat_id: 5,
+                    id: 22,
+                    text: "new session".into(),
+                    outgoing: false,
+                    sender_id: 7,
+                },
+            ),
+            0.3,
+        );
+        host.tick(0.3);
+        assert!(
+            host.drain().into_iter().any(|e| matches!(
+                e, HostEvent::Action(origin, id, Action::Send { chat_id: 5, .. })
+                    if origin == replacement_origin() && id == "sender"
+            )),
+            "the authorized new client's event should still work"
+        );
+    }
+
+    #[test]
+    fn security_fix_old_client_requeue_is_discarded_after_same_user_replacement() {
+        let dir = TempDir::new();
+        let mut host = host(
+            &dir,
+            vec![plugin(
+                "sender",
+                r#"telega.plugin { name = "sender", permissions = { "send" } }"#,
+            )],
+            &[("sender", config(true, false, json!({})))],
+        );
+        host.handle(HostCmd::Account(Some(replacement_origin())), 0.1);
+        let action = Action::Send {
+            chat_id: 5,
+            text: "reply".into(),
+        };
+        host.handle(
+            HostCmd::Requeue(origin(), "sender".into(), action.clone()),
+            0.2,
+        );
+        host.tick(0.2);
+        assert!(
+            !host
+                .drain()
+                .iter()
+                .any(|e| matches!(e, HostEvent::Action(..))),
+            "an old client's failed action must not be retried for the new client"
+        );
+        host.handle(
+            HostCmd::Requeue(replacement_origin(), "sender".into(), action.clone()),
+            0.3,
+        );
+        host.tick(0.3);
+        assert!(
+            host.drain().into_iter().any(|e| matches!(
+                e, HostEvent::Action(current, id, issued)
+                    if current == replacement_origin() && id == "sender" && issued == action
+            )),
+            "a current client's retry must remain eligible"
+        );
+    }
+
+    #[test]
+    fn security_fix_rapid_disable_reenable_cancels_scheduled_delete_through_transport() {
+        let dir = TempDir::new();
+        let mut host = host(
+            &dir,
+            vec![autodelete()],
+            &[("autodelete", autodelete_on(false))],
+        );
+        let (handle, receiver) = crate::plugins::HostHandle::for_test();
+        // The real transport first observes the enabled state, just as it
+        // does at startup; otherwise it cannot know an off transition began.
+        handle.send(HostCmd::Configure(
+            [("autodelete".into(), autodelete_on(false))].into(),
+        ));
+        for cmd in receiver.try_iter() {
+            host.handle(cmd, 0.0);
+        }
+        host.handle(own_message(5, 10), 0.0);
+        // Both commands arrive while Lua has not read the transport. The
+        // disable must not vanish when the final enabled config arrives.
+        handle.send(HostCmd::Configure(
+            [(
+                "autodelete".into(),
+                config(false, false, json!({ "chats": [5], "minutes": 1 })),
+            )]
+            .into(),
+        ));
+        handle.send(HostCmd::Configure(
+            [("autodelete".into(), autodelete_on(false))].into(),
+        ));
+        for cmd in receiver.try_iter() {
+            host.handle(cmd, 0.1);
+        }
+        host.tick(61.0);
+        assert!(
+            actions(&mut host).is_empty(),
+            "a deletion scheduled before the brief disable must not fire after re-enabling"
+        );
+        host.handle(own_message(5, 11), 61.0);
+        host.tick(121.0);
+        assert_eq!(
+            actions(&mut host),
+            [Action::Delete {
+                chat_id: 5,
+                ids: vec![11],
+                revoke: true,
+            }],
+            "newly scheduled work should still run after re-enabling"
+        );
+    }
+
+    #[test]
+    fn security_fix_flood_wait_wake_precedes_due_action_and_preserves_retry() {
+        let dir = TempDir::new();
+        let src = r#"
+            telega.plugin { name = "burst", permissions = { "read", "delete_own" } }
+            telega.on("message_new", function(m) telega.delete(m.chat_id, { m.id }, { revoke = true }) end)
+        "#;
+        let mut host = host(
+            &dir,
+            vec![plugin("burst", src)],
+            &[("burst", config(true, false, json!({})))],
+        );
+        for id in 1..=2 {
+            host.handle(own_message(5, id), 0.0);
+        }
+        host.tick(0.0);
+        assert_eq!(
+            actions(&mut host),
+            [Action::Delete {
+                chat_id: 5,
+                ids: vec![1],
+                revoke: true,
+            }]
+        );
+
+        let (handle, receiver) = crate::plugins::HostHandle::for_test();
+        let retry = Action::Delete {
+            chat_id: 5,
+            ids: vec![99],
+            revoke: true,
+        };
+        handle.send(HostCmd::FloodWait(origin(), 30));
+        handle.send(HostCmd::Requeue(origin(), "burst".into(), retry.clone()));
+        // At the exact instant action 2 becomes due, dispatch the wake with
+        // the actual worker step. A pre-control tick would emit action 2.
+        while receiver.drive_host(&mut host, 0.5) {}
+        assert!(
+            actions(&mut host).is_empty(),
+            "the due send must remain paused when FloodWait wakes the worker"
+        );
+        assert_eq!(host.next_wakeup(0.5), Some(30.5));
+        host.tick(30.5);
+        assert_eq!(
+            actions(&mut host),
+            [retry],
+            "the retried action must survive the pause and run first afterward"
+        );
+    }
+
+    #[test]
+    fn security_fix_account_removal_wake_precedes_due_autodelete() {
+        let dir = TempDir::new();
+        let mut host = host(
+            &dir,
+            vec![autodelete()],
+            &[("autodelete", autodelete_on(false))],
+        );
+        host.handle(own_message(5, 10), 0.0);
+        assert_eq!(host.next_wakeup(0.0), Some(60.0));
+
+        let (handle, receiver) = crate::plugins::HostHandle::for_test();
+        handle.send(HostCmd::Account(None));
+        // No real clock or thread: the pending delete is already overdue when
+        // the account-removal wake is processed by the production worker step.
+        while receiver.drive_host(&mut host, 61.0) {}
+        assert!(
+            actions(&mut host).is_empty(),
+            "logging out must prevent an overdue action on the old account"
+        );
+        host.tick(61.0);
+        assert!(
+            actions(&mut host).is_empty(),
+            "the old account's task cannot fire again without an active account"
+        );
+    }
+
+    #[test]
+    fn security_fix_transport_bounds_event_backlog_without_losing_controls() {
+        // Exercise the real HostHandle transport with no worker draining it:
+        // ordinary events must not retain an unbounded backlog in Rust memory.
+        let (handle, receiver) = crate::plugins::HostHandle::for_test();
+        const EVENTS: usize = 512;
+        const MAX_PENDING_EVENTS: usize = 256;
+        let text = "x".repeat(32 * 1024);
+        for id in 0..EVENTS {
+            handle.send(HostCmd::Event(
+                origin(),
+                Event::New {
+                    chat_id: 5,
+                    id: id as i64,
+                    text: text.clone(),
+                    outgoing: true,
+                    sender_id: 1,
+                },
+            ));
+        }
+        // Neither policy changes nor account changes may be stuck behind or
+        // silently dropped with the saturated event queue.
+        handle.send(HostCmd::Configure(Default::default()));
+        handle.send(HostCmd::Account(Some(origin())));
+        let commands: Vec<_> = receiver.try_iter().collect();
+        let accepted = commands
+            .iter()
+            .filter(|cmd| matches!(cmd, HostCmd::Event(_, Event::New { .. })))
+            .count();
+        assert!(
+            accepted <= MAX_PENDING_EVENTS,
+            "retained {accepted} of {EVENTS} 32-KiB events with no consumer"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, HostCmd::Configure(_))),
+            "a full event queue must still admit the configuration change"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, HostCmd::Account(Some(account)) if *account == origin())),
+            "a full event queue must still admit the account change"
+        );
+    }
 }

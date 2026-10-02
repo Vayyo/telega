@@ -351,13 +351,18 @@ fn fill_sound(shared: &Shared, out: &mut [f32]) {
         let channels = usize::from(sound.channels).max(1);
         let mut filled = 0usize;
         for sample in out.iter_mut() {
-            *sample = match (playing, sound.samples.pop_front()) {
-                (true, Some(s)) => {
-                    filled += 1;
-                    s * volume
+            *sample = if playing {
+                match sound.samples.pop_front() {
+                    Some(s) => {
+                        filled += 1;
+                        s * volume
+                    }
+                    // Starved: silence, and the clock does not move.
+                    None => 0.0,
                 }
-                // Paused or starved: silence, and the clock does not move.
-                _ => 0.0,
+            } else {
+                // Paused: output silence without consuming buffered samples.
+                0.0
             };
         }
         sound.played += (filled / channels) as u64;
@@ -836,5 +841,70 @@ mod tests {
             false,
         );
         wait(|| player.error().is_some());
+    }
+}
+
+#[cfg(test)]
+mod security_diagnostics {
+    use super::*;
+
+    #[test]
+    fn security_fix_pausing_preserves_audio_samples_and_resumes_in_order_at_the_selected_volume() {
+        let source = [0.125, 0.25, 0.375, 0.5, 0.625, 0.75];
+        let shared = Shared {
+            frames: Mutex::new(VecDeque::new()),
+            sound: Mutex::new(Some(Sound {
+                samples: source.into_iter().collect(),
+                played: 0,
+                rate: 48_000,
+                channels: 2,
+                stalled: None,
+            })),
+            clock: Mutex::new(Clock {
+                base: Duration::ZERO,
+                since: None,
+            }),
+            info: Mutex::new(Info::default()),
+            seek: Mutex::new(None),
+            paused: AtomicBool::new(true),
+            volume: AtomicU32::new(1.0_f32.to_bits()),
+            finished: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        };
+
+        for _ in 0..2 {
+            let mut paused_output = [f32::NAN; 2];
+            fill_sound(&shared, &mut paused_output);
+            assert_eq!(paused_output, [0.0; 2]);
+            let guard = shared.sound.lock();
+            let sound = guard.as_ref().unwrap();
+            assert_eq!(sound.samples.iter().copied().collect::<Vec<_>>(), source);
+            assert_eq!(sound.played, 0);
+            assert!(sound.stalled.is_none());
+        }
+        assert_eq!(shared.position(), Duration::ZERO);
+
+        shared.paused.store(false, Ordering::Relaxed);
+        let mut resumed_output = [f32::NAN; 4];
+        fill_sound(&shared, &mut resumed_output);
+        assert_eq!(resumed_output, source[..4]);
+        {
+            let guard = shared.sound.lock();
+            let sound = guard.as_ref().unwrap();
+            assert_eq!(
+                sound.samples.iter().copied().collect::<Vec<_>>(),
+                source[4..]
+            );
+            assert_eq!(sound.played, 2);
+        }
+
+        shared.volume.store(0.5_f32.to_bits(), Ordering::Relaxed);
+        let mut quieter_output = [f32::NAN; 2];
+        fill_sound(&shared, &mut quieter_output);
+        assert_eq!(quieter_output, [source[4] * 0.5, source[5] * 0.5]);
+        let guard = shared.sound.lock();
+        let sound = guard.as_ref().unwrap();
+        assert!(sound.samples.is_empty());
+        assert_eq!(sound.played, 3);
     }
 }

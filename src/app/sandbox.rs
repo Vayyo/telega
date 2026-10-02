@@ -1055,10 +1055,121 @@ fn sandbox_password() {
     println!("{}", scene("lock", &mut app).display());
     app.session.auth = Auth::Ready;
     let _ = app.update(Msg::OpenSettings);
+    let _ = app.update(Msg::ToggleSettingsSection(
+        super::session::SettingsSection::Security,
+    ));
     println!(
         "{}",
         scene_sized("settings", &mut app, Size::new(1000.0, 900.0)).display()
     );
+}
+
+/// Clicks real category headers and controls and draws the collapsed/expanded page.
+#[test]
+#[ignore = "writes settings category screenshots; run explicitly"]
+fn sandbox_settings_categories() {
+    use super::session::SettingsSection;
+
+    const SETTINGS_SIZE: Size = Size::new(1000.0, 900.0);
+    fn click_matching(app: &mut App, window: WinId, matches: impl Fn(&Msg) -> bool) {
+        let mut renderer = renderer();
+        let position = [550.0, 430.0, 380.0, 950.0, 900.0]
+            .into_iter()
+            .flat_map(|x| {
+                (50..850)
+                    .step_by(5)
+                    .map(move |y| iced::Point::new(x, y as f32))
+            })
+            .find(|&position| {
+                let mut messages = Vec::new();
+                let mut ui = UserInterface::build(
+                    app.view(window),
+                    SETTINGS_SIZE,
+                    Cache::default(),
+                    &mut renderer,
+                );
+                for event in [
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                ] {
+                    let _ = ui.update(
+                        &[iced::Event::Mouse(event)],
+                        mouse::Cursor::Available(position),
+                        &mut renderer,
+                        &mut iced_runtime::core::clipboard::Null,
+                        &mut messages,
+                    );
+                }
+                messages.iter().any(&matches)
+            })
+            .expect("visible settings control pointer hit area");
+        assert!(
+            click_sized(app, window, SETTINGS_SIZE, position)
+                .iter()
+                .any(matches),
+            "pointer dispatched expected settings message"
+        );
+    }
+    fn click_category(app: &mut App, window: WinId, section: SettingsSection) {
+        click_matching(
+            app,
+            window,
+            |msg| matches!(msg, Msg::ToggleSettingsSection(value) if *value as usize == section as usize),
+        );
+    }
+
+    let mut app = app();
+    let window = app.main_window;
+    let _ = app.update(Msg::OpenSettings);
+    assert!(
+        !app.session
+            .settings_expanded
+            .iter()
+            .any(|&expanded| expanded)
+    );
+    println!(
+        "{}",
+        scene_sized("settings-categories-collapsed", &mut app, SETTINGS_SIZE).display()
+    );
+    click_category(&mut app, window, SettingsSection::Messages);
+    assert!(app.session.settings_expanded[SettingsSection::Messages as usize]);
+    let keep_deleted = app.settings.keep_deleted;
+    click_matching(
+        &mut app,
+        window,
+        |msg| matches!(msg, Msg::SetKeepDeleted(value) if *value != keep_deleted),
+    );
+    assert_ne!(app.settings.keep_deleted, keep_deleted);
+    click_category(&mut app, window, SettingsSection::Storage);
+    assert!(app.session.settings_expanded[SettingsSection::Messages as usize]);
+    let cache = app.settings.cache;
+    click_matching(
+        &mut app,
+        window,
+        |msg| matches!(msg, Msg::SetCachePolicy(limits) if limits.bytes != cache.bytes),
+    );
+    assert_ne!(app.settings.cache.bytes, cache.bytes);
+    println!(
+        "{}",
+        scene_sized("settings-categories-expanded", &mut app, SETTINGS_SIZE).display()
+    );
+    click_category(&mut app, window, SettingsSection::Messages);
+    assert!(!app.session.settings_expanded[SettingsSection::Messages as usize]);
+    assert!(app.session.settings_expanded[SettingsSection::Storage as usize]);
+    click_category(&mut app, window, SettingsSection::Storage);
+    click_category(&mut app, window, SettingsSection::Plugins);
+    click_matching(&mut app, window, |msg| {
+        matches!(msg, Msg::OpenPluginHelp(true))
+    });
+    assert!(app.session.plugin_help_open);
+    click_matching(&mut app, window, |msg| {
+        matches!(msg, Msg::OpenPluginHelp(false))
+    });
+    assert!(!app.session.plugin_help_open);
+    assert!(app.session.settings_expanded[SettingsSection::Plugins as usize]);
+    let _ = app.update(Msg::CloseSettings);
+    let _ = app.update(Msg::OpenSettings);
+    assert!(app.session.settings_expanded[SettingsSection::Plugins as usize]);
 }
 
 /// Finds each real slider's hit area, drags its pointer, and renders the saved result.
@@ -1069,6 +1180,9 @@ fn sandbox_storage_settings() {
     let mut app = app();
     let window = app.main_window;
     let _ = app.update(Msg::OpenSettings);
+    let _ = app.update(Msg::ToggleSettingsSection(
+        super::session::SettingsSection::Storage,
+    ));
     println!(
         "{}",
         scene_sized("storage-defaults", &mut app, STORAGE_SIZE).display()
@@ -1232,6 +1346,18 @@ fn sandbox_message_menu() {
         }
         let _ = app.update(Msg::Pane(window, PaneMsg::CloseMenu));
     }
+    let previous_look = app.settings.look;
+    let previous_mode = app.system_mode;
+    app.settings.look.scheme = look::Scheme::System;
+    app.system_mode = iced::theme::Mode::Light;
+    app.look = look::Look::new(app.settings.look, app.system_mode);
+    println!("{}", scene("message-menu-light-closed", &mut app).display());
+    let _ = app.update(Msg::Pane(window, PaneMsg::OpenMenu(4)));
+    println!("{}", scene("message-menu-light", &mut app).display());
+    let _ = app.update(Msg::Pane(window, PaneMsg::CloseMenu));
+    app.settings.look = previous_look;
+    app.system_mode = previous_mode;
+    app.look = look::Look::new(app.settings.look, app.system_mode);
 
     // A viewport that grows until every row fits must not reuse a positive
     // bottom offset cached before the resize.
@@ -1298,7 +1424,13 @@ fn sandbox_message_menu() {
     let target_id = pane.messages[target].id;
     let _ = long.update(Msg::Pane(long_window, PaneMsg::OpenMenu(target_id)));
     let offscreen = run_frames(&mut long, long_window, SIZE, 4, &mut renderer());
-    assert_eq!(closed, offscreen, "offscreen bubble has no visible popup");
+    // The composer below y=650 changes enabled styling while a menu owns keys.
+    let history_end = 650 * SIZE.width as usize * 4;
+    assert_eq!(
+        &closed[..history_end],
+        &offscreen[..history_end],
+        "offscreen bubble has no visible popup over history",
+    );
     println!(
         "{}",
         save("message-menu-offscreen", SIZE, offscreen).display()
@@ -1442,9 +1574,21 @@ fn sandbox_scenes() {
             is_channel: false,
             is_member: true,
             members: vec![
-                (7, "Игорь Петров".into()),
-                (8, "Маша".into()),
-                (ME, "Demo User".into()),
+                crate::td::ProfileMember {
+                    id: 7,
+                    name: "Maxwell".into(),
+                    is_bot: true,
+                },
+                crate::td::ProfileMember {
+                    id: 8,
+                    name: "Маша".into(),
+                    is_bot: false,
+                },
+                crate::td::ProfileMember {
+                    id: ME,
+                    name: "Demo User".into(),
+                    is_bot: false,
+                },
             ],
         }),
     ));
@@ -1685,4 +1829,546 @@ fn sandbox_video_note_player() {
         "{}",
         scene("video-note-player-expanded", &mut app).display()
     );
+}
+
+/// Compare actual rasterized status glyphs to the same rows without statuses.
+/// Antialiased edge pixels blend with the row background; assert legible core
+/// pixels rather than requiring a fixed fraction of all touched edge pixels.
+#[test]
+#[ignore = "renders sidebar status contrast screenshots; run explicitly"]
+fn sandbox_sidebar_status() {
+    use super::look::{Accent, LookSettings, Scheme};
+
+    fn pixel(frame: &[u8], x: usize, y: usize) -> [u8; 3] {
+        let at = (y * SIZE.width as usize + x) * 4;
+        [frame[at], frame[at + 1], frame[at + 2]]
+    }
+
+    fn luminance(rgb: [u8; 3]) -> f64 {
+        let channel = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(rgb[0]) + 0.7152 * channel(rgb[1]) + 0.0722 * channel(rgb[2])
+    }
+
+    fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    // Hover is exercised through the same iced UI event/draw/screenshot path
+    // as run_frames, with the pointer inside the requested row.
+    fn draw(app: &mut App, window: WinId, hover: Option<iced::Point>) -> Vec<u8> {
+        let mut renderer = renderer();
+        if let Some(point) = hover {
+            let theme = app.theme(window).unwrap();
+            let mut messages = Vec::new();
+            let mut ui =
+                UserInterface::build(app.view(window), SIZE, Cache::default(), &mut renderer);
+            let cursor = mouse::Cursor::Available(point);
+            let _ = ui.update(
+                &[
+                    iced::Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                    iced::Event::Window(iced::window::Event::RedrawRequested(
+                        std::time::Instant::now(),
+                    )),
+                ],
+                cursor,
+                &mut renderer,
+                &mut iced_runtime::core::clipboard::Null,
+                &mut messages,
+            );
+            ui.draw(
+                &mut renderer,
+                &theme,
+                &Style {
+                    text_color: theme.palette().text,
+                },
+                cursor,
+            );
+            renderer.screenshot(
+                Size::new(SIZE.width as u32, SIZE.height as u32),
+                1.0,
+                theme.palette().background,
+            )
+        } else {
+            run_frames(app, window, SIZE, 1, &mut renderer)
+        }
+    }
+
+    // Only pixels changed by displaying the status count as glyph pixels;
+    // the sampled row background comes from this same real screenshot.
+    fn check_status(
+        shown: &[u8],
+        without: &[u8],
+        row_top: usize,
+        selected: bool,
+        pin: bool,
+        label: &str,
+    ) {
+        let (left, right, top, bottom) = if pin {
+            (190, 295, row_top + 4, row_top + 27)
+        } else {
+            (55, 190, row_top + 26, row_top + 49)
+        };
+        let background = pixel(shown, 180, row_top + 46);
+        let mut glyph = 0;
+        let mut readable = 0;
+        let mut max_contrast = 0.0_f64;
+        let mut max_pixel = [0; 3];
+        for y in top..bottom {
+            for x in left..right {
+                let foreground = pixel(shown, x, y);
+                let previous = pixel(without, x, y);
+                let ratio = contrast(foreground, background);
+                if foreground != previous && ratio > 1.15 {
+                    glyph += 1;
+                    if ratio > max_contrast {
+                        max_contrast = ratio;
+                        max_pixel = foreground;
+                    }
+                    if ratio >= 4.5 {
+                        readable += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "{label} selected={selected} pin={pin}: core {readable}/{glyph}, bg={background:?}, strongest={max_pixel:?}, max contrast={max_contrast:.2}"
+        );
+        assert!(
+            glyph >= 18 && readable >= 8,
+            "{label} selected={selected} pin={pin}: {readable}/{glyph} status glyph pixels meet 4.5:1 against actual row background {background:?}; strongest {max_pixel:?} at {max_contrast:.2}:1"
+        );
+    }
+
+    let mut app = world();
+    let window = app.main_window;
+    for (id, title, order) in [(2, "A", 100), (3, "B", 90)] {
+        app.set_order(id, order);
+        let chat = app.session.chats.get_mut(&id).unwrap();
+        chat.title = title.into();
+        chat.title_lower = title.to_lowercase();
+        chat.private = true;
+        chat.pinned = false;
+        chat.last_outgoing = false;
+        chat.preview.clear();
+        chat.draft = None;
+    }
+    open_with(&mut app, 2, Vec::new());
+    for (scheme, mode) in [
+        (Scheme::Telegram, iced::theme::Mode::Dark),
+        (Scheme::Graphite, iced::theme::Mode::Dark),
+        (Scheme::System, iced::theme::Mode::Dark),
+        (Scheme::System, iced::theme::Mode::Light),
+    ] {
+        for accent in Accent::ALL {
+            app.system_mode = mode;
+            let settings = LookSettings { scheme, accent };
+            let _ = app.update(Msg::SetLook(settings));
+            app.look = super::look::Look::new(settings, mode);
+            let theme = app.theme(window).unwrap();
+            let primary = theme.extended_palette().primary;
+            println!(
+                "{scheme:?}/{mode:?}/{accent:?}: primary base fg={:?} bg={:?}; strong fg={:?} bg={:?}",
+                primary.base.text, primary.base.color, primary.strong.text, primary.strong.color
+            );
+            app.session.local_main.clear();
+            app.session.typing = Default::default();
+            let baseline = draw(&mut app, window, None);
+            app.session.local_main.extend([2, 3]);
+            for (id, user) in [(2, 9), (3, 8)] {
+                td(
+                    &mut app,
+                    json!({"@type": "updateChatAction", "chat_id": id,
+                        "sender_id": {"@type": "messageSenderUser", "user_id": user},
+                        "action": {"@type": "chatActionTyping"}}),
+                );
+                assert!(app.typing_label(id).is_some());
+            }
+            let shown = draw(&mut app, window, None);
+            let representative = (scheme == Scheme::Telegram && accent == Accent::Blue)
+                || (scheme == Scheme::System
+                    && mode == iced::theme::Mode::Light
+                    && accent == Accent::Violet);
+            if representative {
+                let label = if mode == iced::theme::Mode::Light {
+                    "light"
+                } else {
+                    "dark"
+                };
+                println!(
+                    "{}",
+                    save(
+                        &format!("sidebar-status-{label}-shown"),
+                        SIZE,
+                        shown.clone()
+                    )
+                    .display()
+                );
+            }
+            // Find the selected row from its *rendered* background, not from
+            // a theme definition or a fabricated style copy.
+            let sidebar = pixel(&shown, 180, 450);
+            let first = (90..400)
+                .find(|&y| {
+                    let color = pixel(&shown, 180, y);
+                    color != sidebar
+                        && (0..38).all(|offset| pixel(&shown, 180, y + offset) == color)
+                })
+                .expect("selected chat's painted row");
+            assert_eq!(app.displayed_chat_ids(window).unwrap()[..2], [2, 3]);
+
+            for (row, name) in [(first, "selected"), (first + 52, "unselected")] {
+                check_status(&shown, &baseline, row, row == first, true, name);
+                check_status(&shown, &baseline, row, row == first, false, name);
+                let cursor = Some(iced::Point::new(180.0, (row + 36) as f32));
+                app.session.local_main.clear();
+                app.session.typing = Default::default();
+                let without_hover = draw(&mut app, window, cursor);
+                app.session.local_main.extend([2, 3]);
+                for (id, user) in [(2, 9), (3, 8)] {
+                    td(
+                        &mut app,
+                        json!({"@type": "updateChatAction", "chat_id": id,
+                        "sender_id": {"@type": "messageSenderUser", "user_id": user},
+                        "action": {"@type": "chatActionTyping"}}),
+                    );
+                }
+                let hovered = draw(&mut app, window, cursor);
+                check_status(&hovered, &without_hover, row, row == first, true, name);
+                check_status(&hovered, &without_hover, row, row == first, false, name);
+                if representative {
+                    let label = if mode == iced::theme::Mode::Light {
+                        "light"
+                    } else {
+                        "dark"
+                    };
+                    println!(
+                        "{}",
+                        save(&format!("sidebar-status-{label}-{name}"), SIZE, hovered).display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Clicks the real composer tree without running file dialogs, TDLib, or audio
+/// tasks. The recording strip uses the same control builder as the live row;
+/// a synthetic Recorder cannot be built without opening microphone hardware.
+#[test]
+#[ignore = "renders composer icon screenshots and probes controls; run explicitly"]
+fn sandbox_composer_icons() {
+    use super::look::{Accent, LookSettings, Scheme};
+
+    fn probe(root: iced::Element<'_, Msg>, size: Size, at: iced::Point) -> Vec<Msg> {
+        let mut renderer = renderer();
+        let mut ui = UserInterface::build(root, size, Cache::default(), &mut renderer);
+        let mut messages = Vec::new();
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            let _ = ui.update(
+                &[iced::Event::Mouse(event)],
+                mouse::Cursor::Available(at),
+                &mut renderer,
+                &mut iced_runtime::core::clipboard::Null,
+                &mut messages,
+            );
+        }
+        messages
+    }
+
+    fn expected(message: &Msg, index: usize, window: WinId) -> bool {
+        match (index, message) {
+            (0, Msg::Pane(w, PaneMsg::TogglePicker))
+            | (1, Msg::Pane(w, PaneMsg::Send))
+            | (2, Msg::Pane(w, PaneMsg::Attach)) => *w == window,
+            (3, Msg::RecordStart(w)) => *w == window,
+            _ => false,
+        }
+    }
+
+    // Use emissions from the actual laid-out UI, not a duplicate layout or
+    // hard-coded pixel coordinates. Only search a bounded composer strip.
+    fn locate(app: &App, window: WinId, size: Size) -> [iced::Point; 4] {
+        std::array::from_fn(|index| {
+            let x = size.width - 30.0 - 46.0 * (3 - index) as f32;
+            let mut hits = (size.height as i32 - 125..size.height as i32 - 10)
+                .step_by(5)
+                .map(|y| iced::Point::new(x, y as f32))
+                .filter(|&at| {
+                    probe(app.view(window), size, at)
+                        .iter()
+                        .any(|m| expected(m, index, window))
+                });
+            let first = hits.next().unwrap_or_else(|| {
+                panic!("composer control {index} missing at width {}", size.width)
+            });
+            let last = hits.last().unwrap_or(first);
+            iced::Point::new(x, (first.y + last.y) * 0.5)
+        })
+    }
+
+    fn hover(app: &App, window: WinId, size: Size, at: iced::Point) -> Vec<u8> {
+        let theme = app.theme(window).unwrap();
+        let mut renderer = renderer();
+        let mut messages = Vec::new();
+        let mut ui = UserInterface::build(app.view(window), size, Cache::default(), &mut renderer);
+        let cursor = mouse::Cursor::Available(at);
+        let _ = ui.update(
+            &[
+                iced::Event::Mouse(mouse::Event::CursorMoved { position: at }),
+                iced::Event::Window(iced::window::Event::RedrawRequested(
+                    std::time::Instant::now(),
+                )),
+            ],
+            cursor,
+            &mut renderer,
+            &mut iced_runtime::core::clipboard::Null,
+            &mut messages,
+        );
+        ui.draw(
+            &mut renderer,
+            &theme,
+            &Style {
+                text_color: theme.palette().text,
+            },
+            cursor,
+        );
+        renderer.screenshot(
+            Size::new(size.width as u32, size.height as u32),
+            1.0,
+            theme.palette().background,
+        )
+    }
+
+    /// Count opaque-enough icon stroke pixels in the rendered button, not
+    /// anti-aliased fringe pixels. Compare each with that button's real fill.
+    fn check_contrast(frame: &[u8], at: iced::Point, label: &str) {
+        fn pixel(frame: &[u8], x: usize, y: usize) -> [u8; 3] {
+            let offset = (y * SIZE.width as usize + x) * 4;
+            [frame[offset], frame[offset + 1], frame[offset + 2]]
+        }
+        fn luminance(rgb: [u8; 3]) -> f64 {
+            let linear = |value: u8| {
+                let s = f64::from(value) / 255.0;
+                if s <= 0.04045 {
+                    s / 12.92
+                } else {
+                    ((s + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(rgb[0]) + 0.7152 * linear(rgb[1]) + 0.0722 * linear(rgb[2])
+        }
+        let x = at.x as usize;
+        let y = at.y as usize;
+        let base = luminance(pixel(frame, x + 17, y));
+        let mut readable = 0;
+        for py in y - 11..=y + 11 {
+            for px in x - 11..=x + 11 {
+                let ink = luminance(pixel(frame, px, py));
+                let contrast = (base.max(ink) + 0.05) / (base.min(ink) + 0.05);
+                if contrast >= 4.5 {
+                    readable += 1;
+                }
+            }
+        }
+        if readable < 4 {
+            println!(
+                "contrast failure: {label}, at={at:?}, background={:?}, center={:?}, frame={}",
+                pixel(frame, x + 17, y),
+                pixel(frame, x, y),
+                save("composer-icons-contrast-failure", SIZE, frame.to_vec()).display()
+            );
+        }
+        assert!(
+            readable >= 4,
+            "{label}: only {readable} icon stroke pixels have 4.5:1 contrast"
+        );
+    }
+
+    let mut app = world();
+    let window = app.main_window;
+    open_with(&mut app, 2, vec![msg(2, 501, 9, 2, "Иконки композитора")]);
+    let narrow = Size::new(540.0, 700.0);
+    let mut normal = Vec::new();
+    let mut dark_positions = [iced::Point::ORIGIN; 4];
+    for (scheme, mode, name, size) in [
+        (Scheme::Telegram, iced::theme::Mode::Dark, "dark", SIZE),
+        (Scheme::System, iced::theme::Mode::Light, "light", SIZE),
+        (Scheme::System, iced::theme::Mode::Light, "narrow", narrow),
+    ] {
+        app.system_mode = mode;
+        app.settings.look = LookSettings {
+            scheme,
+            accent: Accent::Orange,
+        };
+        app.look = super::look::Look::new(app.settings.look, mode);
+        let positions = locate(&app, window, size);
+        if name == "dark" {
+            dark_positions = positions;
+        }
+        for (index, &at) in positions.iter().enumerate() {
+            let emissions = probe(app.view(window), size, at);
+            assert!(
+                emissions.iter().any(|m| expected(m, index, window)),
+                "{name}: control {index} produced {emissions:?}"
+            );
+            // No click result is ever fed into app.update (which could start
+            // microphone/file dialogs or enqueue TDLib work).
+        }
+        println!("{name}: picker/send/attach/record controls emitted their actions");
+        println!(
+            "{}",
+            scene_sized(&format!("composer-icons-{name}"), &mut app, size).display()
+        );
+        if name == "dark" {
+            normal = run_frames(&mut app, window, SIZE, 4, &mut renderer());
+            println!(
+                "{}",
+                save(
+                    "composer-icons-hover",
+                    size,
+                    hover(&app, window, size, positions[1])
+                )
+                .display()
+            );
+        }
+    }
+    // Contrast comes from actual screenshot pixels at the hit-tested geometry,
+    // both at rest and under a pointer, for every appearance/accent combination.
+    for (scheme, mode, name) in [
+        (Scheme::Telegram, iced::theme::Mode::Dark, "telegram"),
+        (Scheme::Graphite, iced::theme::Mode::Dark, "graphite"),
+        (Scheme::System, iced::theme::Mode::Dark, "system-dark"),
+        (Scheme::System, iced::theme::Mode::Light, "system-light"),
+    ] {
+        app.system_mode = mode;
+        app.settings.look = LookSettings {
+            scheme,
+            accent: Accent::Blue,
+        };
+        app.look = super::look::Look::new(app.settings.look, mode);
+        let positions = locate(&app, window, SIZE);
+        for accent in Accent::ALL {
+            app.settings.look.accent = accent;
+            app.look = super::look::Look::new(app.settings.look, mode);
+            let active = run_frames(&mut app, window, SIZE, 4, &mut renderer());
+            for (index, &at) in positions.iter().enumerate() {
+                let label = format!("{name}/{accent:?}/button-{index}");
+                check_contrast(&active, at, &format!("{label}/active"));
+                check_contrast(
+                    &hover(&app, window, SIZE, at),
+                    at,
+                    &format!("{label}/hover"),
+                );
+            }
+            println!("{name}/{accent:?}: all four icons meet 4.5:1 at rest and hovered");
+        }
+    }
+
+    app.system_mode = iced::theme::Mode::Dark;
+    app.settings.look = LookSettings {
+        scheme: Scheme::Telegram,
+        accent: Accent::Orange,
+    };
+    app.look = super::look::Look::new(app.settings.look, app.system_mode);
+    app.session.panes.get_mut(&window).unwrap().editing = Some((501, String::new()));
+    let edit_points = locate(&app, window, SIZE);
+    assert!(
+        probe(app.view(window), SIZE, edit_points[1])
+            .iter()
+            .any(|m| expected(m, 1, window))
+    );
+    let edit_pixels = run_frames(&mut app, window, SIZE, 4, &mut renderer());
+    // A checkmark must differ visibly from the paper plane in the same slot.
+    let icon_diff = (edit_points[1].y as usize - 10..edit_points[1].y as usize + 10)
+        .flat_map(|y| {
+            (edit_points[1].x as usize - 10..edit_points[1].x as usize + 10)
+                .map(move |x| (y * SIZE.width as usize + x) * 4)
+        })
+        .filter(|&p| normal[p..p + 3] != edit_pixels[p..p + 3])
+        .count();
+    assert!(
+        icon_diff > 10,
+        "checkmark should replace plane: {icon_diff} distinct pixels"
+    );
+    println!(
+        "{}",
+        save("composer-icons-editing", SIZE, edit_pixels).display()
+    );
+    println!(
+        "{}",
+        save(
+            "composer-icons-editing-hover",
+            SIZE,
+            hover(&app, window, SIZE, edit_points[1])
+        )
+        .display()
+    );
+    app.session.panes.get_mut(&window).unwrap().editing = None;
+
+    app.session.accounts_open = true; // compositor remains visible, actions disabled.
+    assert!(!app.composer_available(window, &app.session.panes[&window]));
+    let disabled = run_frames(&mut app, window, SIZE, 4, &mut renderer());
+    println!(
+        "{}",
+        save("composer-icons-disabled", SIZE, disabled).display()
+    );
+    for &at in &dark_positions {
+        let emissions = probe(app.view(window), SIZE, at);
+        assert!(
+            !(0..4).any(|i| emissions.iter().any(|m| expected(m, i, window))),
+            "disabled composer emitted {emissions:?}"
+        );
+    }
+    app.session.accounts_open = false;
+
+    // Draw exactly the recording control row used by view_chat, but without
+    // fabricating a microphone/recorder and without dispatching RecordStop.
+    let recording_size = Size::new(340.0, 64.0);
+    let theme = app.look.theme.clone();
+    let strip = || {
+        iced::widget::container(super::view::recording_controls(&theme, 83))
+            .padding(8)
+            .width(iced::Fill)
+            .align_bottom(iced::Fill)
+    };
+    let mut renderer = renderer();
+    let mut ui = UserInterface::build(strip(), recording_size, Cache::default(), &mut renderer);
+    ui.draw(
+        &mut renderer,
+        &theme,
+        &Style {
+            text_color: theme.palette().text,
+        },
+        mouse::Cursor::Unavailable,
+    );
+    let recording_pixels = renderer.screenshot(
+        Size::new(recording_size.width as u32, recording_size.height as u32),
+        1.0,
+        theme.palette().background,
+    );
+    println!(
+        "{}",
+        save("composer-icons-recording", recording_size, recording_pixels).display()
+    );
+    for (x, send) in [(266.0, true), (312.0, false)] {
+        let messages = probe(strip().into(), recording_size, iced::Point::new(x, 36.0));
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, Msg::RecordStop(actual) if *actual == send)),
+            "recording send={send} emitted {messages:?}"
+        );
+    }
+    println!("recording send/cancel controls emitted RecordStop(true/false)");
 }

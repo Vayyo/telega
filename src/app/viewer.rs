@@ -35,6 +35,21 @@ fn decode_full(path: &str) -> Result<(u32, u32, Vec<u8>), String> {
     Ok((rgba.width(), rgba.height(), rgba.into_raw()))
 }
 
+/// The blocking closure owns the slot, not the abortable async waiter. Used
+/// by the viewer decode path and by controlled worker-lifetime tests.
+pub(crate) async fn decode_with_viewer_slot<T: Send + 'static>(
+    permit_source: &'static tokio::sync::Semaphore,
+    decode: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let permit = permit_source.acquire().await.map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 impl App {
     /// Photos of the chat shown in `window`, oldest first.
     fn chat_photos(&self, window: WinId) -> Vec<i32> {
@@ -95,10 +110,9 @@ impl App {
         Task::none()
     }
 
-    /// Decodes the photo, bounded by the same `DECODES` semaphore as the
-    /// bubbles. The returned handle cancels this decode (freeing its
-    /// semaphore slot right away) once the viewer moves on: see the
-    /// `decode` field of `PhotoView`.
+    /// Decodes the photo using a worker-held `DECODES` slot. The handle
+    /// aborts the UI waiter on navigation, but a running native decode
+    /// retains the slot until its blocking closure actually exits.
     fn decode_for_viewer(&mut self, file_id: i32) -> Task<Msg> {
         let Some(path) = self
             .session
@@ -110,13 +124,8 @@ impl App {
         };
         let (task, handle) = Task::perform(
             async move {
-                let _permit = super::media::DECODES
-                    .acquire()
+                decode_with_viewer_slot(&super::media::DECODES, move || decode_full(&path))
                     .await
-                    .map_err(|e| e.to_string())?;
-                tokio::task::spawn_blocking(move || decode_full(&path))
-                    .await
-                    .map_err(|e| e.to_string())
                     .and_then(|r| r)
             },
             move |r| Msg::ViewerDecoded(file_id, r),
@@ -238,6 +247,7 @@ pub(crate) fn decode_full_for_tests(path: &str) -> Result<(u32, u32, Vec<u8>), S
 
 #[cfg(test)]
 mod tests {
+    static TEST_DECODES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     #[test]
     fn big_photo_is_scaled_to_the_viewer_limit() {
         let path = std::env::temp_dir().join(format!("telega-viewer-{}.png", std::process::id()));
@@ -246,5 +256,86 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!((w, h), (2560, 1280));
         assert_eq!(rgba.len(), (w * h * 4) as usize);
+    }
+
+    #[tokio::test]
+    async fn security_fix_aborted_photo_waiters_keep_two_decoder_slots_until_workers_exit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut releases = Vec::new();
+        let mut waiters = Vec::new();
+        for id in 0..2 {
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let started_tx = started_tx.clone();
+            waiters.push(tokio::spawn(async move {
+                super::decode_with_viewer_slot(&TEST_DECODES, move || {
+                    started_tx.send(id).unwrap();
+                    // A native image decode cannot stop mid-call even if its
+                    // viewer's async waiter is canceled by navigation.
+                    let _ = release_rx.recv();
+                    id
+                })
+                .await
+            }));
+            releases.push(release_tx);
+        }
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                .await
+                .expect("blocking decoder starts")
+                .expect("decoder reports its start");
+        }
+
+        for waiter in waiters {
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(
+            TEST_DECODES.available_permits(),
+            0,
+            "navigation cannot free a running decoder's slot"
+        );
+
+        let (third_release_tx, third_release_rx) = mpsc::channel::<()>();
+        let third_started = started_tx.clone();
+        let third = tokio::spawn(async move {
+            super::decode_with_viewer_slot(&TEST_DECODES, move || {
+                third_started.send(2).unwrap();
+                let _ = third_release_rx.recv();
+                2
+            })
+            .await
+        });
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a third decoder must wait while both canceled workers are running"
+        );
+
+        releases.remove(0).send(()).unwrap();
+        let admitted = tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("released worker opens one slot")
+            .expect("next worker reports its start");
+        assert_eq!(admitted, 2);
+        assert_eq!(TEST_DECODES.available_permits(), 0);
+        third_release_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), third)
+                .await
+                .expect("replacement worker finishes")
+                .unwrap()
+                .unwrap(),
+            2
+        );
+        releases.remove(0).send(()).unwrap();
+        // Wait for both canceled blocking closures to finish, not just for
+        // their discarded async results.
+        let permits = tokio::time::timeout(Duration::from_secs(5), TEST_DECODES.acquire_many(2))
+            .await
+            .expect("canceled native workers eventually free both slots")
+            .unwrap();
+        drop(permits);
     }
 }

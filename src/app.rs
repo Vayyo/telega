@@ -9,6 +9,7 @@ pub(crate) mod media;
 mod nav;
 mod notify;
 mod pane;
+mod pane_update;
 mod password;
 mod picker;
 mod playback;
@@ -18,7 +19,9 @@ mod qr;
 pub(crate) mod rich;
 mod selectable;
 mod session;
+mod sidebar_view;
 mod tabs;
+mod td_updates;
 mod tray;
 mod typing;
 mod video;
@@ -32,7 +35,7 @@ use std::path::PathBuf;
 use iced::keyboard::{self, Key, Modifiers};
 use iced::widget::scrollable::Viewport;
 use iced::{Subscription, Task, window};
-use tdlib_rs::enums::{AuthorizationState, ChatList, MessageSender, OptionValue, Update};
+use tdlib_rs::enums::{AuthorizationState, ChatList, MessageSender, Update};
 use tdlib_rs::types::{ChatPosition, File, Message};
 
 use crate::archive::Archive;
@@ -41,8 +44,9 @@ use crate::settings::{CacheLimits, Settings};
 use crate::td;
 use media::Media;
 use pane::{ChatPane, Page};
-use plugin_runtime::message_event;
-use session::{FolderCreation, FolderReorder, FolderReorderState, ListRead, Session};
+use session::{
+    FolderCreation, FolderReorder, FolderReorderState, ListRead, Session, SettingsSection,
+};
 
 pub(crate) type WinId = window::Id;
 
@@ -68,7 +72,7 @@ pub(crate) enum Msg {
     /// Deletion from the UI finished; on failure the ids stop counting as
     /// own deletions, same as a plugin's deletion (`PluginDeleted`).
     DeleteDone(i64, Vec<i64>, Result<(), String>),
-    Input(String),
+    Input(crate::lock::SecretString),
     SubmitAuth,
     /// Return from code/password entry to phone entry (wrong number).
     BackToPhone,
@@ -77,6 +81,7 @@ pub(crate) enum Msg {
     ConfirmLogOut(bool),
     OpenSettings,
     CloseSettings,
+    ToggleSettingsSection(SettingsSection),
     SetKeepDeleted(bool),
     SetCachePolicy(CacheLimits),
     ApplyCachePolicy,
@@ -96,11 +101,17 @@ pub(crate) enum Msg {
     Plugin(HostEvent),
     /// Result of an action a plugin asked for: the original action (to
     /// retry if it failed on a flood wait), a log line or error.
-    PluginDone(String, Action, Result<String, String>),
-    /// A plugin deletion after filtering: only these ids are the user's own.
-    PluginDeleteOwn(String, i64, Vec<i64>, bool, Action),
-    /// Deletion finished; on failure the ids stop counting as own deletions.
-    PluginDeleted(String, i64, Vec<i64>, Action, Result<(), String>),
+    PluginDone(plugins::Origin, String, Action, Result<String, String>),
+    /// Deletion after filtering; origin is verified again before the effect.
+    PluginDeleteOwn(plugins::Origin, String, i64, Vec<i64>, bool, Action),
+    PluginDeleted(
+        plugins::Origin,
+        String,
+        i64,
+        Vec<i64>,
+        Action,
+        Result<(), String>,
+    ),
     PluginToggle(String, bool),
     PluginDryRun(String, bool),
     PluginSetting(String, String, serde_json::Value),
@@ -404,7 +415,7 @@ pub(crate) enum Link {
     },
     Spoiler(i64),
     /// Monospace text: a click copies it.
-    Copy(String),
+    Copy(std::sync::Arc<str>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -1174,7 +1185,147 @@ impl App {
         }
     }
 
+    /// The chat editor is visible but must not receive keys through another surface.
+    fn composer_available(&self, window: WinId, pane: &ChatPane) -> bool {
+        self.auth_ready()
+            && pane.chat_id.is_some()
+            && self.session.leave.is_none()
+            && pane.menu.is_none()
+            && pane.search.is_none()
+            && pane.forward.is_none()
+            && pane.delete_selection.is_none()
+            && !(pane.profile.is_some()
+                && (pane.profile_more || pane.profile_qr.is_some() || pane.confirm_leave))
+            && pane.confirm_join.is_none()
+            && pane.confirm_link.is_none()
+            && pane.list.menu.is_none()
+            && pane.list.folder_picker.is_none()
+            && pane.list.new_folder_name.is_none()
+            && pane.list.confirm_read.is_none()
+            && pane.list.archive_settings.is_none()
+            && (window != self.main_window
+                || (!self.session.settings_open
+                    && !self.session.accounts_open
+                    && !self.session.confirm_logout))
+            && !self
+                .session
+                .photo_view
+                .as_ref()
+                .is_some_and(|v| v.window == window)
+            && !self
+                .session
+                .user_card
+                .as_ref()
+                .is_some_and(|c| c.window == window)
+            && !self
+                .session
+                .video
+                .as_ref()
+                .is_some_and(|v| v.window == window && v.expanded)
+            && !self
+                .session
+                .playback
+                .recording
+                .as_ref()
+                .is_some_and(|r| r.window == window)
+    }
+
+    /// Focus operations are scoped: iced's plain `focus` unfocuses every other
+    /// window's input when traversing all window trees.
+    fn composer_focus_task(&self, window: WinId, focus: bool) -> Task<Msg> {
+        use iced::advanced::widget::operation::{self, focusable};
+        let Some(pane) = self.session.panes.get(&window) else {
+            return Task::none();
+        };
+        let root = pane.root_id.clone();
+        let operation: Box<dyn iced::advanced::widget::Operation> = if focus {
+            Box::new(operation::scope(
+                root,
+                focusable::focus(pane.compose_id.clone()),
+            ))
+        } else {
+            Box::new(operation::scope(root, focusable::unfocus()))
+        };
+        iced_runtime::task::effect(iced_runtime::Action::widget(operation))
+    }
+
     pub(crate) fn update(&mut self, msg: Msg) -> Task<Msg> {
+        // Only explicit user transitions can take focus. No per-update scan of
+        // the panes: background TDLib replies must not move the caret.
+        let window = match &msg {
+            Msg::Pane(window, _)
+            | Msg::WindowFocus(window, _)
+            | Msg::Key(window, _, _)
+            | Msg::ToggleProfile(window)
+            | Msg::OpenProfile(window, _)
+            | Msg::Profile(window, _)
+            | Msg::ShowArchive(window, _)
+            | Msg::ShowFolder(window, _)
+            | Msg::ToggleArchiveSettings(window, _)
+            | Msg::ViewPhoto(window, _)
+            | Msg::ChatMenu(window, _)
+            | Msg::ChatOp(window, _, _)
+            | Msg::AskReadList(window, _)
+            | Msg::ConfirmReadList(window, _, _, _)
+            | Msg::OpenFound(window, _, _)
+            | Msg::RecordStarted(window, _, _)
+            | Msg::MainWindowOpened(window) => Some(*window),
+            Msg::SelectTab(_)
+            | Msg::CloseTab(_)
+            | Msg::CloseAllTabs
+            | Msg::OpenChatWindow(_)
+            | Msg::CloseSettings
+            | Msg::OpenSettings
+            | Msg::ToggleAccounts
+            | Msg::DismissAccountPopup
+            | Msg::LogOut
+            | Msg::ConfirmLogOut(_)
+            | Msg::NotificationClicked(_, _) => Some(self.main_window),
+            Msg::CloseViewer => self.session.photo_view.as_ref().map(|v| v.window),
+            Msg::Card(card::CardMsg::Open(window, _)) => Some(*window),
+            Msg::Card(_) => self.session.user_card.as_ref().map(|c| c.window),
+            Msg::Video(video::VideoMsg::Play(window, ..)) => Some(*window),
+            Msg::Video(_) => self.session.video.as_ref().map(|v| v.window),
+            Msg::RecordStop(_) => self.session.playback.recording.as_ref().map(|r| r.window),
+            _ => None,
+        };
+        let chat_before = window.and_then(|w| self.session.panes.get(&w).and_then(|p| p.chat_id));
+        let was_available = window.is_some_and(|w| {
+            self.session
+                .panes
+                .get(&w)
+                .is_some_and(|p| self.composer_available(w, p))
+        });
+        let explicit_focus = matches!(
+            &msg,
+            Msg::Pane(
+                _,
+                PaneMsg::SelectChat(_) | PaneMsg::ClickOutside | PaneMsg::ForwardTo(_)
+            ) | Msg::SelectTab(_)
+                | Msg::WindowFocus(_, true)
+                | Msg::MainWindowOpened(_)
+        );
+        let task = self.update_inner(msg);
+        let Some(window) = window else { return task };
+        let available = self
+            .session
+            .panes
+            .get(&window)
+            .is_some_and(|p| self.composer_available(window, p));
+        if available
+            && (explicit_focus
+                || !was_available
+                || chat_before != self.session.panes[&window].chat_id)
+        {
+            Task::batch([self.composer_focus_task(window, true), task])
+        } else if !available && was_available {
+            Task::batch([self.composer_focus_task(window, false), task])
+        } else {
+            task
+        }
+    }
+
+    fn update_inner(&mut self, msg: Msg) -> Task<Msg> {
         match msg {
             Msg::Td(client_id, update) => {
                 // Late updates of an already replaced client.
@@ -1256,7 +1407,14 @@ impl App {
             Msg::ConfirmLogOut(confirmed) => {
                 self.session.confirm_logout = false;
                 if confirmed {
+                    if self.key_transition_active() {
+                        self.error = Some("сначала завершите смену ключа".into());
+                        return Task::none();
+                    }
                     self.session.auth = Auth::LoggingOut;
+                    if let Some(host) = &self.plugin_host {
+                        host.send(HostCmd::Account(None));
+                    }
                     return Task::perform(td::log_out(self.session.client_id), Msg::Done);
                 }
             }
@@ -1269,8 +1427,15 @@ impl App {
                     pane.list.archive_settings = None;
                 }
             }
+            Msg::ToggleSettingsSection(section) => {
+                let expanded = &mut self.session.settings_expanded[section as usize];
+                *expanded = !*expanded;
+            }
             Msg::CloseSettings => {
                 self.session.settings_open = false;
+                self.session.password_form.current.clear();
+                self.session.password_form.new.clear();
+                self.session.password_form.repeat.clear();
                 if self.cache_unsaved {
                     self.save_settings();
                 }
@@ -1366,50 +1531,14 @@ impl App {
             Msg::Key(window, key, modifiers) => return self.on_key(window, key, modifiers),
             Msg::Pane(window, msg) => return self.on_pane(window, msg),
             Msg::Plugin(event) => return self.on_plugin(event),
-            Msg::PluginDone(id, action, result) => {
-                let line = match result {
-                    Ok(line) => line,
-                    Err(e) => {
-                        if let (Some(secs), Some(host)) = (td::flood_wait(&e), &self.plugin_host) {
-                            // The action itself would otherwise be lost: put
-                            // it back at the head of the queue instead of
-                            // only pausing future ones.
-                            host.send(HostCmd::FloodWait(secs));
-                            host.send(HostCmd::Requeue(id.clone(), action));
-                        }
-                        format!("ошибка: {e}")
-                    }
-                };
-                self.plugin_log(id, line);
+            Msg::PluginDone(origin, id, action, result) => {
+                return self.plugin_done(origin, id, action, result);
             }
-            Msg::PluginDeleteOwn(plugin, chat_id, own, revoke, action) => {
-                if own.is_empty() {
-                    self.plugin_log(plugin, "нечего удалять: сообщения не ваши".into());
-                    return Task::none();
-                }
-                // Deliberate deletions are not kept in the deleted archive.
-                self.session
-                    .self_deleted
-                    .extend(own.iter().map(|&message| (chat_id, message)));
-                let ids = own.clone();
-                return Task::perform(
-                    td::delete_messages(self.session.client_id, chat_id, own, revoke),
-                    move |r| {
-                        Msg::PluginDeleted(plugin.clone(), chat_id, ids.clone(), action.clone(), r)
-                    },
-                );
+            Msg::PluginDeleteOwn(origin, plugin, chat_id, own, revoke, action) => {
+                return self.plugin_delete_own(origin, plugin, chat_id, own, revoke, action);
             }
-            Msg::PluginDeleted(plugin, chat_id, ids, action, result) => {
-                let line = match result {
-                    Ok(()) => Ok(format!("удалено {} сообщ. в чате {chat_id}", ids.len())),
-                    Err(e) => {
-                        for id in &ids {
-                            self.session.self_deleted.remove(&(chat_id, *id));
-                        }
-                        Err(e)
-                    }
-                };
-                return self.update(Msg::PluginDone(plugin, action, line));
+            Msg::PluginDeleted(origin, plugin, chat_id, ids, action, result) => {
+                return self.plugin_deleted(origin, plugin, chat_id, ids, action, result);
             }
             Msg::PluginToggle(id, on) => {
                 // Enabling records which permissions the user agreed to.
@@ -1529,8 +1658,16 @@ impl App {
             },
             Msg::FileDropped(window, path) => return self.send_files(window, vec![path]),
             Msg::Pasted(window, result) => match result {
-                Ok(Some(path)) => return self.send_files(window, vec![path]),
-                Ok(None) => {}
+                Ok(Some(path))
+                    if self
+                        .session
+                        .panes
+                        .get(&window)
+                        .is_some_and(|p| self.composer_available(window, p)) =>
+                {
+                    return self.send_files(window, vec![path]);
+                }
+                Ok(Some(_) | None) => {}
                 Err(e) => self.error = Some(e),
             },
             Msg::WindowFocus(window, focused) => {
@@ -1549,6 +1686,10 @@ impl App {
                 }
                 tray::TrayEvent::Activate => return self.restore_main_window(),
                 tray::TrayEvent::Quit => {
+                    if self.key_transition_active() {
+                        self.error = Some("сначала завершите смену ключа".into());
+                        return Task::none();
+                    }
                     if self.cache_unsaved {
                         self.save_settings();
                     }
@@ -1596,6 +1737,9 @@ impl App {
                             self.error =
                                 Some(format!("Не удалось применить настройки хранилища: {error}"));
                         }
+                        if self.pending_transition().is_some() {
+                            return self.resume_key_recovery();
+                        }
                         if self.session.auth == Auth::Ready || self.session.cache_commit_pending {
                             self.session.cache_pending = None;
                             self.session.cache_commit_pending = false;
@@ -1603,7 +1747,18 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        if self.session.db_key.is_some() && e.to_lowercase().contains("encryption")
+                        if self.pending_transition().is_some() {
+                            if e.to_lowercase().contains("encryption")
+                                && !self.session.recovery_tried_other
+                                && let Some((_, target)) = &self.session.recovery_keys
+                            {
+                                self.session.recovery_tried_other = true;
+                                self.session.db_key = target.clone();
+                                return self.set_parameters();
+                            }
+                            self.recovery_failed(format!("база TDLib: {e}"));
+                        } else if self.session.db_key.is_some()
+                            && e.to_lowercase().contains("encryption")
                         {
                             self.session.db_key = None;
                             self.session.auth = Auth::Locked {
@@ -1679,11 +1834,18 @@ impl App {
             }
             Msg::OpenProfile(window, chat_id) => return self.open_profile(window, chat_id),
             Msg::Profile(window, action) => return self.profile_action(window, action),
-            Msg::ProfileLoaded(window, chat_id, result) => {
+            Msg::ProfileLoaded(window, chat_id, mut result) => {
                 if let Some(pane) = self.session.panes.get_mut(&window)
                     && let Some((shown, data)) = &mut pane.profile
                     && *shown == chat_id
                 {
+                    if let Ok(profile) = &mut result {
+                        for member in &mut profile.members {
+                            if self.session.users.contains_key(&member.id) {
+                                member.is_bot = self.session.bot_users.contains(&member.id);
+                            }
+                        }
+                    }
                     *data = Some(result);
                 }
             }
@@ -2006,7 +2168,8 @@ impl App {
                 }
                 // Any confirmation opened in another window before this send
                 // is now stale, even if the request finishes before it is clicked.
-                for pane in self.session.panes.values_mut() {
+                let mut dismissed_windows = Vec::new();
+                for (other_window, pane) in &mut self.session.panes {
                     if pane
                         .list
                         .confirm_read
@@ -2014,6 +2177,9 @@ impl App {
                         .is_some_and(|(_, pending)| *pending == list)
                     {
                         pane.list.confirm_read = None;
+                        if *other_window != window {
+                            dismissed_windows.push(*other_window);
+                        }
                     }
                 }
                 self.session.list_reads.push(ListRead {
@@ -2021,9 +2187,16 @@ impl App {
                     request,
                     window,
                 });
-                return Task::perform(td::read_chat_list(client, list), move |result| {
+                let read = Task::perform(td::read_chat_list(client, list), move |result| {
                     Msg::ListReadDone(window, client, request, result)
                 });
+                return Task::batch(
+                    dismissed_windows
+                        .into_iter()
+                        .filter(|other| self.composer_available(*other, &self.session.panes[other]))
+                        .map(|other| self.composer_focus_task(other, true))
+                        .chain(std::iter::once(read)),
+                );
             }
             Msg::ListReadDone(window, client, request, result) => {
                 if client != self.session.client_id {
@@ -2317,16 +2490,36 @@ impl App {
                     return iced::clipboard::write(text);
                 }
             }
-            Key::Character("v" | "V" | "м" | "М") if modifiers.command() && self.auth_ready() => {
-                return Task::perform(
-                    async {
-                        tokio::task::spawn_blocking(media::paste_image)
-                            .await
-                            .map_err(|e| e.to_string())
-                            .and_then(|r| r)
-                    },
-                    move |r| Msg::Pasted(window, r),
-                );
+            Key::Character("v" | "V" | "м" | "М")
+                if modifiers.command()
+                    && self
+                        .session
+                        .panes
+                        .get(&window)
+                        .is_some_and(|p| self.composer_available(window, p)) =>
+            {
+                use iced::advanced::widget::operation::{self, focusable};
+                let pane = &self.session.panes[&window];
+                let focused = iced::advanced::widget::operate(operation::scope(
+                    pane.root_id.clone(),
+                    focusable::is_focused(pane.compose_id.clone()),
+                ));
+                // The sidebar search also receives Ctrl+V. Only an editor
+                // actually holding focus may turn clipboard media into a send.
+                return focused.then(move |focused| {
+                    if !focused {
+                        return Task::none();
+                    }
+                    Task::perform(
+                        async {
+                            tokio::task::spawn_blocking(media::paste_image)
+                                .await
+                                .map_err(|e| e.to_string())
+                                .and_then(|r| r)
+                        },
+                        move |r| Msg::Pasted(window, r),
+                    )
+                });
             }
             // Ctrl+N (Cmd+N on macOS); "т" is the same key on the Russian layout.
             Key::Character("n" | "т" | "N" | "Т")
@@ -2402,7 +2595,12 @@ impl App {
             ]),
             None => Task::none(),
         };
-        Task::batch([open.discard(), select])
+        let focus = if chat_id.is_some() {
+            self.composer_focus_task(window, true)
+        } else {
+            Task::none()
+        };
+        Task::batch([open.discard(), focus, select])
     }
 
     fn open_archive_window(&mut self) -> Task<Msg> {
@@ -2462,6 +2660,10 @@ impl App {
             if window != self.main_window || self.main_window_state != MainWindowState::Open {
                 return Task::none();
             }
+            if self.key_transition_active() {
+                self.error = Some("сначала завершите смену ключа".into());
+                return Task::none();
+            }
             if self.cache_unsaved {
                 self.save_settings();
             }
@@ -2483,6 +2685,13 @@ impl App {
 
     fn on_window_closed(&mut self, window: WinId) -> Task<Msg> {
         if window == self.main_window {
+            if self.key_transition_active() {
+                // A compositor may destroy the window without sending a
+                // cancellable close request; reopen a recovery surface.
+                self.error = Some("сначала завершите смену ключа".into());
+                self.main_window_state = MainWindowState::Hidden;
+                return self.restore_main_window();
+            }
             if self.cache_unsaved {
                 self.save_settings();
             }
@@ -2539,626 +2748,6 @@ impl App {
         })
     }
 
-    fn on_pane(&mut self, window: WinId, msg: PaneMsg) -> Task<Msg> {
-        // Answers for a window that was closed meanwhile are dropped here.
-        let Some(pane) = self.session.panes.get_mut(&window) else {
-            return Task::none();
-        };
-        match msg {
-            PaneMsg::SelectChat(chat_id) => {
-                if window == self.main_window {
-                    self.session.settings_open = false;
-                }
-                return self.select_chat(window, chat_id);
-            }
-            PaneMsg::HistoryLoaded(chat_id, result) => {
-                if pane.shows(chat_id) {
-                    match result {
-                        Ok(messages) => {
-                            if let Some(archive) = &self.session.archive {
-                                pane.local_pins = archive.local_pins(chat_id).unwrap_or_default();
-                            }
-                            // A jump in flight or already landed keeps its
-                            // own history; pins, draft and roles still load
-                            // for the chat that just opened either way.
-                            let skip_history = pane.jump_pending.is_some() || pane.jumped;
-                            let pinned = self.load_pinned(window, chat_id);
-                            let draft = self.load_draft(window, chat_id);
-                            let roles = self.load_roles(chat_id);
-                            let history = if skip_history {
-                                Task::none()
-                            } else {
-                                self.show_history(window, chat_id, &messages)
-                            };
-                            return Task::batch([history, pinned, draft, roles]);
-                        }
-                        Err(e) => self.error = Some(e),
-                    }
-                }
-            }
-            PaneMsg::PinnedLoaded(chat_id, result) => {
-                if pane.shows(chat_id)
-                    && let Ok(messages) = result
-                {
-                    let current = pane.pins().get(pane.pinned_shown).map(|(m, _)| m.id);
-                    pane.pinned = messages.iter().map(MsgItem::from).collect();
-                    pane.pinned_shown = current
-                        .and_then(|id| pane.pins().iter().position(|(m, _)| m.id == id))
-                        .unwrap_or(0);
-                }
-            }
-            PaneMsg::PinnedClicked => {
-                let pins = pane.pins();
-                let Some(id) = pins.get(pane.pinned_shown).map(|(m, _)| m.id) else {
-                    return Task::none();
-                };
-                // Like Telegram: each click goes one pinned message further back.
-                pane.pinned_shown = (pane.pinned_shown + 1) % pins.len();
-                return self.jump(window, id);
-            }
-            PaneMsg::PinLocal(id, on) => {
-                pane.menu = None;
-                let Some(chat_id) = pane.chat_id else {
-                    return Task::none();
-                };
-                let message = pane.messages.iter().find(|m| m.id == id).cloned();
-                let Some(archive) = &self.session.archive else {
-                    self.error = Some("закрепы для себя появятся после входа в аккаунт".into());
-                    return Task::none();
-                };
-                let result = match (on, message) {
-                    (true, Some(m)) => archive.pin_local(&m, chrono::Utc::now().timestamp()),
-                    (true, None) => return Task::none(),
-                    (false, _) => archive.unpin_local(chat_id, id),
-                };
-                if let Err(e) = result {
-                    self.error = Some(format!("закреп: {e}"));
-                }
-                self.refresh_local_pins(chat_id, on.then_some(id));
-            }
-            PaneMsg::OlderLoaded(chat_id, before, result) => {
-                // Ignore answers for a chat or position that is no longer shown.
-                if pane.shows(chat_id) && pane.oldest_loaded == Some(before) {
-                    match result {
-                        Ok(messages) => {
-                            return self.prepend_history(window, chat_id, before, &messages);
-                        }
-                        Err(e) => {
-                            pane.loading_older = false;
-                            self.error = Some(e);
-                        }
-                    }
-                }
-            }
-            PaneMsg::Scrolled(viewport) => {
-                pane.scroll = Some(viewport.absolute_offset());
-                let bounds = viewport.bounds();
-                pane.view_size = Some((bounds.height, bounds.width));
-                // The list is anchored to the bottom; the reversed offset is
-                // the distance from the top.
-                if viewport.absolute_offset_reversed().y < 200.0 {
-                    return self.load_older(window);
-                }
-                if viewport.absolute_offset().y < 200.0 {
-                    return self.load_newer(window);
-                }
-            }
-            PaneMsg::ListScrolled(viewport) => {
-                pane.list.scroll = viewport.absolute_offset().y;
-                pane.list.view_height = Some(viewport.bounds().height);
-            }
-            PaneMsg::SearchScrolled(id, viewport) => {
-                if let Some(search) = &mut pane.search
-                    && search.scroll_id == id
-                {
-                    search.scroll = viewport.absolute_offset().y;
-                    search.view_height = Some(viewport.bounds().height);
-                }
-            }
-            PaneMsg::Measured(id, height) => {
-                pane.heights.insert(id, height);
-            }
-            PaneMsg::Compose(action) => {
-                pane.compose_touched |= action.is_edit();
-                pane.compose.perform(action);
-            }
-            PaneMsg::StartEdit(id) => {
-                pane.menu = None;
-                let Some(chat_id) = pane.chat_id else {
-                    return Task::none();
-                };
-                return Task::perform(
-                    td::message_markdown(self.session.client_id, chat_id, id),
-                    move |r| Msg::Pane(window, PaneMsg::EditLoaded(chat_id, id, r)),
-                );
-            }
-            PaneMsg::EditLoaded(chat_id, id, result) => {
-                // The window switched chats while this was loading: applying
-                // it now would put another chat's message text, under this
-                // chat's own message id, into the wrong chat's input field.
-                if !pane.shows(chat_id) {
-                    return Task::none();
-                }
-                match result {
-                    Ok(text) => {
-                        // The draft steps aside and comes back after the edit.
-                        let draft = match pane.editing.take() {
-                            Some((_, draft)) => draft,
-                            None => pane.compose.text(),
-                        };
-                        pane.editing = Some((id, draft));
-                        pane.reply_to = None;
-                        pane.compose = iced::widget::text_editor::Content::with_text(&text);
-                        pane.compose
-                            .perform(iced::widget::text_editor::Action::Move(
-                                iced::widget::text_editor::Motion::DocumentEnd,
-                            ));
-                    }
-                    Err(e) => self.error = Some(e),
-                }
-            }
-            PaneMsg::CancelEdit => pane.finish_edit(),
-            PaneMsg::Send => {
-                let text = pane.compose.text().trim().to_owned();
-                if let Some(chat_id) = pane.chat_id
-                    && let Some((id, _)) = pane.editing
-                {
-                    if text.is_empty() {
-                        return Task::none();
-                    }
-                    pane.finish_edit();
-                    return Task::perform(
-                        td::edit_text(self.session.client_id, chat_id, id, text),
-                        Msg::Done,
-                    );
-                }
-                if let Some(chat_id) = pane.chat_id
-                    && !text.is_empty()
-                {
-                    pane.compose = iced::widget::text_editor::Content::new();
-                    // Sending clears the draft in Telegram too.
-                    self.session.synced_drafts.insert(chat_id, String::new());
-                    let reply_to = pane.reply_to.take();
-                    return Task::perform(
-                        td::send_text(self.session.client_id, chat_id, text, reply_to),
-                        Msg::Done,
-                    );
-                }
-            }
-            PaneMsg::Link(Link::Url { url, hidden: true }) => pane.confirm_link = Some(url),
-            PaneMsg::Link(Link::Url { url, hidden: false }) | PaneMsg::OpenLink(url) => {
-                pane.confirm_link = None;
-                // A user mentioned without a username (no link TDLib can
-                // resolve exists for them): open the profile directly.
-                if let Some(user_id) = url
-                    .strip_prefix("tg://user?id=")
-                    .and_then(|id| id.parse::<i64>().ok())
-                {
-                    return self.on_card(card::CardMsg::Open(window, user_id));
-                }
-                // Telegram links open inside the client.
-                if td::is_telegram_link(&url) {
-                    return Task::perform(
-                        td::resolve_link(self.session.client_id, url.clone()),
-                        move |r| Msg::LinkResolved(window, url.clone(), r),
-                    );
-                }
-                if let Some(url) = rich::safe_link(&url)
-                    && let Err(e) = open::that_detached(&url)
-                {
-                    self.error = Some(format!("не удалось открыть ссылку: {e}"));
-                }
-            }
-            PaneMsg::CancelLink => pane.confirm_link = None,
-            PaneMsg::JoinChat(link) => {
-                pane.confirm_join = None;
-                return Task::perform(td::join_by_link(self.session.client_id, link), move |r| {
-                    Msg::Joined(window, r)
-                });
-            }
-            PaneMsg::CancelJoin => pane.confirm_join = None,
-            PaneMsg::Link(Link::Copy(text)) => return self.copy_notice(text),
-            PaneMsg::Link(Link::Spoiler(id)) | PaneMsg::Reveal(id) => {
-                pane.revealed.insert(id);
-                // A spoiler photo is loaded only once revealed.
-                let photo = pane
-                    .messages
-                    .iter()
-                    .find(|m| m.id == id)
-                    .and_then(|m| m.media.as_ref())
-                    .and_then(|media| match media {
-                        Media::Photo { file_id, .. } => Some(*file_id),
-                        _ => None,
-                    });
-                if let Some(file_id) = photo {
-                    return self.show_photo(file_id);
-                }
-            }
-            PaneMsg::Reply(id) => {
-                pane.menu = None;
-                pane.finish_edit();
-                pane.reply_to = Some(id);
-            }
-            PaneMsg::CancelReply => pane.reply_to = None,
-            PaneMsg::JumpTo(id) => return self.jump(window, id),
-            PaneMsg::AroundLoaded(chat_id, target, result) => {
-                // A later jump already changed what is awaited: drop this
-                // stale answer instead of acting on an abandoned jump.
-                if pane.shows(chat_id) && pane.jump_pending == Some(target) {
-                    match result {
-                        Ok(messages) => {
-                            return self.show_around(window, chat_id, target, &messages);
-                        }
-                        Err(e) => {
-                            pane.jump_pending = None;
-                            self.error = Some(e);
-                        }
-                    }
-                }
-            }
-            PaneMsg::NewerLoaded(chat_id, after, result) => {
-                let current =
-                    pane.shows(chat_id) && pane.messages.last().map(|m| m.id) == Some(after);
-                match result {
-                    Ok(messages) if current => {
-                        return self.append_newer(window, chat_id, after, &messages);
-                    }
-                    Ok(_) => pane.loading_newer = false,
-                    Err(e) => {
-                        pane.loading_newer = false;
-                        self.error = Some(e);
-                    }
-                }
-            }
-            PaneMsg::ToLatest => return self.back_to_latest(window),
-            PaneMsg::SearchToggle => {
-                pane.search = match pane.search.take() {
-                    Some(_) => None,
-                    None => Some(pane::ChatSearch::default()),
-                };
-            }
-            PaneMsg::SearchQuery(q) => {
-                if let Some(search) = &mut pane.search {
-                    search.query = q;
-                    search.results = None;
-                    search.scroll = 0.0;
-                    search.view_height = None;
-                    search.scroll_id = iced::widget::Id::unique();
-                    search.paging = Default::default();
-                }
-            }
-            PaneMsg::SearchSubmit => {
-                let id = pane.search.as_mut().map(|search| {
-                    search.scroll = 0.0;
-                    search.view_height = None;
-                    search.scroll_id = iced::widget::Id::unique();
-                    search.scroll_id.clone()
-                });
-                let task = self.search_submit(window);
-                return if let Some(id) = id {
-                    Task::batch([
-                        task,
-                        iced::widget::operation::scroll_to(
-                            id,
-                            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
-                        ),
-                    ])
-                } else {
-                    task
-                };
-            }
-            PaneMsg::SearchMore => return self.search_more(window),
-            PaneMsg::SearchResults(chat_id, query, request, cursor, result) => {
-                self.search_results(window, chat_id, &query, request, cursor, result);
-            }
-            PaneMsg::OpenMenu(id) => {
-                let Some(chat_id) = pane.chat_id else {
-                    return Task::none();
-                };
-                let deleted = pane.messages.iter().any(|m| m.id == id && m.deleted);
-                // A message deleted on the server has nothing to ask TDLib about.
-                let rights = deleted.then_some(td::MessageRights {
-                    delete_for_self: false,
-                    delete_for_all: false,
-                    edit: false,
-                });
-                pane.menu = Some(Menu {
-                    message_id: id,
-                    rights,
-                    reactions: Vec::new(),
-                });
-                if !deleted {
-                    return Task::batch([
-                        Task::perform(
-                            td::message_rights(self.session.client_id, chat_id, id),
-                            move |r| Msg::Pane(window, PaneMsg::MenuReady(id, r)),
-                        ),
-                        Task::perform(
-                            td::available_reactions(self.session.client_id, chat_id, id),
-                            move |r| Msg::Pane(window, PaneMsg::ReactionsReady(id, r)),
-                        ),
-                    ]);
-                }
-            }
-            PaneMsg::MenuReady(id, result) => {
-                if let Some(menu) = &mut pane.menu
-                    && menu.message_id == id
-                {
-                    match result {
-                        Ok(rights) => menu.rights = Some(rights),
-                        Err(e) => {
-                            pane.menu = None;
-                            self.error = Some(e);
-                        }
-                    }
-                }
-            }
-            PaneMsg::ReactionsReady(id, result) => {
-                if let Some(menu) = &mut pane.menu
-                    && menu.message_id == id
-                {
-                    menu.reactions = result.unwrap_or_default();
-                }
-            }
-            PaneMsg::DraftLoaded(chat_id, result) => {
-                if let Ok(text) = result
-                    && pane.shows(chat_id)
-                    && pane.compose.text().is_empty()
-                {
-                    pane.compose = iced::widget::text_editor::Content::with_text(&text);
-                    pane.compose_touched = true;
-                    self.session.synced_drafts.insert(chat_id, text);
-                }
-            }
-            PaneMsg::TogglePicker => {
-                if pane.picker.take().is_none() {
-                    return self.picker_tab(window, picker::Tab::Emoji);
-                }
-            }
-            PaneMsg::PickerTab(tab) => return self.picker_tab(window, tab),
-            PaneMsg::ClosePicker => pane.picker = None,
-            PaneMsg::InsertEmoji(emoji) => {
-                pane.compose_touched = true;
-                picker::insert(&mut pane.compose, &emoji);
-            }
-            PaneMsg::SendSticker(sticker) => {
-                if let Some(chat_id) = pane.chat_id {
-                    pane.picker = None;
-                    // Telegram just moved it to the front of "recent": load
-                    // that list again next time the tab opens instead of
-                    // showing a stale one.
-                    self.session.stickers.recent = None;
-                    return Task::perform(
-                        td::send_sticker(self.session.client_id, chat_id, *sticker),
-                        Msg::Done,
-                    );
-                }
-            }
-            PaneMsg::Vote(id, option) => {
-                if let Some(chat_id) = pane.chat_id {
-                    return Task::perform(
-                        td::vote(self.session.client_id, chat_id, id, vec![option]),
-                        Msg::Done,
-                    );
-                }
-            }
-            PaneMsg::ToggleVote(id, option) => {
-                let picked = pane.poll_selection.entry(id).or_default();
-                if !picked.remove(&option) {
-                    picked.insert(option);
-                }
-            }
-            PaneMsg::SubmitVote(id) => {
-                if let Some(chat_id) = pane.chat_id {
-                    let options: Vec<i32> = pane
-                        .poll_selection
-                        .remove(&id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .collect();
-                    if !options.is_empty() {
-                        return Task::perform(
-                            td::vote(self.session.client_id, chat_id, id, options),
-                            Msg::Done,
-                        );
-                    }
-                }
-            }
-            PaneMsg::React(id, key) => {
-                pane.menu = None;
-                let Some(chat_id) = pane.chat_id else {
-                    return Task::none();
-                };
-                // A reaction already put by the user is taken back.
-                let on = !pane
-                    .messages
-                    .iter()
-                    .find(|m| m.id == id)
-                    .is_some_and(|m| m.reacted(&key));
-                return Task::perform(
-                    td::set_reaction(self.session.client_id, chat_id, id, key, on),
-                    Msg::Done,
-                );
-            }
-            PaneMsg::Forward(ids) => {
-                pane.menu = None;
-                pane.forward = Some((ids, String::new()));
-            }
-            PaneMsg::ForwardSelection => {
-                if let Some(selected) = &pane.selected {
-                    pane.forward = Some((selected.iter().copied().collect(), String::new()));
-                }
-            }
-            PaneMsg::ForwardQuery(query) => {
-                if let Some((_, q)) = &mut pane.forward {
-                    *q = query;
-                }
-            }
-            PaneMsg::CancelForward => pane.forward = None,
-            PaneMsg::ForwardTo(to) => {
-                let (Some(from), Some((ids, _))) = (pane.chat_id, pane.forward.take()) else {
-                    return Task::none();
-                };
-                pane.selected = None;
-                pane.delete_selection = None;
-                // Like Telegram: the chat the messages went to opens.
-                let forward = Task::perform(
-                    td::forward(self.session.client_id, to, from, ids),
-                    Msg::Done,
-                );
-                return Task::batch([forward, self.select_chat(window, to)]);
-            }
-            PaneMsg::Select(id) => {
-                pane.menu = None;
-                let selected = pane.selected.get_or_insert_with(Default::default);
-                if !selected.remove(&id) {
-                    selected.insert(id);
-                }
-                if selected.is_empty() {
-                    pane.selected = None;
-                }
-                pane.delete_selection = None;
-            }
-            PaneMsg::ClearSelection => {
-                pane.selected = None;
-                pane.delete_selection = None;
-            }
-            PaneMsg::CopySelection => {
-                let Some(selected) = pane.selected.take() else {
-                    return Task::none();
-                };
-                pane.delete_selection = None;
-                let picked: Vec<(bool, MessageSender, String)> = pane
-                    .messages
-                    .iter()
-                    .filter(|m| selected.contains(&m.id))
-                    .map(|m| (m.outgoing, m.sender.clone(), m.text.clone()))
-                    .collect();
-                let me = self
-                    .session
-                    .users
-                    .get(&self.session.my_id.unwrap_or_default())
-                    .map_or("Я", String::as_str);
-                let lines: Vec<String> = picked
-                    .iter()
-                    .map(|(outgoing, sender, text)| {
-                        let name = if *outgoing {
-                            me
-                        } else {
-                            self.sender_display(sender)
-                        };
-                        format!("{name}: {text}")
-                    })
-                    .collect();
-                return iced::clipboard::write(lines.join("\n"));
-            }
-            PaneMsg::DeleteSelection => {
-                let (Some(chat_id), Some(selected)) = (pane.chat_id, &pane.selected) else {
-                    return Task::none();
-                };
-                pane.delete_selection = Some(None);
-                let ids: Vec<i64> = selected.iter().copied().collect();
-                return Task::perform(
-                    td::common_rights(self.session.client_id, chat_id, ids),
-                    move |r| Msg::Pane(window, PaneMsg::SelectionRights(r)),
-                );
-            }
-            PaneMsg::SelectionRights(result) => match result {
-                Ok(rights) if pane.delete_selection.is_some() => {
-                    pane.delete_selection = Some(Some(rights));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    pane.delete_selection = None;
-                    self.error = Some(e);
-                }
-            },
-            PaneMsg::DeleteSelected { revoke } => {
-                let (Some(chat_id), Some(selected)) = (pane.chat_id, pane.selected.take()) else {
-                    return Task::none();
-                };
-                pane.delete_selection = None;
-                let ids: Vec<i64> = selected.into_iter().collect();
-                self.session
-                    .self_deleted
-                    .extend(ids.iter().map(|&id| (chat_id, id)));
-                let done_ids = ids.clone();
-                return Task::perform(
-                    td::delete_messages(self.session.client_id, chat_id, ids, revoke),
-                    move |r| Msg::DeleteDone(chat_id, done_ids.clone(), r),
-                );
-            }
-            PaneMsg::TextPress(message, at) => {
-                pane.text_selection = Some(pane::TextSelection {
-                    message,
-                    anchor: at,
-                    focus: at,
-                    dragging: true,
-                });
-            }
-            PaneMsg::TextDrag(message, at) => {
-                if let Some(sel) = &mut pane.text_selection
-                    && sel.message == message
-                    && sel.dragging
-                {
-                    sel.focus = at;
-                }
-            }
-            PaneMsg::ClickOutside => {
-                pane.menu = None;
-                pane.text_selection = None;
-            }
-            PaneMsg::CloseMenu => pane.menu = None,
-            PaneMsg::CopyText(id) => {
-                pane.menu = None;
-                // A selection in this message is what gets copied.
-                if pane.text_selection.is_some_and(|s| s.message == id)
-                    && let Some(text) = pane.selected_text()
-                {
-                    return iced::clipboard::write(text);
-                }
-                if let Some(m) = pane.messages.iter().find(|m| m.id == id) {
-                    return iced::clipboard::write(m.text.clone());
-                }
-            }
-            PaneMsg::Delete { id, revoke } => {
-                pane.menu = None;
-                if let Some(chat_id) = pane.chat_id {
-                    self.session.self_deleted.insert((chat_id, id));
-                    return Task::perform(
-                        td::delete_message(self.session.client_id, chat_id, id, revoke),
-                        move |r| Msg::DeleteDone(chat_id, vec![id], r),
-                    );
-                }
-            }
-            PaneMsg::Forget(id) => {
-                pane.menu = None;
-                if let Some(chat_id) = pane.chat_id {
-                    self.forget(chat_id, &[id]);
-                }
-            }
-            PaneMsg::MediaVisible(file_id) => return self.show_photo(file_id),
-            PaneMsg::MediaHidden(file_id) => {
-                self.session.wanted_photos.remove(&file_id);
-            }
-            PaneMsg::Attach => {
-                return Task::perform(
-                    async {
-                        rfd::AsyncFileDialog::new()
-                            .set_title("Отправить файлы")
-                            .pick_files()
-                            .await
-                            .map(|files| files.iter().map(|f| f.path().to_path_buf()).collect())
-                            .unwrap_or_default()
-                    },
-                    move |paths| Msg::Pane(window, PaneMsg::FilesChosen(paths)),
-                );
-            }
-            PaneMsg::FilesChosen(paths) => return self.send_files(window, paths),
-        }
-        Task::none()
-    }
-
     /// Panes showing the chat.
     /// Own pins changed: every pane of the chat shows the new list; `show`
     /// makes the bar show that message.
@@ -3210,7 +2799,15 @@ impl App {
     /// A pin-list read must not prevent the already-open message archive
     /// from saving messages. Neither list is usable if either read fails.
     fn attach_archive(&mut self, mut archive: Archive) {
-        archive.set_key(self.session.db_key);
+        if self.key_transition_active() {
+            self.error = Some("архив ожидает восстановления ключа".into());
+            return;
+        }
+        if let Err(e) = archive.verify_key(self.session.db_key.as_ref()) {
+            self.error = Some(format!("ключ архива: {e}"));
+            return;
+        }
+        archive.set_key(self.session.db_key.clone());
         let pins = (
             archive.local_chat_pins(false),
             archive.local_chat_pins(true),
@@ -3231,431 +2828,32 @@ impl App {
         }
     }
 
-    fn on_update(&mut self, update: Update) -> Task<Msg> {
-        match update {
-            Update::AuthorizationState(u) => return self.on_auth_state(u.authorization_state),
-            Update::Option(u) => {
-                if u.name == "my_id"
-                    && let OptionValue::Integer(v) = u.value
-                {
-                    self.session.my_id = Some(v.value);
-                    if self.session.archive.is_none() && self.session.rekeying_archive.is_none() {
-                        match Archive::open_for_account(v.value) {
-                            Ok(archive) => self.attach_archive(archive),
-                            Err(e) => self.error = Some(format!("архив: {e}")),
-                        }
-                    }
-                    self.announce_account();
-                    let known = self.account_known(v.value);
-                    return Task::batch([known, self.restore_tabs()]);
-                }
-            }
-            Update::NewChat(u) => {
-                let chat = u.chat;
-                if let Some(m) = &chat.last_message {
-                    self.archive_save(&MsgItem::from(m));
-                }
-                let last = chat
-                    .last_message
-                    .as_ref()
-                    .map(|m| rich::preview(&m.content))
-                    .unwrap_or_default();
-                let preview = view::preview_text(&last);
-                let title_lower = chat.title.to_lowercase();
-                self.session.chats.insert(
-                    chat.id,
-                    ChatItem {
-                        title: chat.title,
-                        title_lower,
-                        last,
-                        preview,
-                        unread: chat.unread_count,
-                        order: 0,
-                        last_id: chat.last_message.as_ref().map_or(0, |m| m.id),
-                        last_outgoing: chat.last_message.as_ref().is_some_and(|m| m.is_outgoing),
-                        last_pending: chat
-                            .last_message
-                            .as_ref()
-                            .is_some_and(|m| m.sending_state.is_some()),
-                        read_outbox: chat.last_read_outbox_message_id,
-                        read_inbox: chat.last_read_inbox_message_id,
-                        archive_order: 0,
-                        pinned: false,
-                        notify: chat.notification_settings.clone(),
-                        folders: Vec::new(),
-                        kind: Some(chat.r#type.clone()),
-                        draft: td::draft_text(chat.draft_message.as_ref()),
-                        private: matches!(
-                            chat.r#type,
-                            tdlib_rs::enums::ChatType::Private(_)
-                                | tdlib_rs::enums::ChatType::Secret(_)
-                        ),
-                    },
-                );
-                self.set_positions(chat.id, &chat.positions);
-                return self.set_avatar(
-                    avatars::Peer::Chat(chat.id),
-                    chat.photo.as_ref().map(|p| &p.small),
-                );
-            }
-            Update::ChatPhoto(u) => {
-                return self.set_avatar(
-                    avatars::Peer::Chat(u.chat_id),
-                    u.photo.as_ref().map(|p| &p.small),
-                );
-            }
-            Update::ChatTitle(u) => {
-                if let Some(chat) = self.session.chats.get_mut(&u.chat_id) {
-                    chat.title_lower = u.title.to_lowercase();
-                    chat.title = u.title;
-                }
-            }
-            Update::UnreadMessageCount(u) if matches!(u.chat_list, ChatList::Folder(_)) => {
-                if let ChatList::Folder(f) = u.chat_list {
-                    self.session
-                        .folder_unread
-                        .insert(f.chat_folder_id, (u.unread_count, u.unread_unmuted_count));
-                }
-            }
-            Update::UnreadMessageCount(u) => {
-                if matches!(u.chat_list, ChatList::Main) {
-                    self.session.unread = (u.unread_count, u.unread_unmuted_count);
-                    #[cfg(target_os = "linux")]
-                    if let Some(tray) = &self.tray {
-                        return tray.show(self.badge());
-                    }
-                }
-            }
-            Update::ChatLastMessage(u) => {
-                if let Some(m) = &u.last_message {
-                    self.archive_save(&MsgItem::from(m));
-                }
-                if let Some(chat) = self.session.chats.get_mut(&u.chat_id) {
-                    chat.last = u
-                        .last_message
-                        .as_ref()
-                        .map(|m| rich::preview(&m.content))
-                        .unwrap_or_default();
-                    chat.preview = view::preview_text(&chat.last);
-                    if let Some(m) = &u.last_message {
-                        chat.last_id = m.id;
-                    }
-                    chat.last_outgoing = u.last_message.as_ref().is_some_and(|m| m.is_outgoing);
-                    chat.last_pending = u
-                        .last_message
-                        .as_ref()
-                        .is_some_and(|m| m.sending_state.is_some());
-                }
-                self.set_positions(u.chat_id, &u.positions);
-            }
-            Update::ChatPosition(u) => match u.position.list {
-                ChatList::Main => {
-                    self.set_order(u.chat_id, u.position.order);
-                    if let Some(chat) = self.session.chats.get_mut(&u.chat_id)
-                        && (u.position.order != 0 || chat.archive_order == 0)
-                    {
-                        chat.pinned = u.position.is_pinned;
-                    }
-                }
-                ChatList::Archive => {
-                    self.set_archive_order(u.chat_id, u.position.order);
-                    if let Some(chat) = self.session.chats.get_mut(&u.chat_id)
-                        && (u.position.order != 0 || chat.order == 0)
-                    {
-                        chat.pinned = u.position.is_pinned;
-                    }
-                }
-                ChatList::Folder(f) => {
-                    self.set_folder_order(u.chat_id, f.chat_folder_id, u.position.order);
-                }
-            },
-            Update::ChatFolders(u) => {
-                self.session.folders = u
-                    .chat_folders
-                    .iter()
-                    .map(|f| (f.id, f.name.text.text.clone()))
-                    .collect();
-                self.session.main_tab =
-                    (u.main_chat_list_position.max(0) as usize).min(self.session.folders.len());
-                let known: Vec<i32> = self.session.folders.iter().map(|&(id, _)| id).collect();
-                if let Some(pending) = self.session.folder_creation.as_mut() {
-                    pending.observed = self
-                        .session
-                        .folders
-                        .iter()
-                        .filter(|(id, _)| !pending.initial.contains(id))
-                        .map(|(id, _)| *id)
-                        .collect();
-                    if pending.id.is_some_and(|id| pending.observed.contains(&id)) {
-                        let window = pending.window;
-                        let chat_id = pending.chat_id;
-                        let request = pending.request;
-                        self.session.folder_creation = None;
-                        self.session.folder_creation_warning = None;
-                        if let Some(pane) = self.session.panes.get_mut(&window)
-                            && pane.list.menu == Some(chat_id)
-                            && pane.list.new_folder_request == Some(request)
-                        {
-                            pane.list.new_folder_name = None;
-                            pane.list.new_folder_request = None;
-                        }
-                    }
-                }
-                if let Some(pending) = self.session.folder_reorder.as_mut() {
-                    let matches_request = known == pending.expected
-                        && self.session.main_tab == pending.main_tab as usize;
-                    let unchanged_order = known == pending.initial
-                        && self.session.main_tab == pending.initial_main_tab;
-                    if matches_request {
-                        if matches!(
-                            pending.state,
-                            FolderReorderState::AwaitingUpdate
-                                | FolderReorderState::DiscrepancyAfterReply
-                        ) {
-                            self.session.folder_reorder = None;
-                        } else {
-                            pending.state = FolderReorderState::MatchedBeforeReply;
-                        }
-                        self.session.folder_reorder_error = None;
-                    } else if unchanged_order {
-                        if pending.state == FolderReorderState::MatchedBeforeReply {
-                            pending.state = FolderReorderState::AwaitingReply;
-                        }
-                        // Metadata-only updates cannot confirm a reorder, and
-                        // cannot resolve an existing order discrepancy either.
-                    } else {
-                        pending.state = match pending.state {
-                            FolderReorderState::AwaitingUpdate
-                            | FolderReorderState::DiscrepancyAfterReply => {
-                                FolderReorderState::DiscrepancyAfterReply
-                            }
-                            _ => FolderReorderState::DiscrepancyBeforeReply,
-                        };
-                        self.session.folder_reorder_error = Some(
-                            "Порядок папок расходится с запросом; результат операции неизвестен"
-                                .into(),
-                        );
-                    }
-                }
-                self.session.folder_lists.retain(|id, _| known.contains(id));
-                // A pane showing a folder that is gone falls back to all chats.
-                for pane in self.all_panes_mut() {
-                    if pane.list.folder.is_some_and(|f| !known.contains(&f)) {
-                        pane.list.folder = None;
-                        pane.list.confirm_read = None;
-                        pane.list.read_feedback = None;
-                    }
-                    if let Some(picker) = &mut pane.list.folder_picker
-                        && picker
-                            .pending
-                            .is_some_and(|(_, folder)| !known.contains(&folder))
-                    {
-                        picker.pending = None;
-                        picker.feedback = Some("Папка больше не существует".into());
-                    }
-                }
-            }
-            Update::ChatDraftMessage(u) => {
-                if let Some(chat) = self.session.chats.get_mut(&u.chat_id) {
-                    chat.draft = td::draft_text(u.draft_message.as_ref());
-                }
-                self.set_positions(u.chat_id, &u.positions);
-            }
-            Update::ChatNotificationSettings(u) => {
-                if let Some(chat) = self.session.chats.get_mut(&u.chat_id) {
-                    chat.notify = u.notification_settings;
-                }
-            }
-            Update::ChatAction(u) => {
-                // Own actions from other devices, and topic threads, are not shown.
-                let own = matches!(&u.sender_id, MessageSender::User(s) if Some(s.user_id) == self.session.my_id);
-                if !own && u.topic_id.is_none() {
-                    let typing = matches!(u.action, tdlib_rs::enums::ChatAction::Typing);
-                    self.session.typing.set(
-                        u.chat_id,
-                        u.sender_id,
-                        typing,
-                        std::time::Instant::now(),
-                    );
-                }
-            }
-            Update::MessageIsPinned(u) => {
-                return Task::perform(
-                    td::pinned_messages(self.session.client_id, u.chat_id),
-                    move |r| Msg::PinnedRefreshed(u.chat_id, r),
-                );
-            }
-            Update::ChatReadOutbox(u) => {
-                if let Some(chat) = self.session.chats.get_mut(&u.chat_id) {
-                    chat.read_outbox = u.last_read_outbox_message_id;
-                }
-            }
-            Update::ChatReadInbox(u) => {
-                if let Some(chat) = self.session.chats.get_mut(&u.chat_id) {
-                    chat.unread = u.unread_count;
-                    chat.read_inbox = u.last_read_inbox_message_id;
-                }
-            }
-            Update::User(u) => {
-                let user = u.user;
-                if matches!(&user.r#type, tdlib_rs::enums::UserType::Bot(_)) {
-                    self.session.bot_users.insert(user.id);
-                } else {
-                    self.session.bot_users.remove(&user.id);
-                }
-                let name = format!("{} {}", user.first_name, user.last_name);
-                self.session.users.insert(user.id, name.trim().to_owned());
-                self.user_renamed(user.id);
-                return self.set_avatar(
-                    avatars::Peer::User(user.id),
-                    user.profile_photo.as_ref().map(|p| &p.small),
-                );
-            }
-            Update::NewMessage(u) => {
-                let m = u.message;
-                let (item, files) = MsgItem::parse(&m);
-                self.note_files_of(&files);
-                self.archive_save(&item);
-                // Pending outgoing messages are reported once confirmed.
-                if m.sending_state.is_none() {
-                    self.plugin_event(message_event(&m));
-                }
-                // A chat shown nowhere never displays this message, so its
-                // reply (if any) does not need a preview either.
-                let mut shown = false;
-                for pane in self.panes_of(m.chat_id) {
-                    shown = true;
-                    // After a jump the newest history is not loaded yet; the
-                    // message arrives with the newer pages instead.
-                    if pane.newest_loaded && !pane.messages.iter().any(|x| x.id == m.id) {
-                        pane.messages.push(item.clone());
-                    }
-                }
-                let replies = if shown {
-                    self.fetch_replies(m.chat_id, std::slice::from_ref(&item))
-                } else {
-                    Task::none()
-                };
-                // Read only when on screen in a window, not in a background tab.
-                let on_screen = self.session.panes.values().any(|p| p.shows(m.chat_id));
-                if on_screen && !m.is_outgoing {
-                    return Task::batch([
-                        Task::perform(
-                            td::mark_read(self.session.client_id, m.chat_id, m.id),
-                            |()| Msg::Ignore,
-                        ),
-                        replies,
-                    ]);
-                }
-                return replies;
-            }
-            // Outgoing messages get a temporary id until the server confirms them.
-            Update::MessageSendSucceeded(u) => {
-                let (item, files) = MsgItem::parse(&u.message);
-                self.note_files_of(&files);
-                self.archive_save(&item);
-                self.plugin_event(message_event(&u.message));
-                for pane in self.panes_of(u.message.chat_id) {
-                    if let Some(slot) = pane.find_mut(u.old_message_id) {
-                        *slot = item.clone();
-                    }
-                }
-            }
-            // The server rejected the send: show why and mark the message
-            // failed instead of leaving it "sending" forever.
-            Update::MessageSendFailed(u) => {
-                self.error = Some(format!("не отправлено: {}", u.error.message));
-                for pane in self.panes_of(u.message.chat_id) {
-                    if let Some(item) = pane.find_mut(u.old_message_id) {
-                        *item = MsgItem::from(&u.message);
-                    }
-                }
-            }
-            Update::MessageContent(u) => {
-                let text = td::message_text(&u.new_content);
-                self.note_files(&u.new_content);
-                self.plugin_event(plugins::Event::Edited {
-                    chat_id: u.chat_id,
-                    id: u.message_id,
-                    text: text.clone(),
-                });
-                if let Some(archive) =
-                    Self::active_archive(&mut self.session.archive, self.settings.keep_deleted)
-                    && let Err(e) = archive.set_text(u.chat_id, u.message_id, &text)
-                {
-                    self.error = Some(format!("архив: {e}"));
-                }
-                let new_media = media::media_of(&u.new_content).map(|(m, _)| m);
-                if self.session.video.as_ref().is_some_and(|video| {
-                    video.chat_id == u.chat_id
-                        && video.message_id == u.message_id
-                        && !matches!(
-                            new_media.as_ref(),
-                            Some(media::Media::Video { file_id, round, .. })
-                                if *file_id == video.file_id && *round == video.round
-                        )
-                }) {
-                    self.persist_video_volume();
-                    self.session.video = None;
-                }
-                let new_extra = extra::extra_of(&u.new_content).map(|(e, _)| Box::new(e));
-                let new_rich = rich_of(&u.new_content, new_extra.as_deref());
-                for pane in self.panes_of(u.chat_id) {
-                    if let Some(item) = pane.find_mut(u.message_id) {
-                        item.media = new_media.clone();
-                        item.text = text.clone();
-                        item.rich = new_rich.clone();
-                        item.extra = new_extra.clone();
-                    }
-                }
-                // A cached preview of this message (shown as another
-                // message's reply-to) would otherwise keep the pre-edit text.
-                if let Some(item) = self
-                    .session
-                    .reply_previews
-                    .get_mut(&(u.chat_id, u.message_id))
-                {
-                    item.media = new_media;
-                    item.text = text;
-                    item.rich = new_rich;
-                    item.extra = new_extra;
-                }
-            }
-            Update::MessageInteractionInfo(u) => {
-                let reactions = reactions_of(u.interaction_info.as_ref());
-                for pane in self.panes_of(u.chat_id) {
-                    if let Some(item) = pane.find_mut(u.message_id) {
-                        item.reactions = reactions.clone();
-                    }
-                }
-            }
-            Update::MessageEdited(u) => {
-                for pane in self.panes_of(u.chat_id) {
-                    if let Some(item) = pane.find_mut(u.message_id) {
-                        item.edited = u.edit_date > 0;
-                    }
-                }
-            }
-            // `from_cache` = only evicted from TDLib's cache, not really deleted.
-            Update::File(u) => return self.on_file(&u.file),
-            Update::NotificationGroup(u) => return self.on_notification_group(&u),
-            Update::DeleteMessages(u) if u.is_permanent && !u.from_cache => {
-                self.plugin_event(plugins::Event::Deleted {
-                    chat_id: u.chat_id,
-                    ids: u.message_ids.clone(),
-                });
-                self.on_deleted(u.chat_id, &u.message_ids)
-            }
-            _ => {}
-        }
-        Task::none()
-    }
-
     fn on_auth_state(&mut self, state: AuthorizationState) -> Task<Msg> {
         self.session.busy = false;
         self.session.input.clear();
+        if matches!(state, AuthorizationState::Ready) && self.pending_transition().is_some() {
+            self.session.recovery_ready_pending = true;
+            if self.session.recovery_keys.is_none() {
+                self.session.auth = Auth::Locked {
+                    error: Some("смена ключа прервана; введите пароль для восстановления".into()),
+                    forgot: false,
+                };
+            }
+            return Task::none();
+        }
         self.session.auth = match state {
             AuthorizationState::WaitTdlibParameters => {
+                if self.pending_transition().is_some() && self.session.recovery_keys.is_none() {
+                    return {
+                        self.session.auth = Auth::Locked {
+                            error: Some(
+                                "смена ключа прервана; введите старый или новый пароль".into(),
+                            ),
+                            forgot: false,
+                        };
+                        Task::none()
+                    };
+                }
                 if self.locked_slot().is_some() && self.session.db_key.is_none() {
                     Auth::Locked {
                         error: None,
@@ -3739,18 +2937,24 @@ impl App {
     }
 
     fn submit_auth(&mut self) -> Task<Msg> {
-        let value = self.session.input.trim().to_owned();
-        if value.is_empty() || self.session.busy {
+        if self.session.input.trim().is_empty() || self.session.busy {
             return Task::none();
         }
         let id = self.session.client_id;
         let request = match self.session.auth {
-            Auth::Phone => Task::perform(td::send_phone(id, value), Msg::Done),
-            Auth::Code => Task::perform(td::send_code(id, value), Msg::Done),
+            Auth::Phone => Task::perform(
+                td::send_phone(id, self.session.input.trim().to_owned()),
+                Msg::Done,
+            ),
+            Auth::Code => Task::perform(
+                td::send_code(id, self.session.input.trim().to_owned()),
+                Msg::Done,
+            ),
             // Password is not trimmed: spaces may be part of it.
-            Auth::Password { .. } => {
-                Task::perform(td::send_password(id, self.session.input.clone()), Msg::Done)
-            }
+            Auth::Password { .. } => Task::perform(
+                td::send_password(id, std::mem::take(&mut self.session.input)),
+                Msg::Done,
+            ),
             _ => return Task::none(),
         };
         self.session.busy = true;
@@ -4398,6 +3602,10 @@ impl App {
     /// an unscoped search result. Persist first; failures leave memory intact.
     /// An unreadable list cannot be edited from an incomplete in-memory view.
     fn local_chat_pin(&mut self, window: WinId, chat_id: i64, on: bool) -> Task<Msg> {
+        if self.key_transition_active() {
+            self.error = Some("локальные закрепы недоступны во время смены ключа".into());
+            return Task::none();
+        }
         if self.session.local_chat_pins_failed {
             self.error = Some("локальные закрепы недоступны: ошибка загрузки".into());
             return Task::none();
@@ -4503,10 +3711,125 @@ impl App {
         }
     }
 
+    fn defer_archive_save(&mut self, item: &MsgItem) {
+        if !self.settings.keep_deleted || item.pending || item.failed {
+            return;
+        }
+        let row = self
+            .session
+            .deferred_archive
+            .entry((item.chat_id, item.id))
+            .or_default();
+        if row.purge {
+            return;
+        }
+        row.save = Some(item.clone());
+        row.edit = None;
+    }
+
+    fn defer_archive_edit(&mut self, chat_id: i64, id: i64, text: String) {
+        if self.settings.keep_deleted {
+            let row = self
+                .session
+                .deferred_archive
+                .entry((chat_id, id))
+                .or_default();
+            if !row.purge {
+                row.edit = Some(text);
+            }
+        }
+    }
+
+    /// Replay server changes only through a handle verified under the target
+    /// key. Keep the entire coalesced queue on any failed write for retry.
+    fn flush_deferred_archive(&mut self, archive: &mut Archive) -> Result<(), String> {
+        let mut deferred = std::mem::take(&mut self.session.deferred_archive);
+        if let Some(pending) = self.pending_transition() {
+            for (chat, ids) in pending.deleted_ids {
+                for id in ids {
+                    let row = deferred.entry((chat, id)).or_default();
+                    if !row.purge {
+                        row.deleted = true;
+                    }
+                }
+            }
+            for (chat, ids) in pending.purged_ids {
+                for id in ids {
+                    let row = deferred.entry((chat, id)).or_default();
+                    row.purge = true;
+                    row.deleted = false;
+                    row.save = None;
+                    row.edit = None;
+                }
+            }
+        }
+        let result = (|| {
+            let mut purges: HashMap<i64, Vec<i64>> = HashMap::new();
+            let mut deletes: HashMap<i64, Vec<i64>> = HashMap::new();
+            for (&(chat, id), row) in &deferred {
+                if row.purge {
+                    purges.entry(chat).or_default().push(id);
+                } else if row.deleted {
+                    deletes.entry(chat).or_default().push(id);
+                }
+            }
+            for (chat, ids) in purges {
+                archive.purge(chat, &ids).map_err(|e| e.to_string())?;
+            }
+            archive
+                .save(
+                    deferred
+                        .values()
+                        .filter(|row| !row.purge)
+                        .filter_map(|row| row.save.as_ref()),
+                )
+                .map_err(|e| e.to_string())?;
+            for (&(chat, id), row) in &deferred {
+                if !row.purge
+                    && let Some(text) = &row.edit
+                {
+                    archive
+                        .set_text(chat, id, text)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            for (chat, ids) in deletes {
+                archive
+                    .mark_deleted(chat, &ids)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.session.deferred_archive = deferred;
+            return Err(e);
+        }
+        for ((chat, id), row) in deferred {
+            if row.purge {
+                for pane in self.panes_of(chat) {
+                    pane.remove(&[id]);
+                }
+                self.session.reply_previews.remove(&(chat, id));
+            } else if row.deleted {
+                for pane in self.panes_of(chat) {
+                    pane.mark_deleted(&[id]);
+                }
+                if let Some(item) = self.session.reply_previews.get_mut(&(chat, id)) {
+                    item.deleted = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Archives a confirmed message; pending outgoing ones have temporary ids
     /// and are archived on `MessageSendSucceeded` instead.
     fn archive_save(&mut self, item: &MsgItem) {
         if item.pending || item.failed {
+            return;
+        }
+        if self.key_transition_active() {
+            self.defer_archive_save(item);
             return;
         }
         if let Some(archive) =
@@ -4520,6 +3843,96 @@ impl App {
     /// Permanent deletion on the server. Messages deleted by the user from
     /// this client disappear; any other deletion keeps the archived copy.
     fn on_deleted(&mut self, chat_id: i64, ids: &[i64]) {
+        if self.key_transition_active() {
+            let (own, foreign): (Vec<i64>, Vec<i64>) = ids
+                .iter()
+                .partition(|&&id| self.session.self_deleted.remove(&(chat_id, id)));
+            // Deleting a row or setting its flag does not require its text key.
+            // While we still own the verified source archive, commit it there
+            // before any background rekey can take the connection.
+            let direct = self.session.archive.as_mut().map(|archive| {
+                if !own.is_empty() {
+                    archive.purge(chat_id, &own)?;
+                }
+                if self.settings.keep_deleted && !foreign.is_empty() {
+                    archive.mark_deleted(chat_id, &foreign)?;
+                }
+                Ok::<(), rusqlite::Error>(())
+            });
+            if let Some(Err(e)) = &direct {
+                self.error = Some(format!("архив: {e}"));
+            }
+            if !matches!(direct, Some(Ok(())))
+                && (!own.is_empty() || self.settings.keep_deleted && !foreign.is_empty())
+            {
+                let slot = self.session.slot;
+                let Some(pending) = self
+                    .settings
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.slot == slot)
+                    .and_then(|account| account.pending_key_change.as_mut())
+                else {
+                    self.error = Some("архив недоступен для удаления".into());
+                    self.session
+                        .self_deleted
+                        .extend(own.into_iter().map(|id| (chat_id, id)));
+                    return;
+                };
+                for &id in &own {
+                    pending.purged_ids.entry(chat_id).or_default().insert(id);
+                    if let Some(deleted) = pending.deleted_ids.get_mut(&chat_id) {
+                        deleted.remove(&id);
+                    }
+                }
+                if self.settings.keep_deleted {
+                    for &id in &foreign {
+                        if !pending
+                            .purged_ids
+                            .get(&chat_id)
+                            .is_some_and(|ids| ids.contains(&id))
+                        {
+                            pending.deleted_ids.entry(chat_id).or_default().insert(id);
+                        }
+                    }
+                }
+                if let Err(e) = self.try_save_settings() {
+                    // Keep the in-memory intent for an explicit retry; the
+                    // on-disk outcome after a failed sync may be ambiguous.
+                    self.recovery_failed(format!("журнал удаления архива: {e}"));
+                    return;
+                }
+            }
+            for id in own {
+                let row = self
+                    .session
+                    .deferred_archive
+                    .entry((chat_id, id))
+                    .or_default();
+                row.purge = true;
+                row.save = None;
+                row.edit = None;
+                row.deleted = false;
+            }
+            for id in foreign {
+                if self.settings.keep_deleted {
+                    let row = self
+                        .session
+                        .deferred_archive
+                        .entry((chat_id, id))
+                        .or_default();
+                    if !row.purge {
+                        row.deleted = true;
+                    }
+                } else {
+                    for pane in self.panes_of(chat_id) {
+                        pane.remove(&[id]);
+                    }
+                    self.session.reply_previews.remove(&(chat_id, id));
+                }
+            }
+            return;
+        }
         let (own, foreign): (Vec<i64>, Vec<i64>) = ids
             .iter()
             .partition(|&&id| self.session.self_deleted.remove(&(chat_id, id)));
@@ -4556,6 +3969,10 @@ impl App {
 
     /// Removes messages from the archive and from every window.
     fn forget(&mut self, chat_id: i64, ids: &[i64]) {
+        if self.key_transition_active() {
+            self.error = Some("сначала завершите смену ключа".into());
+            return;
+        }
         if let Some(archive) = &mut self.session.archive
             && let Err(e) = archive.purge(chat_id, ids)
         {
@@ -4670,7 +4087,11 @@ impl App {
         let (confirmed, pending): (Vec<&Message>, Vec<&Message>) =
             messages.iter().partition(|m| m.sending_state.is_none());
         let mut items: Vec<MsgItem> = confirmed.into_iter().map(MsgItem::from).collect();
-        if let Some(archive) =
+        if self.key_transition_active() {
+            for item in &items {
+                self.defer_archive_save(item);
+            }
+        } else if let Some(archive) =
             Self::active_archive(&mut self.session.archive, self.settings.keep_deleted)
         {
             let deleted = archive

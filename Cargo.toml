@@ -1,11 +1,11 @@
 [package]
 name = "telega"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
 arboard = { version = "3", features = ["wayland-data-control"] }
-argon2 = "0.5"
+argon2 = { version = "0.5", features = ["zeroize"] }
 base64 = "0.23"
 blake3 = "1.8.7"
 chacha20poly1305 = "0.10"
@@ -32,6 +32,7 @@ tdlib-rs = { version = "1.4", features = ["local-tdlib"] }
 tiny-skia = "0.11"
 wgpu = { version = "27", default-features = false }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+zeroize = "1.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.3"

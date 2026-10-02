@@ -728,11 +728,14 @@ impl super::App {
         }
         Task::perform(
             async move {
-                let _permit = DECODES.acquire().await.map_err(|e| e.to_string())?;
-                tokio::task::spawn_blocking(move || decode(&path))
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|r| r)
+                let permit = DECODES.acquire().await.map_err(|e| e.to_string())?;
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    decode(&path)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)
             },
             move |r| Msg::ImageDecoded(file_id, r),
         )

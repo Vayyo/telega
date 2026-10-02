@@ -4,9 +4,9 @@
 use iced::widget::{button, column, container, image, row, sensor, text};
 use iced::{ContentFit, Element, Fill};
 use tdlib_rs::enums::{LinkPreviewType, MessageContent, PollType};
-use tdlib_rs::types::{File, Photo};
+use tdlib_rs::types::{File, FormattedText, Photo};
 
-use super::{App, Link, Msg, MsgItem, PaneMsg, WinId};
+use super::{App, Link, Msg, MsgItem, PaneMsg, WinId, rich};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Extra {
@@ -94,6 +94,28 @@ fn preview_hidden(url: &str, message_text: &str) -> bool {
     !message_text.contains(url)
 }
 
+/// Match only runs of text that remain visible before spoilers are revealed.
+/// Pieces partition the original text, including boundaries from formatting;
+/// a target may cross those boundaries, but not a spoiler boundary.
+fn preview_hidden_rich(url: &str, text: &FormattedText) -> bool {
+    let pieces = rich::pieces(text);
+    if pieces.iter().all(|piece| !piece.style.spoiler) {
+        return preview_hidden(url, &text.text);
+    }
+    let mut start = 0;
+    let mut end = 0;
+    for piece in &pieces {
+        if piece.style.spoiler {
+            if !preview_hidden(url, &text.text[start..end]) {
+                return false;
+            }
+            start = end + piece.text.len();
+        }
+        end += piece.text.len();
+    }
+    preview_hidden(url, &text.text[start..end])
+}
+
 /// The card of a message and the file it references (link picture).
 pub(crate) fn extra_of(content: &MessageContent) -> Option<(Extra, Option<File>)> {
     Some(match content {
@@ -114,7 +136,7 @@ pub(crate) fn extra_of(content: &MessageContent) -> Option<(Extra, Option<File>)
                     title: preview.title.clone(),
                     description: preview.description.text.clone(),
                     thumb: file.as_ref().map(|f| f.id),
-                    hidden: preview_hidden(&preview.url, &m.text.text),
+                    hidden: preview_hidden_rich(&preview.url, &m.text),
                 },
                 file,
             )
@@ -219,6 +241,21 @@ impl App {
                 thumb,
                 hidden,
             } => {
+                // Once this message's spoilers are revealed, its actual text
+                // may show the target that was hidden when Extra was built.
+                let hidden = *hidden
+                    && (!self
+                        .session
+                        .panes
+                        .get(&window)
+                        .is_some_and(|pane| pane.revealed.contains(&m.id))
+                        || preview_hidden(
+                            url,
+                            &m.rich
+                                .iter()
+                                .map(|piece| piece.text.as_str())
+                                .collect::<String>(),
+                        ));
                 let mut info = column![].spacing(2).width(Fill);
                 if !site.is_empty() {
                     info = info.push(text(site).size(12).style(text::primary));
@@ -253,7 +290,7 @@ impl App {
                 button(card)
                     .padding([4, 8])
                     .style(card_button)
-                    .on_press(open(url.clone(), *hidden))
+                    .on_press(open(url.clone(), hidden))
                     .into()
             }
             Extra::Poll {
@@ -472,6 +509,109 @@ mod tests {
             matches!(extra, Extra::Link { hidden: true, .. }),
             "the card's target is not what the text shows"
         );
+    }
+
+    #[test]
+    fn security_fix_link_preview_requires_confirmation_until_spoiler_url_is_visible() {
+        let url = "https://audit.example.invalid/path";
+        let prefix = "😀 ";
+        let cases = [
+            ("entire_url", format!("{prefix}{url}"), Some(url), true),
+            (
+                "spanning_spoiler",
+                format!("{prefix}{url}"),
+                Some("example.invalid"),
+                true,
+            ),
+            (
+                "unicode_boundary",
+                format!("é{prefix}{url}🦊"),
+                Some("example.invalid"),
+                true,
+            ),
+            ("visible", format!("{prefix}{url}"), None, false),
+            (
+                "another_visible_copy",
+                format!("{prefix}{url} {url}"),
+                Some("example.invalid"),
+                false,
+            ),
+        ];
+        for (label, text, covered, expected_hidden) in cases {
+            let mut source = link_preview_message(url, &text);
+            if let Some(covered) = covered {
+                // TDLib entity coordinates are UTF-16 code units, not byte offsets.
+                let offset = text.split_once(covered).unwrap().0.encode_utf16().count();
+                source["text"]["entities"] = json!([
+                    {"@type": "textEntity", "offset": offset,
+                     "length": covered.encode_utf16().count(),
+                     "type": {"@type": "textEntityTypeSpoiler"}}
+                ]);
+            }
+            let content: MessageContent = serde_json::from_value(source).unwrap();
+            let formatted = super::super::rich::formatted_of(&content).unwrap();
+            let displayed = super::super::rich::masked(&super::super::rich::pieces(formatted));
+            assert_eq!(
+                displayed.contains(url),
+                !expected_hidden,
+                "{label}: rich text visibility"
+            );
+            let (extra, _) = extra_of(&content).expect("TDLib link preview reaches Extra");
+            let Extra::Link { hidden, .. } = extra else {
+                panic!("{label}: expected link card");
+            };
+            assert_eq!(hidden, expected_hidden, "{label}: confirmation required");
+        }
+    }
+
+    #[test]
+    fn security_fix_spoiler_mask_placeholder_cannot_make_unseen_preview_target_visible() {
+        let url = "https://evil.example/▒▒▒";
+        let cases = [
+            (
+                "spoiler_collision",
+                "https://evil.example/secret",
+                Some(("secret", "textEntityTypeSpoiler")),
+                true,
+            ),
+            ("literal_visible", url, None, false),
+            (
+                "styled_visible",
+                url,
+                Some(("▒▒▒", "textEntityTypeBold")),
+                false,
+            ),
+        ];
+        for (label, text, entity, expected_hidden) in cases {
+            let mut source = link_preview_message(url, text);
+            if let Some((part, kind)) = entity {
+                let offset = text.split_once(part).unwrap().0.encode_utf16().count();
+                source["text"]["entities"] = json!([
+                    {"@type": "textEntity", "offset": offset,
+                     "length": part.encode_utf16().count(),
+                     "type": {"@type": kind}}
+                ]);
+            }
+            let content: MessageContent = serde_json::from_value(source).unwrap();
+            let formatted = super::super::rich::formatted_of(&content).unwrap();
+            assert_eq!(
+                formatted.text.contains(url),
+                !expected_hidden,
+                "{label}: URL must really occur in the message to count as visible"
+            );
+            let pieces = super::super::rich::pieces(formatted);
+            if label == "spoiler_collision" {
+                assert!(pieces.iter().any(|p| p.style.spoiler));
+            }
+            if label == "styled_visible" {
+                assert!(pieces.iter().any(|p| p.style.bold));
+            }
+            let (extra, _) = extra_of(&content).expect("TDLib preview becomes a link card");
+            let Extra::Link { hidden, .. } = extra else {
+                panic!("{label}: expected link card");
+            };
+            assert_eq!(hidden, expected_hidden, "{label}: confirmation requirement");
+        }
     }
 
     fn quiz_poll_content(correct: Vec<i32>, chosen: [bool; 2]) -> Value {

@@ -555,7 +555,9 @@ impl shader::Program<Msg> for VideoProgram<'_> {
                 state.hovered = hovered;
                 // Publishing also schedules a redraw, including when this
                 // transition coincides with an active player's redraw.
-                return Some(Action::publish(Msg::Video(VideoMsg::HoverControls(hovered))));
+                return Some(Action::publish(Msg::Video(VideoMsg::HoverControls(
+                    hovered,
+                ))));
             }
         } else {
             state.hovered = false;
@@ -828,7 +830,7 @@ impl shader::Primitive for VideoPrimitive {
             if self.round { 1.0 } else { 0.0 },
         ];
         let mut bytes = [0u8; 16];
-        for (chunk, value) in bytes.chunks_exact_mut(4).zip(uniforms) {
+        for (chunk, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(uniforms) {
             chunk.copy_from_slice(&value.to_ne_bytes());
         }
         queue.write_buffer(&planes.uniforms, 0, &bytes);

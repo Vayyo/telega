@@ -39,10 +39,13 @@ pub async fn close(client_id: i32) -> TdResult<()> {
 }
 
 /// Re-encrypts the TDLib database with a new key ("" = none).
-pub async fn set_db_key(client_id: i32, key: String) -> TdResult<()> {
-    functions::set_database_encryption_key(key, client_id)
-        .await
-        .map_err(err)
+pub async fn set_db_key(client_id: i32, key: crate::lock::SecretString) -> TdResult<()> {
+    tdlib_rs::send_secret_request(
+        client_id,
+        serde_json::json!({"@type": "setDatabaseEncryptionKey", "new_encryption_key": &*key}),
+    )
+    .await
+    .map_err(err)
 }
 
 /// What the current user may do with a message.
@@ -167,25 +170,28 @@ pub async fn set_parameters(
     api_id: i32,
     api_hash: String,
     slot: u32,
-    key: String,
+    key: crate::lock::SecretString,
     limits: crate::settings::CacheLimits,
 ) -> TdResult<Option<String>> {
-    functions::set_tdlib_parameters(
-        false,
-        crate::paths::db_dir(slot).to_string_lossy().into_owned(),
-        crate::paths::files_dir(slot).to_string_lossy().into_owned(),
-        key,
-        true,
-        true,
-        true,
-        false,
-        api_id,
-        api_hash,
-        "ru".into(),
-        "Desktop".into(),
-        String::new(),
-        env!("CARGO_PKG_VERSION").into(),
+    tdlib_rs::send_secret_request(
         client_id,
+        serde_json::json!({
+            "@type": "setTdlibParameters",
+            "use_test_dc": false,
+            "database_directory": crate::paths::db_dir(slot).to_string_lossy(),
+            "files_directory": crate::paths::files_dir(slot).to_string_lossy(),
+            "database_encryption_key": &*key,
+            "use_file_database": true,
+            "use_chat_info_database": true,
+            "use_message_database": true,
+            "use_secret_chats": false,
+            "api_id": api_id,
+            "api_hash": api_hash,
+            "system_language_code": "ru",
+            "device_model": "Desktop",
+            "system_version": "",
+            "application_version": env!("CARGO_PKG_VERSION"),
+        }),
     )
     .await
     .map_err(err)?;
@@ -259,10 +265,13 @@ pub async fn send_code(client_id: i32, code: String) -> TdResult<()> {
         .map_err(err)
 }
 
-pub async fn send_password(client_id: i32, password: String) -> TdResult<()> {
-    functions::check_authentication_password(password, client_id)
-        .await
-        .map_err(err)
+pub async fn send_password(client_id: i32, password: crate::lock::SecretString) -> TdResult<()> {
+    tdlib_rs::send_secret_request(
+        client_id,
+        serde_json::json!({"@type": "checkAuthenticationPassword", "password": &*password}),
+    )
+    .await
+    .map_err(err)
 }
 
 /// Asks TDLib to push `limit` more chats of the main list as updates.
@@ -1003,13 +1012,20 @@ pub struct Profile {
     pub subtitle: String,
     /// Bio or description with its links and @mentions.
     pub about: Vec<crate::app::rich::Piece>,
-    /// Members that could be listed (first page): (user id, name).
-    pub members: Vec<(i64, String)>,
+    /// Members that could be listed (first page).
+    pub members: Vec<ProfileMember>,
     /// Discussion group of a channel (or channel of a group); 0 if none.
     pub linked_chat_id: i64,
     pub is_channel: bool,
     /// A group or channel the user is in (can leave it).
     pub is_member: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileMember {
+    pub id: i64,
+    pub name: String,
+    pub is_bot: bool,
 }
 
 fn usernames_of(names: Option<&tdlib_rs::types::Usernames>) -> Vec<String> {
@@ -1075,14 +1091,18 @@ pub fn status_label(status: &enums::UserStatus) -> String {
 async fn member_names(
     client_id: i32,
     members: &[tdlib_rs::types::ChatMember],
-) -> Vec<(i64, String)> {
+) -> Vec<ProfileMember> {
     let mut names = Vec::new();
     for m in members.iter().take(50) {
         if let enums::MessageSender::User(u) = &m.member_id
             && let Ok(enums::User::User(user)) = functions::get_user(u.user_id, client_id).await
         {
             let name = format!("{} {}", user.first_name, user.last_name);
-            names.push((user.id, name.trim().to_owned()));
+            names.push(ProfileMember {
+                id: user.id,
+                name: name.trim().to_owned(),
+                is_bot: matches!(user.r#type, enums::UserType::Bot(_)),
+            });
         }
     }
     names
@@ -1380,7 +1400,7 @@ pub async fn chat_roles(
 /// need, asking TDLib to download from that place (a seek to the end of an
 /// MP4 for its index, then back, both work). For the video player thread;
 /// TDLib answers through the app's update loop.
-pub struct FileStream {
+pub struct FileStream<B = NativeFileBackend> {
     client_id: i32,
     file_id: i32,
     size: u64,
@@ -1388,9 +1408,60 @@ pub struct FileStream {
     file: Option<std::fs::File>,
     /// Bytes known to be downloaded from `available.0` on.
     available: (u64, u64),
-    /// Where TDLib was last asked to download from.
+    /// Where TDLib was last successfully asked to download from.
     requested: Option<u64>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    backend: B,
+    request_timeout: std::time::Duration,
+    progress_timeout: std::time::Duration,
+}
+
+pub struct NativeFileBackend;
+
+pub(crate) trait FileStreamBackend {
+    fn prefix(
+        &self,
+        client_id: i32,
+        file_id: i32,
+        offset: u64,
+    ) -> impl Future<Output = std::io::Result<u64>>;
+    fn get_file(
+        &self,
+        client_id: i32,
+        file_id: i32,
+    ) -> impl Future<Output = std::io::Result<std::fs::File>>;
+    fn download(
+        &self,
+        client_id: i32,
+        file_id: i32,
+        offset: u64,
+    ) -> impl Future<Output = std::io::Result<()>>;
+}
+
+impl FileStreamBackend for NativeFileBackend {
+    async fn prefix(&self, client_id: i32, file_id: i32, offset: u64) -> std::io::Result<u64> {
+        let offset = i64::try_from(offset).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+        let enums::FileDownloadedPrefixSize::FileDownloadedPrefixSize(prefix) =
+            functions::get_file_downloaded_prefix_size(file_id, offset, client_id)
+                .await
+                .map_err(|e| std::io::Error::other(e.message))?;
+        Ok(prefix.size.max(0) as u64)
+    }
+
+    async fn get_file(&self, client_id: i32, file_id: i32) -> std::io::Result<std::fs::File> {
+        let enums::File::File(file) = functions::get_file(file_id, client_id)
+            .await
+            .map_err(|e| std::io::Error::other(e.message))?;
+        std::fs::File::open(&file.local.path)
+    }
+
+    async fn download(&self, client_id: i32, file_id: i32, offset: u64) -> std::io::Result<()> {
+        let offset = i64::try_from(offset).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+        functions::download_file(file_id, 32, offset, 0, false, client_id)
+            .await
+            .map_err(|e| std::io::Error::other(e.message))?;
+        Ok(())
+    }
 }
 
 impl FileStream {
@@ -1399,6 +1470,28 @@ impl FileStream {
         file_id: i32,
         size: u64,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self::with_backend(
+            client_id,
+            file_id,
+            size,
+            stop,
+            NativeFileBackend,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(30),
+        )
+    }
+}
+
+impl<B: FileStreamBackend> FileStream<B> {
+    pub(crate) fn with_backend(
+        client_id: i32,
+        file_id: i32,
+        size: u64,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        backend: B,
+        request_timeout: std::time::Duration,
+        progress_timeout: std::time::Duration,
     ) -> Self {
         Self {
             client_id,
@@ -1409,39 +1502,52 @@ impl FileStream {
             available: (0, 0),
             requested: None,
             stop,
+            backend,
+            request_timeout,
+            progress_timeout,
         }
     }
 
-    fn downloaded_from(&self, offset: u64) -> u64 {
-        let answer = iced::futures::executor::block_on(functions::get_file_downloaded_prefix_size(
-            self.file_id,
-            offset as i64,
-            self.client_id,
-        ));
-        match answer {
-            Ok(enums::FileDownloadedPrefixSize::FileDownloadedPrefixSize(p)) => {
-                p.size.max(0) as u64
+    fn wait_request<T>(
+        &self,
+        last_progress: std::time::Instant,
+        future: impl Future<Output = std::io::Result<T>>,
+    ) -> std::io::Result<T> {
+        use std::task::{Context, Poll, Waker};
+        let deadline = std::time::Instant::now() + self.request_timeout;
+        let progress_deadline = last_progress + self.progress_timeout;
+        let mut future = std::pin::pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        loop {
+            if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::ErrorKind::Interrupted.into());
             }
-            Err(_) => 0,
+            let now = std::time::Instant::now();
+            if now >= deadline || now >= progress_deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TDLib file request timed out",
+                ));
+            }
+            if let Poll::Ready(result) = future.as_mut().poll(&mut context) {
+                return result;
+            }
+            std::thread::sleep(
+                std::time::Duration::from_millis(40)
+                    .min(deadline.saturating_duration_since(now))
+                    .min(progress_deadline.saturating_duration_since(now)),
+            );
         }
-    }
-
-    fn open_file(&mut self) -> std::io::Result<&mut std::fs::File> {
-        if self.file.is_none() {
-            let enums::File::File(file) = iced::futures::executor::block_on(functions::get_file(
-                self.file_id,
-                self.client_id,
-            ))
-            .map_err(|e| std::io::Error::other(e.message))?;
-            self.file = Some(std::fs::File::open(&file.local.path)?);
-        }
-        Ok(self.file.as_mut().expect("just opened"))
     }
 }
 
-impl std::io::Read for FileStream {
+impl<B: FileStreamBackend> std::io::Read for FileStream<B> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         use std::io::Seek;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let last_progress = std::time::Instant::now();
         loop {
             if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(std::io::ErrorKind::Interrupted.into());
@@ -1450,51 +1556,68 @@ impl std::io::Read for FileStream {
                 return Ok(0);
             }
             let (start, len) = self.available;
-            let mut ready = (start + len).saturating_sub(self.pos);
-            if self.pos < start || ready == 0 {
-                ready = self.downloaded_from(self.pos);
+            let mut ready = if self.pos < start {
+                0
+            } else {
+                start.saturating_add(len).saturating_sub(self.pos)
+            };
+            if ready == 0 {
+                ready = self.wait_request(
+                    last_progress,
+                    self.backend.prefix(self.client_id, self.file_id, self.pos),
+                )?;
                 self.available = (self.pos, ready);
             }
             if ready > 0 {
                 let pos = self.pos;
-                let file = self.open_file()?;
+                if self.file.is_none() {
+                    self.file = Some(self.wait_request(
+                        last_progress,
+                        self.backend.get_file(self.client_id, self.file_id),
+                    )?);
+                }
+                let file = self.file.as_mut().expect("file just opened");
                 file.seek(std::io::SeekFrom::Start(pos))?;
-                let want = buf.len().min(ready as usize);
+                let want = buf.len().min(usize::try_from(ready).unwrap_or(usize::MAX));
+                let want = if self.size > 0 {
+                    want.min(usize::try_from(self.size - self.pos).unwrap_or(usize::MAX))
+                } else {
+                    want
+                };
                 let n = file.read(&mut buf[..want])?;
                 if n > 0 {
                     self.pos += n as u64;
                     return Ok(n);
                 }
             }
-            // Not there yet: download from here (once per place) and wait.
             if self.requested != Some(self.pos) {
+                self.wait_request(
+                    last_progress,
+                    self.backend
+                        .download(self.client_id, self.file_id, self.pos),
+                )?;
                 self.requested = Some(self.pos);
-                let _ = iced::futures::executor::block_on(functions::download_file(
-                    self.file_id,
-                    32,
-                    self.pos as i64,
-                    0,
-                    false,
-                    self.client_id,
-                ));
             }
-            std::thread::sleep(std::time::Duration::from_millis(40));
+            let remaining = self
+                .progress_timeout
+                .saturating_sub(last_progress.elapsed());
+            if remaining.is_zero() {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40).min(remaining));
             self.available = (self.pos, 0);
         }
     }
 }
 
-impl std::io::Seek for FileStream {
+impl<B> std::io::Seek for FileStream<B> {
     fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
         let target = match to {
             std::io::SeekFrom::Start(p) => p as i128,
             std::io::SeekFrom::Current(d) => self.pos as i128 + d as i128,
             std::io::SeekFrom::End(d) => self.size as i128 + d as i128,
         };
-        if target < 0 {
-            return Err(std::io::ErrorKind::InvalidInput.into());
-        }
-        self.pos = target as u64;
+        self.pos = u64::try_from(target).map_err(|_| std::io::ErrorKind::InvalidInput)?;
         Ok(self.pos)
     }
 }
@@ -1828,6 +1951,307 @@ mod tests {
                 ("storage_max_time_from_last_access", 1),
                 ("storage_max_file_count", i32::MAX as i64),
             ]
+        );
+    }
+
+    static NEXT_CACHED_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    struct OfflineCachedFile(std::path::PathBuf);
+
+    impl Drop for OfflineCachedFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn offline_cached_file(contents: &[u8]) -> OfflineCachedFile {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "telega-stream-{}-{}",
+            std::process::id(),
+            NEXT_CACHED_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create test-owned cached file");
+        file.write_all(contents).expect("cache test bytes");
+        OfflineCachedFile(path)
+    }
+
+    #[derive(Default)]
+    struct OfflineFileBackend {
+        available: u64,
+        downloaded_after_request: Option<std::sync::atomic::AtomicBool>,
+        path: Option<std::path::PathBuf>,
+        prefix_error: bool,
+        file_error: bool,
+        download_error: bool,
+        pending_download: bool,
+        entered_download: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl FileStreamBackend for OfflineFileBackend {
+        async fn prefix(&self, _: i32, _: i32, offset: u64) -> std::io::Result<u64> {
+            if self.prefix_error {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "offline prefix failure",
+                ));
+            }
+            if self
+                .downloaded_after_request
+                .as_ref()
+                .is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                return Ok(0);
+            }
+            Ok(self.available.saturating_sub(offset))
+        }
+
+        async fn get_file(&self, _: i32, _: i32) -> std::io::Result<std::fs::File> {
+            if self.file_error {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "offline local-file failure",
+                ));
+            }
+            std::fs::File::open(self.path.as_ref().expect("cached test file"))
+        }
+
+        async fn download(&self, _: i32, _: i32, _: u64) -> std::io::Result<()> {
+            if self.download_error {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "offline download failure",
+                ));
+            }
+            if self.pending_download {
+                if let Some(sender) = &self.entered_download {
+                    sender.send(()).expect("stop test receiver");
+                }
+                return std::future::pending().await;
+            }
+            if let Some(flag) = &self.downloaded_after_request {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    fn offline_stream(
+        backend: OfflineFileBackend,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        request_timeout: std::time::Duration,
+        progress_timeout: std::time::Duration,
+    ) -> FileStream<OfflineFileBackend> {
+        FileStream::with_backend(7, 11, 5, stop, backend, request_timeout, progress_timeout)
+    }
+
+    #[test]
+    fn security_fix_file_stream_reports_prefix_download_and_local_file_failures() {
+        use std::io::{ErrorKind, Read};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::Duration;
+
+        for (backend, kind, marker) in [
+            (
+                OfflineFileBackend {
+                    prefix_error: true,
+                    ..Default::default()
+                },
+                ErrorKind::PermissionDenied,
+                "offline prefix failure",
+            ),
+            (
+                OfflineFileBackend {
+                    download_error: true,
+                    ..Default::default()
+                },
+                ErrorKind::BrokenPipe,
+                "offline download failure",
+            ),
+            (
+                OfflineFileBackend {
+                    available: 5,
+                    file_error: true,
+                    ..Default::default()
+                },
+                ErrorKind::NotFound,
+                "offline local-file failure",
+            ),
+        ] {
+            let mut stream = offline_stream(
+                backend,
+                Arc::new(AtomicBool::new(false)),
+                Duration::from_millis(300),
+                Duration::from_millis(300),
+            );
+            let error = stream.read(&mut [0u8; 1]).expect_err("backend failure");
+            assert_eq!(error.kind(), kind);
+            assert!(
+                error.to_string().contains(marker),
+                "backend error detail lost: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_fix_file_stream_ends_no_progress_and_unanswered_downloads() {
+        use std::io::{ErrorKind, Read};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::Duration;
+
+        for (backend, request_timeout, progress_timeout) in [
+            (
+                OfflineFileBackend::default(),
+                Duration::from_secs(1),
+                Duration::from_millis(90),
+            ),
+            (
+                OfflineFileBackend {
+                    pending_download: true,
+                    ..Default::default()
+                },
+                Duration::from_millis(90),
+                Duration::from_secs(1),
+            ),
+        ] {
+            let mut stream = offline_stream(
+                backend,
+                Arc::new(AtomicBool::new(false)),
+                request_timeout,
+                progress_timeout,
+            );
+            assert_eq!(
+                stream.read(&mut [0u8; 1]).expect_err("deadline").kind(),
+                ErrorKind::TimedOut
+            );
+        }
+    }
+
+    #[test]
+    fn security_fix_file_stream_stop_interrupts_a_pending_download_request() {
+        use std::io::{ErrorKind, Read};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut stream = offline_stream(
+            OfflineFileBackend {
+                pending_download: true,
+                entered_download: Some(entered_tx),
+                ..Default::default()
+            },
+            Arc::clone(&stop),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        let worker = std::thread::spawn(move || {
+            done_tx
+                .send(stream.read(&mut [0u8; 1]).map_err(|error| error.kind()))
+                .expect("stop result receiver");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("download future started");
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stop must interrupt pending request"),
+            Err(ErrorKind::Interrupted)
+        );
+        worker.join().expect("stream worker");
+    }
+
+    #[test]
+    fn security_fix_file_stream_reads_cached_bytes_after_seek_and_handles_empty_reads() {
+        use std::io::{Read, Seek};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::Duration;
+
+        let fixture = offline_cached_file(b"ABCDE");
+
+        let mut stream = offline_stream(
+            OfflineFileBackend {
+                available: 5,
+                path: Some(fixture.0.clone()),
+                ..Default::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        );
+        assert_eq!(stream.read(&mut []).expect("empty read"), 0);
+        let mut bytes = [0u8; 2];
+        assert_eq!(stream.read(&mut bytes).expect("first cached range"), 2);
+        assert_eq!(&bytes, b"AB");
+        stream
+            .seek(std::io::SeekFrom::Start(3))
+            .expect("seek forward");
+        assert_eq!(stream.read(&mut bytes).expect("later cached range"), 2);
+        assert_eq!(&bytes, b"DE");
+        assert_eq!(stream.read(&mut bytes).expect("end of file"), 0);
+        stream
+            .seek(std::io::SeekFrom::Start(1))
+            .expect("seek backward");
+        assert_eq!(stream.read(&mut bytes).expect("earlier cached range"), 2);
+        assert_eq!(&bytes, b"BC");
+    }
+
+    #[test]
+    fn security_fix_unknown_size_stream_downloads_reads_and_seeks_without_false_eof() {
+        use std::io::{ErrorKind, Read, Seek};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::Duration;
+
+        let fixture = offline_cached_file(b"ABCDE");
+        let mut stream = FileStream::with_backend(
+            7,
+            11,
+            0,
+            Arc::new(AtomicBool::new(false)),
+            OfflineFileBackend {
+                available: 5,
+                path: Some(fixture.0.clone()),
+                downloaded_after_request: Some(AtomicBool::new(false)),
+                ..Default::default()
+            },
+            Duration::from_millis(300),
+            Duration::from_millis(90),
+        );
+        let mut bytes = [0u8; 2];
+        assert_eq!(
+            stream
+                .read(&mut bytes)
+                .expect("downloaded unknown-size bytes"),
+            2
+        );
+        assert_eq!(&bytes, b"AB");
+        stream
+            .seek(std::io::SeekFrom::Start(3))
+            .expect("seek in unknown-size file");
+        assert_eq!(
+            stream.read(&mut bytes).expect("later unknown-size bytes"),
+            2
+        );
+        assert_eq!(&bytes, b"DE");
+        assert_eq!(
+            stream
+                .read(&mut bytes)
+                .expect_err("no final size or EOF signal")
+                .kind(),
+            ErrorKind::TimedOut,
+            "unknown size must not be mistaken for a completed file"
         );
     }
 }

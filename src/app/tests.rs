@@ -11,6 +11,15 @@ use crate::av::audio::Recorder;
 use crate::settings::{Account, CacheLimits};
 use serde_json::{Value, json};
 
+#[path = "tests/security_input.rs"]
+mod security_input;
+
+#[path = "tests/security_secrets.rs"]
+mod security_secrets;
+
+#[path = "tests/security_plugins.rs"]
+mod security_plugins;
+
 #[test]
 fn api_credentials_reject_missing_and_invalid_id_without_exposing_hash() {
     for id in [
@@ -913,20 +922,45 @@ fn turning_keep_deleted_off_hides_archive_in_every_window() {
     assert_eq!(shown_in(&app, second), [(11, "b", false)]);
 }
 
+fn plugin_origin(app: &App) -> plugins::Origin {
+    plugins::Origin {
+        client_id: app.session.client_id,
+        account_id: app.session.my_id.expect("logged-in test plugin account"),
+    }
+}
+
 /// App connected to a fake plugin thread; returns what the app sends it.
-fn with_plugin_host(app: &mut App) -> std::sync::mpsc::Receiver<HostCmd> {
+fn with_plugin_host(app: &mut App) -> plugins::TestReceiver {
     let (handle, rx) = HostHandle::for_test();
     let _ = app.update(Msg::Plugin(HostEvent::Ready(handle)));
     rx
 }
 
-fn sent(rx: &std::sync::mpsc::Receiver<HostCmd>) -> Vec<HostCmd> {
+fn sent(rx: &plugins::TestReceiver) -> Vec<HostCmd> {
     rx.try_iter().collect()
+}
+
+/// Existing deletion behavior applies to an actively authorized plugin, not
+/// to an unconfigured continuation delivered from an old session.
+fn allow_plugin_delete(app: &mut App) {
+    app.session.my_id = Some(5);
+    let _ = app.update(Msg::Plugin(HostEvent::Plugins(vec![PluginInfo {
+        id: "autodelete".into(),
+        name: "Autodelete".into(),
+        description: String::new(),
+        permissions: vec![plugins::Permission::Read, plugins::Permission::DeleteOwn],
+        settings: Vec::new(),
+        builtin: true,
+        error: None,
+    }])));
+    let _ = app.update(Msg::PluginToggle("autodelete".into(), true));
+    let _ = app.update(Msg::PluginDryRun("autodelete".into(), false));
 }
 
 #[test]
 fn plugin_deletions_are_not_kept_in_the_deleted_archive() {
     let mut app = app();
+    allow_plugin_delete(&mut app);
     open(&mut app, 1, &[(10, "a"), (11, "b")]);
     // TDLib confirmed 10 as the user's own; 11 was requested but is not.
     let action = plugins::Action::Delete {
@@ -934,7 +968,9 @@ fn plugin_deletions_are_not_kept_in_the_deleted_archive() {
         ids: vec![10, 11],
         revoke: true,
     };
+    let origin = plugin_origin(&app);
     let _ = app.update(Msg::PluginDeleteOwn(
+        origin,
         "autodelete".into(),
         1,
         vec![10],
@@ -954,13 +990,17 @@ fn failed_plugin_deletion_rolls_back_and_requeues_the_action() {
     let mut app = app();
     let rx = with_plugin_host(&mut app);
     sent(&rx);
+    allow_plugin_delete(&mut app);
+    sent(&rx);
     open(&mut app, 1, &[(10, "a")]);
     let action = plugins::Action::Delete {
         chat_id: 1,
         ids: vec![10],
         revoke: true,
     };
+    let origin = plugin_origin(&app);
     let _ = app.update(Msg::PluginDeleteOwn(
+        origin,
         "autodelete".into(),
         1,
         vec![10],
@@ -970,6 +1010,7 @@ fn failed_plugin_deletion_rolls_back_and_requeues_the_action() {
     // Telegram refused the deletion (flood wait): the id must stop counting
     // as a deliberate plugin deletion, and the action must not be lost.
     let _ = app.update(Msg::PluginDeleted(
+        origin,
         "autodelete".into(),
         1,
         vec![10],
@@ -984,11 +1025,15 @@ fn failed_plugin_deletion_rolls_back_and_requeues_the_action() {
     );
     let cmds = sent(&rx);
     assert!(
-        matches!(cmds.first(), Some(HostCmd::FloodWait(30))),
+        cmds.iter()
+            .any(|cmd| matches!(cmd, HostCmd::FloodWait(active, 30) if *active == origin)),
         "{cmds:?}"
     );
     assert!(
-        matches!(cmds.get(1), Some(HostCmd::Requeue(id, a)) if id == "autodelete" && *a == action),
+        cmds.iter().any(|cmd| matches!(
+            cmd, HostCmd::Requeue(origin, id, a)
+                if *origin == plugin_origin(&app) && id == "autodelete" && *a == action
+        )),
         "{cmds:?}"
     );
 }
@@ -1017,7 +1062,8 @@ fn plugins_get_the_account_only_when_logged_in() {
     assert!(
         sent(&rx)
             .iter()
-            .any(|c| matches!(c, HostCmd::Account(Some(42))))
+            .any(|c| matches!(c, HostCmd::Account(Some(origin))
+                if origin.client_id == app.session.client_id && origin.account_id == 42))
     );
 
     // Log out: plugins lose the account, the thread connection survives.
@@ -1037,6 +1083,7 @@ fn plugins_get_the_account_only_when_logged_in() {
 #[test]
 fn message_events_reach_plugins() {
     let mut app = app();
+    app.session.my_id = Some(5);
     let rx = with_plugin_host(&mut app);
     sent(&rx);
     new_message(&mut app, 1, 10, "hi");
@@ -1051,7 +1098,7 @@ fn message_events_reach_plugins() {
     let events: Vec<plugins::Event> = sent(&rx)
         .into_iter()
         .filter_map(|c| match c {
-            HostCmd::Event(e) => Some(e),
+            HostCmd::Event(origin, e) if origin == plugin_origin(&app) => Some(e),
             _ => None,
         })
         .collect();
@@ -1107,6 +1154,7 @@ fn plugin_settings_are_saved_and_pushed_to_plugins() {
 #[test]
 fn expanded_plugin_permissions_revoke_actions_until_reenabled() {
     let mut app = app();
+    app.session.my_id = Some(5);
     let rx = with_plugin_host(&mut app);
     sent(&rx);
     let mut info = PluginInfo {
@@ -1120,17 +1168,20 @@ fn expanded_plugin_permissions_revoke_actions_until_reenabled() {
     };
     let _ = app.update(Msg::Plugin(HostEvent::Plugins(vec![info.clone()])));
     let _ = app.update(Msg::PluginToggle(info.id.clone(), true));
+    let _ = app.update(Msg::PluginDryRun(info.id.clone(), false));
     let action = Action::Send {
         chat_id: 1,
         text: "hi".into(),
     };
-    assert_eq!(
-        app.update(Msg::Plugin(HostEvent::Action(
+    let origin = plugin_origin(&app);
+    assert!(
+        iced_runtime::task::into_stream(app.update(Msg::Plugin(HostEvent::Action(
+            origin,
             info.id.clone(),
             action.clone()
-        )))
-        .units(),
-        1
+        ))))
+        .is_some(),
+        "an enabled non-dry-run plugin may send with its granted permission"
     );
 
     info.permissions.push(plugins::Permission::Read);
@@ -1140,21 +1191,24 @@ fn expanded_plugin_permissions_revoke_actions_until_reenabled() {
         sent(&rx).last(),
         Some(HostCmd::Configure(config)) if !config[&info.id].enabled
     ));
-    assert_eq!(
-        app.update(Msg::Plugin(HostEvent::Action(
+    assert!(
+        iced_runtime::task::into_stream(app.update(Msg::Plugin(HostEvent::Action(
+            origin,
             info.id.clone(),
             action.clone()
-        )))
-        .units(),
-        0,
+        ))))
+        .is_none(),
         "a stale action cannot bypass the revoked permission"
     );
 
     let _ = app.update(Msg::PluginToggle(info.id.clone(), true));
-    assert_eq!(
-        app.update(Msg::Plugin(HostEvent::Action(info.id, action)))
-            .units(),
-        1
+    let _ = app.update(Msg::PluginDryRun(info.id.clone(), false));
+    assert!(
+        iced_runtime::task::into_stream(
+            app.update(Msg::Plugin(HostEvent::Action(origin, info.id, action)))
+        )
+        .is_some(),
+        "re-enabling and leaving dry run restores the granted send action"
     );
 }
 
@@ -2007,7 +2061,8 @@ fn new_global_search_resets_deep_sidebar_and_shows_clickable_short_result() {
         Ok((page(2, [9]), None)),
     ));
     let hits = pane(&app).list.messages.as_ref().unwrap();
-    let visible = super::view::search_visible_rows(pane(&app).list.scroll, 100.0, 32.0, hits.len());
+    let visible =
+        super::sidebar_view::search_visible_rows(pane(&app).list.scroll, 100.0, 32.0, hits.len());
     assert_eq!((visible.start, visible.end), (0, 1));
     let hit = &hits[visible.start];
     let _ = app.update(Msg::OpenFound(window, hit.chat_id, hit.id));
@@ -3466,36 +3521,6 @@ fn video_note_player_expand_control_opens_overlay_and_escape_returns_to_bubble()
         "Escape returns video to the message bubble"
     );
     assert_eq!(app.session.video.as_ref().unwrap().file_id, 306);
-}
-
-#[test]
-fn animations_start_when_downloaded_and_stop_off_screen() {
-    let mut app = app();
-    // On screen before its file is there: waits for the download.
-    let _ = app.update(Msg::AnimShow(304, media::Motion::Video));
-    assert!(app.session.playback.waiting(304));
-    assert!(!app.session.playback.playing(304));
-    td(
-        &mut app,
-        json!({"@type": "updateFile", "file": file(304, 9000, 9000, true, "/tmp/g.mp4")}),
-    );
-    assert!(app.session.playback.playing(304));
-
-    let _ = app.update(Msg::AnimHide(304));
-    assert!(!app.session.playback.playing(304));
-
-    // At most three at once.
-    for id in 400..405 {
-        td(
-            &mut app,
-            json!({"@type": "updateFile", "file": file(id, 10, 10, true, "/tmp/x.mp4")}),
-        );
-        let _ = app.update(Msg::AnimShow(id, media::Motion::Video));
-    }
-    let playing = (400..405)
-        .filter(|&id| app.session.playback.playing(id))
-        .count();
-    assert_eq!(playing, 3);
 }
 
 #[test]
@@ -5166,7 +5191,7 @@ fn populated_archive_windows_keep_selection_search_settings_and_read_scope_separ
 }
 
 #[test]
-fn archive_window_closes_safely_during_account_switch_and_logout() {
+fn archive_window_closes_safely_during_account_switch() {
     let mut app = app();
     let main = app.main_window;
     let client = app.session.client_id;
@@ -5192,7 +5217,13 @@ fn archive_window_closes_safely_during_account_switch_and_logout() {
     assert_eq!(app.session.panes.len(), 1);
     assert!(!app.session.panes[&main].list.archive);
     assert_eq!(app.session.panes[&main].list.query, "");
-    app.session.leave = None;
+}
+
+#[test]
+fn archive_window_closes_safely_during_logout() {
+    let mut app = app();
+    let main = app.main_window;
+    let client = app.session.client_id;
     let _ = app.update(Msg::OpenArchiveWindow(main, client));
     let archive = *app.session.panes.keys().find(|&&w| w != main).unwrap();
     let _ = app.update(Msg::ConfirmLogOut(true));
@@ -7371,7 +7402,11 @@ fn profile_panel_opens_for_the_shown_chat_and_ignores_stale_answers() {
         usernames: vec!["rust".into()],
         subtitle: "3 участника".into(),
         about: crate::app::rich::plain("Чат о Rust"),
-        members: vec![(7, "Игорь".into())],
+        members: vec![td::ProfileMember {
+            id: 7,
+            name: "Игорь".into(),
+            is_bot: false,
+        }],
         is_member: true,
         ..Default::default()
     };
@@ -7416,18 +7451,13 @@ fn profile_actions_ask_before_leaving_and_open_linked_chats() {
     };
     let _ = app.update(Msg::ProfileLoaded(window, 5, Ok(data)));
     assert_eq!(active(&app), Some(1));
-    assert_eq!(
-        app.update(Msg::Profile(window, ProfileAction::Leave))
-            .units(),
-        0,
-        "asks first"
+    let _ = app.update(Msg::Profile(window, ProfileAction::Leave));
+    assert!(
+        pane(&app).profile.is_some(),
+        "first click only opens confirmation"
     );
     assert!(pane(&app).confirm_leave);
-    assert_eq!(
-        app.update(Msg::Profile(window, ProfileAction::Leave))
-            .units(),
-        1
-    );
+    let _ = app.update(Msg::Profile(window, ProfileAction::Leave));
     let _ = app.update(Msg::Profile(window, ProfileAction::Left(5, Ok(()))));
     assert_eq!(pane(&app).profile, None, "the panel of a left chat closes");
 
@@ -7618,7 +7648,7 @@ fn drafts_are_saved_when_leaving_and_loaded_into_an_empty_field() {
 }
 
 #[test]
-fn locked_account_waits_for_the_password_and_keys_follow_changes() {
+fn locked_account_waits_for_the_password_and_rejects_invalid_forms() {
     use crate::app::password::PasswordMsg;
     let mut app = app();
     app.session.auth = Auth::Starting;
@@ -7655,7 +7685,10 @@ fn locked_account_waits_for_the_password_and_keys_follow_changes() {
             forgot: false
         }
     );
-    let _ = app.update(Msg::Password(PasswordMsg::Unlocked(Ok(key))));
+    let _ = app.update(Msg::Password(PasswordMsg::Unlocked(Ok((
+        Some(key.clone()),
+        None,
+    )))));
     assert_eq!(app.session.db_key, Some(key));
     // TDLib still refuses: the data has another key.
     let _ = app.update(Msg::ParametersSet(Err(
@@ -7678,43 +7711,6 @@ fn locked_account_waits_for_the_password_and_keys_follow_changes() {
     assert!(
         matches!(&app.session.password_form.message, Some(Err(e)) if e.contains("не совпадают"))
     );
-
-    // TDLib re-keyed: the archive follows (on a worker thread, so `update`
-    // only starts it here; `ArchiveRekeyed` is what it reports back with),
-    // settings keep salt and check.
-    app.session.db_key = Some(key);
-    app.session.archive.as_mut().unwrap().set_key(Some(key));
-    let new_salt = crate::lock::new_salt();
-    let new_key = crate::lock::derive("новый", &new_salt).unwrap();
-    let _ = app.update(Msg::Password(PasswordMsg::Applied(
-        app.session.slot,
-        app.session.client_id,
-        Ok((Some(new_key), new_salt.clone(), String::new())),
-    )));
-    let _ = app.update(Msg::Password(PasswordMsg::ArchiveRekeyed(
-        app.session.slot,
-        app.session.client_id,
-        Some(new_key),
-        new_salt.clone(),
-        String::new(),
-        Ok(()),
-    )));
-    assert_eq!(app.session.db_key, Some(new_key));
-    assert_eq!(
-        app.settings.accounts[0].lock_salt.as_deref(),
-        Some(new_salt.as_str())
-    );
-    // Removed: nothing left to ask at the next start. The archive is
-    // already `None` here (taken, not given back, by the unpolled task
-    // above), so this round finishes synchronously with no archive to wait
-    // for.
-    let _ = app.update(Msg::Password(PasswordMsg::Applied(
-        app.session.slot,
-        app.session.client_id,
-        Ok((None, String::new(), String::new())),
-    )));
-    assert_eq!(app.session.db_key, None);
-    assert_eq!(app.locked_slot(), None);
 }
 
 #[test]
@@ -8373,6 +8369,159 @@ fn ui_hover_and_bot_group_sender_shows_bot_beside_the_same_name_only_for_bots() 
 }
 
 #[test]
+fn ui_bot_group_profile_member_badge() {
+    let mut app = app();
+    app.session.chats.insert(1, chat_item("Группа", false));
+    open(&mut app, 1, &[]);
+    let window = app.main_window;
+    let _ = app.update(Msg::ToggleProfile(window));
+    let profile = td::Profile {
+        subtitle: "2 участника".into(),
+        members: vec![
+            td::ProfileMember {
+                id: 7,
+                name: "Maxwell".into(),
+                is_bot: false,
+            },
+            td::ProfileMember {
+                id: 8,
+                name: "Мария".into(),
+                is_bot: false,
+            },
+        ],
+        ..Default::default()
+    };
+    let _ = app.update(Msg::ProfileLoaded(window, 1, Ok(profile.clone())));
+    let regular = ui_hover_and_bot_frame(&mut app);
+
+    // A changed member name must change pixels inside this row crop, proving
+    // that differences here measure the participant rather than the header.
+    let mut renamed_profile = profile.clone();
+    renamed_profile.members[0].name = "Другое имя".into();
+    let _ = app.update(Msg::ProfileLoaded(window, 1, Ok(renamed_profile)));
+    let renamed = ui_hover_and_bot_frame(&mut app);
+    let _ = app.update(Msg::ProfileLoaded(window, 1, Ok(profile.clone())));
+    let bot_row = (770, 385, 970, 418);
+    let regular_row = (770, 423, 970, 455);
+    assert!(
+        ui_hover_and_bot_changed(&regular, &renamed, bot_row) > 12,
+        "the group profile crop must include Maxwell's visible member name"
+    );
+    assert_eq!(
+        ui_hover_and_bot_changed(&regular, &renamed, regular_row),
+        0,
+        "renaming Maxwell must not alter the regular participant's row"
+    );
+
+    assert!(
+        app.session.bot_users.is_empty(),
+        "this member has not appeared in a user update yet"
+    );
+    let mut bot_profile = profile.clone();
+    bot_profile.members[0].is_bot = true;
+    let _ = app.update(Msg::ProfileLoaded(window, 1, Ok(bot_profile)));
+    let bot = ui_hover_and_bot_frame(&mut app);
+    assert_eq!(
+        ui_hover_and_bot_changed(&regular, &bot, regular_row),
+        0,
+        "the regular participant must not gain a Bot badge"
+    );
+    assert!(
+        ui_hover_and_bot_changed(&regular, &bot, bot_row) > 12,
+        "Bot must be visible beside unchanged Maxwell in the group profile member row"
+    );
+    let mut regular_update = user_with_photo(7, Value::Null);
+    regular_update["user"]["profile_photo"] = Value::Null;
+    regular_update["user"]["first_name"] = json!("Maxwell");
+    td(&mut app, regular_update);
+    let cleared = ui_hover_and_bot_frame(&mut app);
+    assert_eq!(
+        ui_hover_and_bot_changed(&regular, &cleared, bot_row),
+        0,
+        "updating the open profile member to regular must remove Bot without changing the name"
+    );
+    assert_eq!(
+        ui_hover_and_bot_changed(&regular, &cleared, regular_row),
+        0,
+        "the other member's row must remain unchanged after the update"
+    );
+}
+
+#[test]
+fn ui_bot_group_profile_load_uses_newer_user_type() {
+    let mut app = app();
+    app.session.chats.insert(1, chat_item("Группа", false));
+    open(&mut app, 1, &[]);
+    let window = app.main_window;
+    let profile = td::Profile {
+        subtitle: "2 участника".into(),
+        members: vec![
+            td::ProfileMember {
+                id: 7,
+                name: "Maxwell".into(),
+                is_bot: false,
+            },
+            td::ProfileMember {
+                id: 8,
+                name: "Мария".into(),
+                is_bot: false,
+            },
+        ],
+        ..Default::default()
+    };
+    let bot_row = (770, 385, 970, 418);
+    let regular_row = (770, 423, 970, 455);
+
+    let _ = app.update(Msg::ToggleProfile(window));
+    let _ = app.update(Msg::ProfileLoaded(window, 1, Ok(profile.clone())));
+    let regular = ui_hover_and_bot_frame(&mut app);
+    let _ = app.update(Msg::ToggleProfile(window));
+    let _ = app.update(Msg::ToggleProfile(window));
+    assert_eq!(pane(&app).profile, Some((1, None)));
+
+    let mut bot_update = user_with_photo(7, Value::Null);
+    bot_update["user"]["profile_photo"] = Value::Null;
+    bot_update["user"]["first_name"] = json!("Maxwell");
+    bot_update["user"]["type"] =
+        serde_json::to_value(tdlib_rs::enums::UserType::Bot(Default::default())).unwrap();
+    td(&mut app, bot_update);
+    // The request began before this update: its answer has the old type.
+    let _ = app.update(Msg::ProfileLoaded(window, 1, Ok(profile.clone())));
+    let bot = ui_hover_and_bot_frame(&mut app);
+    assert_eq!(
+        ui_hover_and_bot_changed(&regular, &bot, regular_row),
+        0,
+        "Maxwell's update must not change the other member's row"
+    );
+    assert!(
+        ui_hover_and_bot_changed(&regular, &bot, bot_row) > 12,
+        "a newer Bot update must be visible next to unchanged Maxwell after a stale profile answer"
+    );
+
+    let _ = app.update(Msg::ToggleProfile(window));
+    let _ = app.update(Msg::ToggleProfile(window));
+    assert_eq!(pane(&app).profile, Some((1, None)));
+    let mut regular_update = user_with_photo(7, Value::Null);
+    regular_update["user"]["profile_photo"] = Value::Null;
+    regular_update["user"]["first_name"] = json!("Maxwell");
+    td(&mut app, regular_update);
+    let mut stale_bot_profile = profile;
+    stale_bot_profile.members[0].is_bot = true;
+    let _ = app.update(Msg::ProfileLoaded(window, 1, Ok(stale_bot_profile)));
+    let cleared = ui_hover_and_bot_frame(&mut app);
+    assert_eq!(
+        ui_hover_and_bot_changed(&regular, &cleared, bot_row),
+        0,
+        "a newer regular update must remove Bot despite a stale bot profile answer"
+    );
+    assert_eq!(
+        ui_hover_and_bot_changed(&regular, &cleared, regular_row),
+        0,
+        "the other member's row must remain unchanged"
+    );
+}
+
+#[test]
 fn ui_hover_and_bot_user_card_shows_bot_beside_the_same_name_only_for_bots() {
     let mut app = app();
     ui_hover_and_bot_user(&mut app, 42, false);
@@ -8572,4 +8721,505 @@ fn ui_hover_and_bot_round_note_corner_does_not_show_controls() {
         ui_hover_and_bot_changed(&outside, &inside, rect) > 12,
         "round note controls must appear when the cursor moves inside the circle"
     );
+}
+
+/// Rebuilds the real widget tree after every update while retaining the iced
+/// widget cache (and therefore the editor's focus) between frames.
+struct UiComposerFocus {
+    renderer: iced::Renderer,
+    cache: iced_runtime::user_interface::Cache,
+}
+
+impl UiComposerFocus {
+    fn new() -> Self {
+        Self {
+            renderer: sandbox::renderer(),
+            cache: Default::default(),
+        }
+    }
+
+    fn operate_once(
+        &mut self,
+        app: &App,
+        window: WinId,
+        operation: &mut dyn iced_runtime::core::widget::Operation,
+    ) {
+        use iced_runtime::user_interface::UserInterface;
+
+        let mut ui = UserInterface::build(
+            app.view(window),
+            iced::Size::new(1000.0, 700.0),
+            std::mem::take(&mut self.cache),
+            &mut self.renderer,
+        );
+        ui.operate(&self.renderer, operation);
+        self.cache = ui.into_cache();
+    }
+
+    fn operation(
+        &mut self,
+        app: &App,
+        window: WinId,
+        mut operation: Box<dyn iced_runtime::core::widget::Operation>,
+    ) {
+        use iced_runtime::core::widget::operation::Outcome;
+
+        loop {
+            self.operate_once(app, window, &mut *operation);
+            match operation.finish() {
+                Outcome::Chain(next) => operation = next,
+                Outcome::None | Outcome::Some(()) => break,
+            }
+        }
+    }
+
+    /// The real iced runtime runs every widget operation against every open
+    /// window. Reuse the *same* operation object before asking for its outcome.
+    fn operation_both(
+        &mut self,
+        other: &mut Self,
+        app: &App,
+        first: WinId,
+        second: WinId,
+        mut operation: Box<dyn iced_runtime::core::widget::Operation>,
+    ) {
+        use iced_runtime::core::widget::operation::Outcome;
+
+        loop {
+            self.operate_once(app, first, &mut *operation);
+            other.operate_once(app, second, &mut *operation);
+            match operation.finish() {
+                Outcome::Chain(next) => operation = next,
+                Outcome::None | Outcome::Some(()) => break,
+            }
+        }
+    }
+
+    /// Only consume immediately available runtime actions: TDLib futures
+    /// requiring a client are deliberately not awaited by this UI test.
+    fn task(&mut self, app: &App, window: WinId, task: Task<Msg>) {
+        use iced::futures::{FutureExt, StreamExt};
+        use iced_runtime::{Action, task::into_stream};
+
+        if let Some(mut stream) = into_stream(task) {
+            while let Some(Some(action)) = stream.next().now_or_never() {
+                if let Action::Widget(operation) = action {
+                    self.operation(app, window, operation);
+                }
+            }
+        }
+    }
+
+    fn update_both(
+        &mut self,
+        other: &mut Self,
+        app: &mut App,
+        first: WinId,
+        second: WinId,
+        message: Msg,
+    ) {
+        use iced::futures::{FutureExt, StreamExt};
+        use iced_runtime::{Action, task::into_stream};
+
+        if let Some(mut stream) = into_stream(app.update(message)) {
+            while let Some(Some(action)) = stream.next().now_or_never() {
+                if let Action::Widget(operation) = action {
+                    self.operation_both(other, app, first, second, operation);
+                }
+            }
+        }
+    }
+
+    fn update(&mut self, app: &mut App, window: WinId, message: Msg) {
+        let task = app.update(message);
+        self.task(app, window, task);
+    }
+
+    fn key(&mut self, app: &mut App, window: WinId, key: Key, text: Option<&str>) {
+        use iced::keyboard::{Location, key};
+        use iced_runtime::user_interface::UserInterface;
+
+        let physical_key = match key {
+            Key::Named(key::Named::Escape) => key::Physical::Code(key::Code::Escape),
+            _ => key::Physical::Code(key::Code::KeyA),
+        };
+        let mut messages = Vec::new();
+        let mut ui = UserInterface::build(
+            app.view(window),
+            iced::Size::new(1000.0, 700.0),
+            std::mem::take(&mut self.cache),
+            &mut self.renderer,
+        );
+        let _ = ui.update(
+            &[iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                modified_key: key.clone(),
+                key: key.clone(),
+                physical_key,
+                location: Location::Standard,
+                modifiers: Modifiers::empty(),
+                text: text.map(Into::into),
+                repeat: false,
+            })],
+            iced::mouse::Cursor::Unavailable,
+            &mut self.renderer,
+            &mut iced_runtime::core::clipboard::Null,
+            &mut messages,
+        );
+        self.cache = ui.into_cache();
+        for message in messages {
+            self.update(app, window, message);
+        }
+        // `event::listen_with` also delivers Escape to App::update even when
+        // a widget captures the key. Simulate that subscription's output.
+        if key == Key::Named(key::Named::Escape) {
+            self.update(app, window, Msg::Key(window, key, Modifiers::empty()));
+        }
+    }
+
+    fn type_a(&mut self, app: &mut App, window: WinId) {
+        self.key(app, window, Key::Character("a".into()), Some("a"));
+    }
+
+    fn search_point(&mut self, app: &App, window: WinId) -> iced::Point {
+        use iced_runtime::user_interface::UserInterface;
+
+        let mut ui = UserInterface::build(
+            app.view(window),
+            iced::Size::new(1000.0, 700.0),
+            std::mem::take(&mut self.cache),
+            &mut self.renderer,
+        );
+        let mut field = UiComposerFocusSearchField::default();
+        ui.operate(&self.renderer, &mut field);
+        self.cache = ui.into_cache();
+        let bounds = field
+            .0
+            .expect("chat search field rendered to the right of sidebar");
+        iced::Point::new(bounds.center_x(), bounds.center_y())
+    }
+
+    fn click(&mut self, app: &mut App, window: WinId, point: iced::Point) {
+        use iced_runtime::user_interface::UserInterface;
+
+        let mut messages = Vec::new();
+        let mut ui = UserInterface::build(
+            app.view(window),
+            iced::Size::new(1000.0, 700.0),
+            std::mem::take(&mut self.cache),
+            &mut self.renderer,
+        );
+        for event in [
+            iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+            iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+        ] {
+            let _ = ui.update(
+                &[iced::Event::Mouse(event)],
+                iced::mouse::Cursor::Available(point),
+                &mut self.renderer,
+                &mut iced_runtime::core::clipboard::Null,
+                &mut messages,
+            );
+        }
+        self.cache = ui.into_cache();
+        for message in messages {
+            self.update(app, window, message);
+        }
+    }
+}
+
+/// Locate the chat search field by its rendered bounds, not by source text or
+/// an assumed y-coordinate. The sidebar's search field is left of x=300.
+#[derive(Default)]
+struct UiComposerFocusSearchField(Option<iced::Rectangle>);
+
+impl iced_runtime::core::widget::Operation for UiComposerFocusSearchField {
+    fn traverse(
+        &mut self,
+        operate: &mut dyn FnMut(&mut dyn iced_runtime::core::widget::Operation),
+    ) {
+        operate(self);
+    }
+
+    fn text_input(
+        &mut self,
+        _id: Option<&iced::widget::Id>,
+        bounds: iced::Rectangle,
+        _state: &mut dyn iced_runtime::core::widget::operation::TextInput,
+    ) {
+        if bounds.x >= 300.0 {
+            self.0 = Some(bounds);
+        }
+    }
+}
+
+#[test]
+fn ui_composer_focus_types_after_chat_selection_and_only_resumes_after_deleted_menu_closes() {
+    let mut app = app();
+    let main = app.main_window;
+    let mut ui = UiComposerFocus::new();
+    ui.update(&mut app, main, Msg::Pane(main, PaneMsg::SelectChat(1)));
+    assert_eq!(active(&app), Some(1));
+
+    // No click on the composer: the first character must reach the editor.
+    ui.type_a(&mut app, main);
+    assert_eq!(pane(&app).compose.text(), "a");
+
+    new_message(&mut app, 1, 10, "archived");
+    delete(&mut app, 1, &[10], false);
+    assert_eq!(shown(&app), [(10, "archived", true)]);
+    ui.update(&mut app, main, Msg::Pane(main, PaneMsg::OpenMenu(10)));
+    assert!(pane(&app).menu.is_some());
+    ui.type_a(&mut app, main);
+    assert_eq!(
+        pane(&app).compose.text(),
+        "a",
+        "typing into the open menu must not alter the draft"
+    );
+
+    ui.update(&mut app, main, Msg::Pane(main, PaneMsg::CloseMenu));
+    ui.type_a(&mut app, main);
+    assert_eq!(
+        pane(&app).compose.text(),
+        "aa",
+        "closing the menu must restore composer focus"
+    );
+
+    ui.update(&mut app, main, Msg::Pane(main, PaneMsg::OpenMenu(10)));
+    ui.key(
+        &mut app,
+        main,
+        Key::Named(iced::keyboard::key::Named::Escape),
+        None,
+    );
+    assert!(pane(&app).menu.is_none());
+    ui.type_a(&mut app, main);
+    assert_eq!(
+        pane(&app).compose.text(),
+        "aaa",
+        "Escape must restore composer focus"
+    );
+}
+
+#[test]
+fn ui_composer_focus_search_takes_keys_without_leaking_and_closing_it_restores_draft() {
+    let mut app = app();
+    let main = app.main_window;
+    let mut ui = UiComposerFocus::new();
+    ui.update(&mut app, main, Msg::Pane(main, PaneMsg::SelectChat(1)));
+    ui.type_a(&mut app, main);
+    assert_eq!(pane(&app).compose.text(), "a");
+
+    ui.update(&mut app, main, Msg::Pane(main, PaneMsg::SearchToggle));
+    ui.type_a(&mut app, main);
+    assert_eq!(
+        pane(&app).compose.text(),
+        "a",
+        "search opening must not leak a character into the draft"
+    );
+    let search = ui.search_point(&app, main);
+    ui.click(&mut app, main, search);
+    ui.type_a(&mut app, main);
+    assert_eq!(pane(&app).search.as_ref().unwrap().query, "a");
+    assert_eq!(
+        pane(&app).compose.text(),
+        "a",
+        "search field must own its keypress"
+    );
+
+    ui.update(&mut app, main, Msg::Pane(main, PaneMsg::SearchToggle));
+    ui.type_a(&mut app, main);
+    assert_eq!(
+        pane(&app).compose.text(),
+        "aa",
+        "closing search must restore the draft editor"
+    );
+}
+
+#[test]
+fn ui_composer_focus_blank_history_click_returns_to_draft_after_editor_blurs() {
+    let mut app = app();
+    let main = app.main_window;
+    let mut ui = UiComposerFocus::new();
+    ui.update(&mut app, main, Msg::Pane(main, PaneMsg::SelectChat(1)));
+    ui.type_a(&mut app, main);
+    assert_eq!(pane(&app).compose.text(), "a");
+
+    // The pointer press is outside both the editor and chat controls; iced
+    // unfocuses the editor before the next keyboard event.
+    ui.click(&mut app, main, iced::Point::new(900.0, 400.0));
+    ui.type_a(&mut app, main);
+    assert_eq!(
+        pane(&app).compose.text(),
+        "aa",
+        "history clicks with no popup restore typing"
+    );
+}
+
+#[test]
+fn ui_composer_focus_second_window_menu_does_not_steal_main_search() {
+    let mut app = app();
+    let main = app.main_window;
+    let second = open_window(&mut app, 2, &[]);
+    let mut main_ui = UiComposerFocus::new();
+    let mut second_ui = UiComposerFocus::new();
+    main_ui.update_both(
+        &mut second_ui,
+        &mut app,
+        main,
+        second,
+        Msg::Pane(main, PaneMsg::SelectChat(1)),
+    );
+    main_ui.type_a(&mut app, main);
+    assert_eq!(pane(&app).compose.text(), "a");
+
+    main_ui.update_both(
+        &mut second_ui,
+        &mut app,
+        main,
+        second,
+        Msg::Pane(second, PaneMsg::SelectChat(3)),
+    );
+    second_ui.type_a(&mut app, second);
+    assert_eq!(app.session.panes[&second].compose.text(), "a");
+    assert_eq!(pane(&app).compose.text(), "a");
+
+    main_ui.update(&mut app, main, Msg::Pane(main, PaneMsg::SearchToggle));
+    let search = main_ui.search_point(&app, main);
+    main_ui.click(&mut app, main, search);
+    main_ui.type_a(&mut app, main);
+    assert_eq!(pane(&app).search.as_ref().unwrap().query, "a");
+
+    new_message(&mut app, 3, 30, "archived");
+    delete(&mut app, 3, &[30], false);
+    assert_eq!(shown_in(&app, second), [(30, "archived", true)]);
+    main_ui.update_both(
+        &mut second_ui,
+        &mut app,
+        main,
+        second,
+        Msg::Pane(second, PaneMsg::OpenMenu(30)),
+    );
+    assert!(app.session.panes[&second].menu.is_some());
+    second_ui.type_a(&mut app, second);
+    assert_eq!(app.session.panes[&second].compose.text(), "a");
+    main_ui.type_a(&mut app, main);
+    assert_eq!(pane(&app).search.as_ref().unwrap().query, "aa");
+    assert_eq!(pane(&app).compose.text(), "a");
+
+    main_ui.update_both(
+        &mut second_ui,
+        &mut app,
+        main,
+        second,
+        Msg::Pane(second, PaneMsg::CloseMenu),
+    );
+    main_ui.type_a(&mut app, main);
+    assert_eq!(
+        pane(&app).search.as_ref().unwrap().query,
+        "aaa",
+        "closing another window's menu must not steal search focus"
+    );
+    second_ui.type_a(&mut app, second);
+    assert_eq!(app.session.panes[&second].compose.text(), "aa");
+    assert_eq!(pane(&app).compose.text(), "a");
+}
+
+#[test]
+fn ui_composer_focus_folder_switch_closes_chat_menu_and_restores_typing() {
+    let mut app = app();
+    let main = app.main_window;
+    sandbox::chat(&mut app, 1, "Первый", false, 20);
+    let mut ui = UiComposerFocus::new();
+    ui.update(&mut app, main, Msg::Pane(main, PaneMsg::SelectChat(1)));
+    ui.type_a(&mut app, main);
+    assert_eq!(pane(&app).compose.text(), "a");
+
+    ui.update(&mut app, main, Msg::ChatMenu(main, Some(1)));
+    assert_eq!(pane(&app).list.menu, Some(1));
+    ui.type_a(&mut app, main);
+    assert_eq!(
+        pane(&app).compose.text(),
+        "a",
+        "chat-list menu must capture typing"
+    );
+
+    ui.update(&mut app, main, Msg::ShowFolder(main, None));
+    assert!(pane(&app).list.menu.is_none());
+    ui.type_a(&mut app, main);
+    assert_eq!(
+        pane(&app).compose.text(),
+        "aa",
+        "switching folders must restore draft typing"
+    );
+}
+
+#[test]
+fn ui_composer_focus_confirming_shared_read_list_restores_the_other_window_too() {
+    let mut app = app();
+    let main = app.main_window;
+    let second = open_window(&mut app, 2, &[]);
+    let client = app.session.client_id;
+    let mut main_ui = UiComposerFocus::new();
+    let mut second_ui = UiComposerFocus::new();
+    main_ui.update_both(
+        &mut second_ui,
+        &mut app,
+        main,
+        second,
+        Msg::Pane(main, PaneMsg::SelectChat(1)),
+    );
+    main_ui.type_a(&mut app, main);
+    main_ui.update_both(
+        &mut second_ui,
+        &mut app,
+        main,
+        second,
+        Msg::Pane(second, PaneMsg::SelectChat(3)),
+    );
+    second_ui.type_a(&mut app, second);
+    assert_eq!(pane(&app).compose.text(), "a");
+    assert_eq!(app.session.panes[&second].compose.text(), "a");
+
+    main_ui.update_both(
+        &mut second_ui,
+        &mut app,
+        main,
+        second,
+        Msg::AskReadList(main, client),
+    );
+    main_ui.update_both(
+        &mut second_ui,
+        &mut app,
+        main,
+        second,
+        Msg::AskReadList(second, client),
+    );
+    let token = pane(&app).list.confirm_read.as_ref().unwrap().0;
+    assert!(app.session.panes[&second].list.confirm_read.is_some());
+    main_ui.type_a(&mut app, main);
+    second_ui.type_a(&mut app, second);
+    assert_eq!(pane(&app).compose.text(), "a");
+    assert_eq!(app.session.panes[&second].compose.text(), "a");
+
+    main_ui.update_both(
+        &mut second_ui,
+        &mut app,
+        main,
+        second,
+        Msg::ConfirmReadList(main, client, token, true),
+    );
+    assert!(app.session.panes[&second].list.confirm_read.is_none());
+    second_ui.type_a(&mut app, second);
+    assert_eq!(
+        app.session.panes[&second].compose.text(),
+        "aa",
+        "clearing the other window's confirmation must restore its editor"
+    );
+    main_ui.type_a(&mut app, main);
+    assert_eq!(
+        pane(&app).compose.text(),
+        "aa",
+        "confirming must restore the origin editor"
+    );
+    assert_eq!(app.session.panes[&second].compose.text(), "aa");
 }

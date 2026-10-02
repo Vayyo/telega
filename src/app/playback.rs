@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use iced::Task;
@@ -107,19 +109,47 @@ impl Playback {
     }
 }
 
-/// Frames of an animation file, paced by its timestamps and looped, as a
-/// stream for `Task::run`. Decoding runs on its own thread; dropping the
-/// stream (abort) stops it.
-fn frames(path: String, motion: Motion, w: u32, h: u32) -> impl Stream<Item = (u32, u32, Vec<u8>)> {
+/// A permit is acquired before the UI reports playback and stays in the OS
+/// thread even if the stream is hidden while native decoding is in progress.
+static ANIMATION_WORKERS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_ANIMATIONS)));
+
+/// The same admission path is used by animation decoding and controlled
+/// blocking worker tests. A refused (or unspawnable) worker never starts.
+pub(crate) fn spawn_animation_worker(
+    workers: &Arc<tokio::sync::Semaphore>,
+    work: impl FnOnce(Arc<AtomicBool>) + Send + 'static,
+) -> Option<Arc<AtomicBool>> {
+    let permit = Arc::clone(workers).try_acquire_owned().ok()?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    std::thread::Builder::new()
+        .name("animation-decoder".into())
+        .spawn(move || {
+            let _permit = permit;
+            work(worker_cancel);
+        })
+        .ok()?;
+    Some(cancel)
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Dropping the stream marks native decode canceled and closes the bounded
+/// frame receiver, waking a worker waiting to send.
+fn frames(
+    mut rx: tokio::sync::mpsc::Receiver<(u32, u32, Vec<u8>)>,
+    cancel: Arc<AtomicBool>,
+) -> impl Stream<Item = (u32, u32, Vec<u8>)> {
+    let guard = CancelOnDrop(cancel);
     iced::stream::channel(2, async move |mut out| {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u32, u32, Vec<u8>)>(2);
-        std::thread::spawn(move || {
-            let result = match motion {
-                Motion::Lottie => play_lottie(&path, w, h, &tx),
-                _ => play_video(&path, w, h, &tx),
-            };
-            let _ = result;
-        });
+        let _cancel = guard;
         while let Some(frame) = rx.recv().await {
             if out.send(frame).await.is_err() {
                 return;
@@ -130,40 +160,89 @@ fn frames(path: String, motion: Motion, w: u32, h: u32) -> impl Stream<Item = (u
 
 type FrameTx = tokio::sync::mpsc::Sender<(u32, u32, Vec<u8>)>;
 
-fn play_video(path: &str, w: u32, h: u32, tx: &FrameTx) -> Result<(), String> {
-    let mut stream = FrameStream::open(std::path::Path::new(path), w, h)?;
+fn canceled(cancel: &AtomicBool, tx: &FrameTx) -> bool {
+    cancel.load(Ordering::Relaxed) || tx.is_closed()
+}
+
+fn play_video(
+    path: &str,
+    w: u32,
+    h: u32,
+    tx: &FrameTx,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    if canceled(&cancel, tx) {
+        return Ok(());
+    }
+    let mut stream =
+        FrameStream::open_cancelable(std::path::Path::new(path), w, h, cancel.clone())?;
+    if canceled(&cancel, tx) {
+        return Ok(());
+    }
     loop {
+        if canceled(&cancel, tx) {
+            return Ok(());
+        }
         let start = Instant::now();
         let mut any = false;
-        while let Some(frame) = stream.next_frame()? {
+        loop {
+            if canceled(&cancel, tx) {
+                return Ok(());
+            }
+            let Some(frame) = stream.next_frame()? else {
+                break;
+            };
+            if canceled(&cancel, tx) {
+                return Ok(());
+            }
             any = true;
             // A broken timestamp must not freeze the animation for long.
             if let Some(wait) = frame.pts.checked_sub(start.elapsed()) {
                 std::thread::sleep(wait.min(Duration::from_secs(1)));
             }
-            if tx
-                .blocking_send((frame.width, frame.height, frame.rgba))
-                .is_err()
+            if canceled(&cancel, tx)
+                || tx
+                    .blocking_send((frame.width, frame.height, frame.rgba))
+                    .is_err()
             {
                 return Ok(());
             }
         }
-        if !any {
+        if !any || canceled(&cancel, tx) {
             return Ok(());
         }
         stream.rewind()?;
+        if canceled(&cancel, tx) {
+            return Ok(());
+        }
     }
 }
 
-fn play_lottie(path: &str, w: u32, h: u32, tx: &FrameTx) -> Result<(), String> {
+fn play_lottie(
+    path: &str,
+    w: u32,
+    h: u32,
+    tx: &FrameTx,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    if canceled(cancel, tx) {
+        return Ok(());
+    }
     let mut lottie = Lottie::open(std::path::Path::new(path))?;
+    if canceled(cancel, tx) {
+        return Ok(());
+    }
     let count = lottie.frame_count().max(1);
     let step = Duration::from_secs_f64(1.0 / lottie.frame_rate().clamp(1.0, 60.0));
     loop {
         for i in 0..count {
+            if canceled(cancel, tx) {
+                return Ok(());
+            }
             let started = Instant::now();
+            // Native rendering cannot be preempted; its permit remains held.
             let rgba = lottie.render(i, w, h);
-            if tx.blocking_send((w, h, rgba)).is_err() {
+            if canceled(cancel, tx) || tx.blocking_send((w, h, rgba)).is_err() {
                 return Ok(());
             }
             if let Some(rest) = step.checked_sub(started.elapsed()) {
@@ -403,6 +482,16 @@ impl App {
     }
 
     fn start_animation(&mut self, file_id: i32, motion: Motion) -> Task<Msg> {
+        self.start_animation_with_workers(file_id, motion, &ANIMATION_WORKERS)
+    }
+
+    /// Admission path shared by the UI and controlled local-pool tests.
+    pub(crate) fn start_animation_with_workers(
+        &mut self,
+        file_id: i32,
+        motion: Motion,
+        workers: &Arc<tokio::sync::Semaphore>,
+    ) -> Task<Msg> {
         if self.session.playback.anims.len() >= MAX_ANIMATIONS {
             return Task::none();
         }
@@ -416,7 +505,16 @@ impl App {
                 (super::media::PHOTO_MAX_H * 2.0) as u32,
             ),
         };
-        let (task, stop) = Task::run(frames(path, motion, w, h), move |(fw, fh, rgba)| {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let Some(cancel) = spawn_animation_worker(workers, move |cancel| {
+            let _ = match motion {
+                Motion::Lottie => play_lottie(&path, w, h, &tx, &cancel),
+                _ => play_video(&path, w, h, &tx, cancel),
+            };
+        }) else {
+            return Task::none();
+        };
+        let (task, stop) = Task::run(frames(rx, cancel), move |(fw, fh, rgba)| {
             Msg::AnimFrame(file_id, fw, fh, rgba)
         })
         // Runs only if the stream above ends by itself (broken/empty
@@ -617,5 +715,90 @@ mod frame_tests {
         // panic or an extra removal.
         app.animation_ended(100);
         assert_eq!(app.session.playback.anims.len(), MAX_ANIMATIONS - 1);
+    }
+
+    #[test]
+    fn security_fix_hidden_animation_workers_hold_all_slots_until_native_decode_exits() {
+        use std::sync::mpsc;
+
+        let workers = Arc::new(tokio::sync::Semaphore::new(MAX_ANIMATIONS));
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut cancellations = Vec::new();
+        for id in 0..MAX_ANIMATIONS {
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let started_tx = started_tx.clone();
+            let cancel = spawn_animation_worker(&workers, move |_| {
+                started_tx.send(id).unwrap();
+                // Simulates a native decode that cannot notice cancellation
+                // until it returns; the slot must remain occupied meanwhile.
+                let _ = release_rx.recv();
+            })
+            .expect("a free decoder slot admits an animation");
+            releases.push(release_tx);
+            cancellations.push(cancel);
+        }
+        for _ in 0..MAX_ANIMATIONS {
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("admitted native worker starts");
+        }
+
+        for cancel in &cancellations {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        assert_eq!(workers.available_permits(), 0);
+        assert!(
+            spawn_animation_worker(&workers, |_| panic!("refused worker must not run")).is_none(),
+            "canceling a UI stream cannot admit a fourth native worker"
+        );
+
+        let mut app = crate::app::tests::app();
+        app.session.files.insert(
+            44,
+            super::super::media::FileState {
+                path: "not-opened-when-admission-is-refused".into(),
+                done: true,
+                ..Default::default()
+            },
+        );
+        let _ = app.start_animation_with_workers(44, Motion::Video, &workers);
+        assert!(
+            !app.session.playback.playing(44),
+            "refused animation must never be reported as playing"
+        );
+
+        releases.remove(0).send(()).unwrap();
+        let start = Instant::now();
+        while workers.available_permits() == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "finished native worker did not release its slot"
+            );
+            std::thread::yield_now();
+        }
+        let (replacement_tx, replacement_rx) = mpsc::channel();
+        let replacement = spawn_animation_worker(&workers, move |_| {
+            replacement_tx.send(()).unwrap();
+        });
+        assert!(
+            replacement.is_some(),
+            "a completed native worker frees admission"
+        );
+        replacement_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replacement worker actually starts");
+        // Dropping the remaining gates releases their workers even if a
+        // subsequent assertion fails; no worker leaks into another test.
+        drop(releases);
+        let start = Instant::now();
+        while workers.available_permits() != MAX_ANIMATIONS {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "native worker did not relinquish its slot"
+            );
+            std::thread::yield_now();
+        }
     }
 }

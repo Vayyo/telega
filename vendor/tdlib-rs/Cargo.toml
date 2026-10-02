@@ -105,6 +105,9 @@ optional = true
 version = "8"
 optional = true
 
+[dependencies.zeroize]
+version = "1"
+
 [dev-dependencies.tokio]
 version = "1"
 features = [
