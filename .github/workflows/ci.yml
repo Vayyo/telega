@@ -29,7 +29,20 @@ jobs:
           JOBS: "2"
         run: scripts/build-tdlib.sh
       - name: Test
-        run: cargo test --locked --all-targets
+        run: |
+          log="$RUNNER_TEMP/telega-test.log"
+          if cargo test --locked --all-targets >"$log" 2>&1; then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            report="$(tail -c 14000 "$log")"
+            report="${report//'%'/'%25'}"
+            report="${report//$'\r'/'%0D'}"
+            report="${report//$'\n'/'%0A'}"
+            printf '::error title=Cargo test failure::%s\n' "$report"
+            exit "$status"
+          fi
       - name: Native boundary regressions
         run: bash scripts/security-observer-probe.sh
       - name: Clippy
