@@ -5089,7 +5089,12 @@ fn collapsed_archive_remains_reachable_after_back_in_secondary_window() {
         .unwrap();
     let _ = app.update(Msg::SetArchiveCollapsed(secondary, client, true));
     let _ = app.update(Msg::ShowArchive(secondary, false));
-    let entry = sandbox::click(&mut app, secondary, iced::Point::new(80.0, 90.0));
+    let entry = sandbox::click_matching(
+        &mut app,
+        secondary,
+        sandbox::SIZE,
+        |msg| matches!(msg, Msg::ShowArchive(window, true) if *window == secondary),
+    );
     assert!(
         entry
             .iter()

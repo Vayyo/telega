@@ -25,6 +25,49 @@ pub(super) fn click(app: &mut App, window: WinId, position: iced::Point) -> Vec<
     click_sized(app, window, SIZE, position)
 }
 
+/// Finds a real pointer hit area without applying probe messages to the app.
+pub(super) fn click_matching(
+    app: &mut App,
+    window: WinId,
+    size: Size,
+    matches: impl Fn(&Msg) -> bool,
+) -> Vec<Msg> {
+    let mut renderer = renderer();
+    let position = [550.0, 430.0, 380.0, 950.0, 900.0, 80.0]
+        .into_iter()
+        .filter(|&x| x < size.width)
+        .flat_map(|x| {
+            (0..size.height as u32)
+                .step_by(5)
+                .map(move |y| iced::Point::new(x, y as f32))
+        })
+        .find(|&position| {
+            let mut messages = Vec::new();
+            let mut ui =
+                UserInterface::build(app.view(window), size, Cache::default(), &mut renderer);
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                let _ = ui.update(
+                    &[iced::Event::Mouse(event)],
+                    mouse::Cursor::Available(position),
+                    &mut renderer,
+                    &mut iced_runtime::core::clipboard::Null,
+                    &mut messages,
+                );
+            }
+            messages.iter().any(&matches)
+        })
+        .expect("visible control pointer hit area");
+    let messages = click_sized(app, window, size, position);
+    assert!(
+        messages.iter().any(matches),
+        "pointer dispatched expected message"
+    );
+    messages
+}
+
 /// A real pointer click at a scene's size (also used for narrow layouts).
 fn click_sized(app: &mut App, window: WinId, size: Size, position: iced::Point) -> Vec<Msg> {
     let mut renderer = renderer();
@@ -337,7 +380,7 @@ fn window_of(app: &App) -> WinId {
     app.main_window
 }
 
-const SIZE: Size = Size::new(1000.0, 700.0);
+pub(super) const SIZE: Size = Size::new(1000.0, 700.0);
 
 fn scene(name: &str, app: &mut App) -> std::path::PathBuf {
     scene_sized(name, app, SIZE)
@@ -1158,49 +1201,11 @@ fn sandbox_settings_categories() {
     use super::session::SettingsSection;
 
     const SETTINGS_SIZE: Size = Size::new(1000.0, 900.0);
-    fn click_matching(app: &mut App, window: WinId, matches: impl Fn(&Msg) -> bool) {
-        let mut renderer = renderer();
-        let position = [550.0, 430.0, 380.0, 950.0, 900.0]
-            .into_iter()
-            .flat_map(|x| {
-                (50..850)
-                    .step_by(5)
-                    .map(move |y| iced::Point::new(x, y as f32))
-            })
-            .find(|&position| {
-                let mut messages = Vec::new();
-                let mut ui = UserInterface::build(
-                    app.view(window),
-                    SETTINGS_SIZE,
-                    Cache::default(),
-                    &mut renderer,
-                );
-                for event in [
-                    mouse::Event::ButtonPressed(mouse::Button::Left),
-                    mouse::Event::ButtonReleased(mouse::Button::Left),
-                ] {
-                    let _ = ui.update(
-                        &[iced::Event::Mouse(event)],
-                        mouse::Cursor::Available(position),
-                        &mut renderer,
-                        &mut iced_runtime::core::clipboard::Null,
-                        &mut messages,
-                    );
-                }
-                messages.iter().any(&matches)
-            })
-            .expect("visible settings control pointer hit area");
-        assert!(
-            click_sized(app, window, SETTINGS_SIZE, position)
-                .iter()
-                .any(matches),
-            "pointer dispatched expected settings message"
-        );
-    }
     fn click_category(app: &mut App, window: WinId, section: SettingsSection) {
         click_matching(
             app,
             window,
+            SETTINGS_SIZE,
             |msg| matches!(msg, Msg::ToggleSettingsSection(value) if *value as usize == section as usize),
         );
     }
@@ -1224,6 +1229,7 @@ fn sandbox_settings_categories() {
     click_matching(
         &mut app,
         window,
+        SETTINGS_SIZE,
         |msg| matches!(msg, Msg::SetKeepDeleted(value) if *value != keep_deleted),
     );
     assert_ne!(app.settings.keep_deleted, keep_deleted);
@@ -1233,6 +1239,7 @@ fn sandbox_settings_categories() {
     click_matching(
         &mut app,
         window,
+        SETTINGS_SIZE,
         |msg| matches!(msg, Msg::SetCachePolicy(limits) if limits.bytes != cache.bytes),
     );
     assert_ne!(app.settings.cache.bytes, cache.bytes);
@@ -1245,11 +1252,11 @@ fn sandbox_settings_categories() {
     assert!(app.session.settings_expanded[SettingsSection::Storage as usize]);
     click_category(&mut app, window, SettingsSection::Storage);
     click_category(&mut app, window, SettingsSection::Plugins);
-    click_matching(&mut app, window, |msg| {
+    click_matching(&mut app, window, SETTINGS_SIZE, |msg| {
         matches!(msg, Msg::OpenPluginHelp(true))
     });
     assert!(app.session.plugin_help_open);
-    click_matching(&mut app, window, |msg| {
+    click_matching(&mut app, window, SETTINGS_SIZE, |msg| {
         matches!(msg, Msg::OpenPluginHelp(false))
     });
     assert!(!app.session.plugin_help_open);
