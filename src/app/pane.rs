@@ -5,11 +5,14 @@ use std::collections::{HashMap, HashSet};
 
 use iced::widget::Id;
 
-use super::{Menu, MsgItem};
+use super::{Menu, MsgItem, extra, media, rich};
 use crate::td;
+use tdlib_rs::types::Message;
 
 /// Gap between messages in the history column, px.
 pub(crate) const SPACING: f32 = 6.0;
+/// Fixed height of the loading label in the history column.
+pub(crate) const LOADING_ROW_HEIGHT: f32 = 16.0;
 /// Height kept free under the history (`view_history`) for the
 /// "печатает…" line; the bottom-anchored scrollable counts it as content,
 /// so scroll-to-message math below must include it too.
@@ -20,9 +23,60 @@ pub(crate) const HISTORY_PADDING: f32 = 4.0;
 /// Assumed viewport before the scrollable has reported its size.
 const DEFAULT_VIEW: (f32, f32) = (1400.0, 800.0);
 
+/// A reading position survives replacement of a history page and resizing.
+#[derive(Clone, Copy)]
+pub(crate) struct HistoryAnchor {
+    pub(crate) id: i64,
+    pub(crate) delta: f32,
+}
+
+/// Only mutations observed during this occupancy's history request need
+/// replay: TDLib may return a page captured before its update reached us.
+pub(crate) struct ColdContent {
+    pub(crate) text: String,
+    pub(crate) rich: Vec<rich::Piece>,
+    pub(crate) media: Option<media::Media>,
+    pub(crate) extra: Option<Box<extra::Extra>>,
+}
+
+#[derive(Default)]
+pub(crate) struct ColdChange {
+    pub(crate) content: Option<ColdContent>,
+    pub(crate) deleted: Option<bool>,
+    pub(crate) purged: bool,
+    pub(crate) edited: Option<bool>,
+    pub(crate) reactions: Option<Vec<super::Reaction>>,
+}
+
+/// A released tab is distinct from a chat that has never loaded its first page.
+pub(crate) struct ColdHistory {
+    pub(crate) anchor: Option<HistoryAnchor>,
+    /// Fresh for each occupancy, including failed requests and revisits.
+    pub(crate) request: Option<u64>,
+    pub(crate) changes: HashMap<i64, ColdChange>,
+    /// IDs retained for operations before this request began must not
+    /// overwrite authoritative content in the returned page.
+    pub(crate) preexisting: HashSet<i64>,
+    /// Too many distinct changes for one bounded page; refetch it.
+    pub(crate) overflowed: bool,
+    /// One bounded page waits for an authoritative by-ID read after overflow.
+    pub(crate) pending_page: Option<Vec<Message>>,
+    pub(crate) verified_ids: HashSet<i64>,
+}
+
 pub(crate) struct ChatPane {
     pub(crate) chat_id: Option<i64>,
+    /// Latest initial-history request for this pane occupancy.
+    pub(crate) history_request: Option<u64>,
+    /// Set only while this pane resides in the background tab map.
+    pub(crate) inactive_since: Option<std::time::Instant>,
+    pub(crate) cold: Option<ColdHistory>,
+    /// Keep correcting the restored row while the renderer measures its page.
+    pub(crate) restoring_anchor: Option<HistoryAnchor>,
     pub(crate) messages: Vec<MsgItem>,
+    /// Operation-owned records outside the fetched page, never part of its
+    /// scrolling or pagination range.
+    pub(crate) held_messages: Vec<MsgItem>,
     /// Draft; every window keeps its own. Multi-line: Shift+Enter breaks
     /// the line, Enter sends.
     pub(crate) compose: iced::widget::text_editor::Content,
@@ -56,6 +110,12 @@ pub(crate) struct ChatPane {
     pub(crate) highlight: Option<i64>,
     /// Text selected in a message with the mouse.
     pub(crate) text_selection: Option<TextSelection>,
+    /// A rectangle begun on unused history background (content coordinates).
+    pub(crate) rectangle: Option<RectangleSelection>,
+    /// Last eligible bubble press for a same-message double click.
+    pub(crate) last_bubble_press: Option<(i64, std::time::Instant)>,
+    /// A second press becomes a reply only after a matching release without drag.
+    pub(crate) pending_reply: Option<i64>,
     /// Emoji and sticker panel above the input field.
     pub(crate) picker: Option<super::picker::Tab>,
     /// Profile panel: the chat and, once loaded, its details.
@@ -114,7 +174,12 @@ impl Default for ChatPane {
     fn default() -> Self {
         Self {
             chat_id: None,
+            history_request: None,
             messages: Vec::new(),
+            held_messages: Vec::new(),
+            inactive_since: None,
+            cold: None,
+            restoring_anchor: None,
             compose: iced::widget::text_editor::Content::new(),
             root_id: Id::unique(),
             compose_id: Id::unique(),
@@ -141,6 +206,9 @@ impl Default for ChatPane {
             confirm_leave: false,
             picker: None,
             text_selection: None,
+            rectangle: None,
+            last_bubble_press: None,
+            pending_reply: None,
             delete_selection: None,
             pinned_shown: 0,
             unread_after: None,
@@ -242,6 +310,8 @@ pub(crate) struct ListSearch {
     pub(crate) archive: bool,
     /// Telegram folder shown instead of all chats.
     pub(crate) folder: Option<i32>,
+    /// Existing folder reorder and request feedback controls in this window.
+    pub(crate) folder_settings_open: bool,
     /// Archive settings replace this window's chat pane, not its chat list.
     pub(crate) archive_settings: Option<ArchiveSettings>,
     /// One confirmation for this window and the list selected when it opened.
@@ -275,6 +345,7 @@ impl Default for ListSearch {
             archive: false,
             archive_settings: None,
             folder: None,
+            folder_settings_open: false,
             confirm_read: None,
             read_feedback: None,
             menu: None,
@@ -347,6 +418,14 @@ pub(crate) struct TextSelection {
     pub(crate) dragging: bool,
 }
 
+/// The preview is committed only when the left button is released.
+#[derive(Debug, Clone)]
+pub(crate) struct RectangleSelection {
+    pub(crate) anchor: iced::Point,
+    pub(crate) focus: iced::Point,
+    pub(crate) hits: std::collections::BTreeSet<i64>,
+}
+
 impl ChatPane {
     /// The selected text, if something is selected.
     pub(crate) fn selected_text(&self) -> Option<String> {
@@ -417,6 +496,194 @@ impl ChatPane {
         };
     }
 
+    /// Pick the row nearest the viewport's reading reference, rather than
+    /// saving a pixel offset into a page that will no longer exist.
+    fn reading_anchor(&self) -> Option<HistoryAnchor> {
+        let scroll = self.scroll?.y;
+        if scroll <= 2.0 {
+            return None;
+        }
+        let (height, width) = self.view_size.unwrap_or(DEFAULT_VIEW);
+        let mut from_bottom = self.bottom_room();
+        let mut nearest = None;
+        for message in self.messages.iter().rev() {
+            let row = self.height_of(message, width) + SPACING;
+            let center = (from_bottom + row / 2.0 - height / 2.0).max(0.0);
+            let distance = (scroll - center).abs();
+            if nearest.is_none_or(|(_, best)| distance < best) {
+                nearest = Some((message.id, distance));
+            }
+            from_bottom += row;
+        }
+        nearest.and_then(|(id, _)| {
+            self.offset_of(id).map(|center| HistoryAnchor {
+                id,
+                delta: scroll - center,
+            })
+        })
+    }
+
+    /// Release confirmed history and backing allocations, retaining only
+    /// unsent messages and records used by a current explicit operation.
+    pub(crate) fn make_cold(&mut self) {
+        let anchor = self.reading_anchor();
+        let selected = self.selected.as_ref();
+        let forward = self.forward.as_ref();
+        let editing = self.editing.as_ref().map(|(id, _)| *id);
+        self.messages.retain(|m| {
+            m.pending
+                || m.failed
+                || selected.is_some_and(|ids| ids.contains(&m.id))
+                || forward.is_some_and(|(ids, _)| ids.contains(&m.id))
+                || editing == Some(m.id)
+                || self.reply_to == Some(m.id)
+        });
+        self.messages.shrink_to_fit();
+        self.trim_held_messages();
+        self.scroll = None;
+        self.heights = HashMap::new();
+        self.oldest_loaded = None;
+        self.history_request = None;
+        self.history_complete = false;
+        self.newest_loaded = false;
+        self.loading_older = false;
+        self.loading_newer = false;
+        self.jump_pending = None;
+        self.restoring_anchor = None;
+        self.cold = Some(ColdHistory {
+            anchor,
+            request: None,
+            changes: HashMap::new(),
+            preexisting: HashSet::new(),
+            overflowed: false,
+            pending_page: None,
+            verified_ids: HashSet::new(),
+        });
+    }
+
+    /// Only visible cold restore requests retain changes, at most one page's
+    /// distinct IDs. Background tabs do not accumulate update payloads.
+    pub(crate) fn cold_change(&mut self, id: i64) -> Option<&mut ColdChange> {
+        let cold = self.cold.as_mut().filter(|cold| cold.request.is_some())?;
+        if cold.pending_page.is_some() && !cold.verified_ids.contains(&id) {
+            return None;
+        }
+        if cold.overflowed {
+            return None;
+        }
+        if !cold.changes.contains_key(&id) && cold.changes.len() == td::HISTORY_LIMIT {
+            cold.changes.clear();
+            cold.overflowed = true;
+            return None;
+        }
+        Some(cold.changes.entry(id).or_default())
+    }
+
+    /// A completed send kept solely because it was pending can leave on the
+    /// next sweep, while explicit selection/edit/reply operations still win.
+    pub(crate) fn trim_cold_records(&mut self) {
+        self.messages.retain(|m| {
+            m.pending
+                || m.failed
+                || self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&m.id))
+                || self
+                    .forward
+                    .as_ref()
+                    .is_some_and(|(ids, _)| ids.contains(&m.id))
+                || self.editing.as_ref().is_some_and(|(id, _)| *id == m.id)
+                || self.reply_to == Some(m.id)
+        });
+        self.messages.shrink_to_fit();
+        self.trim_held_messages();
+    }
+
+    fn trim_held_messages(&mut self) {
+        self.held_messages.retain(|m| {
+            m.pending
+                || m.failed
+                || self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&m.id))
+                || self
+                    .forward
+                    .as_ref()
+                    .is_some_and(|(ids, _)| ids.contains(&m.id))
+                || self.editing.as_ref().is_some_and(|(id, _)| *id == m.id)
+                || self.reply_to == Some(m.id)
+        });
+        self.held_messages.shrink_to_fit();
+    }
+
+    /// A scroll that differs from the last requested correction is a user
+    /// movement (or an unreachable/clamped offset); stop tracking the row.
+    pub(crate) fn cold_scrolled(&mut self, actual: iced::widget::scrollable::AbsoluteOffset) {
+        if self
+            .restoring_anchor
+            .is_some_and(|anchor| self.heights.contains_key(&anchor.id))
+            && self
+                .scroll
+                .is_some_and(|requested| (requested.y - actual.y).abs() > 2.0)
+        {
+            self.restoring_anchor = None;
+        }
+    }
+
+    /// Content below the newest bubble participates in every bottom-anchored
+    /// offset, including a transient newer-page loading label.
+    fn bottom_room(&self) -> f32 {
+        TYPING_ROOM
+            + HISTORY_PADDING
+            + if self.loading_newer {
+                LOADING_ROW_HEIGHT + SPACING
+            } else {
+                0.0
+            }
+    }
+
+    pub(crate) fn cold_realign(&mut self) -> Option<iced::widget::scrollable::AbsoluteOffset> {
+        let anchor = self.restoring_anchor?;
+        let target = (self.offset_of(anchor.id)? + anchor.delta).max(0.0);
+        let offset = iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target };
+        self.scroll = Some(offset);
+        Some(offset)
+    }
+
+    /// Keep the same message-relative viewport reference when iced changes
+    /// layout dimensions without a user scroll gesture.
+    pub(crate) fn cold_resized(
+        &mut self,
+        size: (f32, f32),
+    ) -> Option<iced::widget::scrollable::AbsoluteOffset> {
+        self.restoring_anchor?;
+        if self.view_size.is_some_and(|(_, width)| width != size.1) {
+            self.heights.clear();
+        }
+        self.view_size = Some(size);
+        self.cold_realign()
+    }
+
+    /// A row's actual height may arrive only after the first redraw.
+    pub(crate) fn cold_measured(
+        &mut self,
+        id: i64,
+        height: f32,
+    ) -> Option<iced::widget::scrollable::AbsoluteOffset> {
+        let old = self.heights.insert(id, height);
+        if old == Some(height) {
+            return None;
+        }
+        let previous = self.scroll.map_or(0.0, |s| s.y);
+        let offset = self.cold_realign()?;
+        if (previous - offset.y).abs() < 0.5 {
+            return None;
+        }
+        Some(offset)
+    }
+
     /// Scroll offset (from the bottom, as the history is anchored) that
     /// brings message `id` to the middle of the viewport.
     pub(crate) fn offset_of(&self, id: i64) -> Option<f32> {
@@ -424,7 +691,7 @@ impl ChatPane {
         // The bottom-anchored column reserves this much space under the
         // newest message (typing room, then the column's own padding), so a
         // message is never really flush with the scrollable's bottom edge.
-        let mut from_bottom = TYPING_ROOM + HISTORY_PADDING;
+        let mut from_bottom = self.bottom_room();
         for m in self.messages.iter().rev() {
             let h = self.height_of(m, width) + SPACING;
             if m.id == id {
@@ -433,6 +700,22 @@ impl ChatPane {
             from_bottom += h;
         }
         None
+    }
+
+    /// A hidden tab drops its in-flight newer request and its loading row.
+    /// Translate the saved offset into the footer-free page before the
+    /// five-minute anchor is captured, or the nearest row can change.
+    pub(crate) fn pause_newer_loading(&mut self) {
+        if !self.loading_newer {
+            return;
+        }
+        self.loading_newer = false;
+        if self.restoring_anchor.is_some() && self.cold_realign().is_some() {
+            return;
+        }
+        if let Some(scroll) = &mut self.scroll {
+            scroll.y = (scroll.y - LOADING_ROW_HEIGHT - SPACING).max(0.0);
+        }
     }
 
     /// Appends a page of newer history (after a jump), skipping duplicates.
@@ -473,7 +756,7 @@ impl ChatPane {
         // Distance from the bottom of the list (including the reserved
         // typing room and padding below the newest message) to the bottom
         // of message `i`.
-        let mut from_bottom = TYPING_ROOM + HISTORY_PADDING;
+        let mut from_bottom = self.bottom_room();
         for (i, m) in self.messages.iter().enumerate().rev() {
             let h = self.height_of(m, width) + SPACING;
             if from_bottom + h < low {
@@ -529,7 +812,7 @@ impl ChatPane {
     }
 
     pub(crate) fn mark_deleted(&mut self, ids: &[i64]) {
-        for item in &mut self.messages {
+        for item in self.messages.iter_mut().chain(&mut self.held_messages) {
             if ids.contains(&item.id) {
                 item.deleted = true;
             }
@@ -538,10 +821,14 @@ impl ChatPane {
 
     pub(crate) fn remove(&mut self, ids: &[i64]) {
         self.messages.retain(|m| !ids.contains(&m.id));
+        self.held_messages.retain(|m| !ids.contains(&m.id));
     }
 
     pub(crate) fn find_mut(&mut self, id: i64) -> Option<&mut MsgItem> {
-        self.messages.iter_mut().find(|m| m.id == id)
+        self.messages
+            .iter_mut()
+            .chain(&mut self.held_messages)
+            .find(|m| m.id == id)
     }
 }
 

@@ -1,0 +1,94 @@
+diff --git a/tdnet/td/net/GetHostByNameActor.cpp b/tdnet/td/net/GetHostByNameActor.cpp
+--- a/tdnet/td/net/GetHostByNameActor.cpp
++++ b/tdnet/td/net/GetHostByNameActor.cpp
+@@ -32,6 +32,7 @@ class GoogleDnsResolver final : public Actor {
+   bool prefer_ipv6_;
+   Promise<IPAddress> promise_;
+   ActorOwn<Wget> wget_;
++  bool querying_ipv4_fallback_ = false;
+   double begin_time_ = 0;
+ 
+   void start_up() final {
+@@ -41,35 +42,47 @@ class GoogleDnsResolver final : public Actor {
+       return stop();
+     }
+ 
+-    const int timeout = 10;
+-    const int ttl = 0;
+     begin_time_ = Time::now();
++    query(prefer_ipv6_);
++  }
++
++  void query(bool ipv6) {
++    const int timeout = 10;
++    const int ttl = 0;
+     auto wget_promise = PromiseCreator::lambda([actor_id = actor_id(this)](Result<unique_ptr<HttpQuery>> r_http_query) {
+       send_closure(actor_id, &GoogleDnsResolver::on_result, std::move(r_http_query));
+     });
+     wget_ = create_actor<Wget>(
+         "GoogleDnsResolver", std::move(wget_promise),
+-        PSTRING() << "https://dns.google/resolve?name=" << url_encode(host_) << "&type=" << (prefer_ipv6_ ? 28 : 1),
+-        std::vector<std::pair<string, string>>({{"Host", "dns.google"}}), timeout, ttl, prefer_ipv6_,
++        PSTRING() << "https://dns.google/resolve?name=" << url_encode(host_) << "&type=" << (ipv6 ? 28 : 1),
++        std::vector<std::pair<string, string>>({{"Host", "dns.google"}}), timeout, ttl, ipv6,
+         SslCtx::VerifyPeer::On);
+   }
+ 
+-  static Result<IPAddress> get_ip_address(Result<unique_ptr<HttpQuery>> r_http_query) {
++  static Result<IPAddress> get_ip_address(Result<unique_ptr<HttpQuery>> r_http_query, int32 requested_type) {
+     TRY_RESULT(http_query, std::move(r_http_query));
+ 
+-    auto get_ip_address = [](JsonValue &answer) -> Result<IPAddress> {
+-      auto &array = answer.get_array();
+-      if (array.empty()) {
+-        return Status::Error("Failed to parse DNS result: Answer is an empty array");
+-      }
+-      if (array[0].type() != JsonValue::Type::Object) {
+-        return Status::Error("Failed to parse DNS result: Answer[0] is not an object");
++    auto get_ip_address = [requested_type](JsonValue &answer) -> Result<IPAddress> {
++      for (auto &entry : answer.get_array()) {
++        if (entry.type() != JsonValue::Type::Object) {
++          continue;
++        }
++        auto &record = entry.get_object();
++        auto r_type = record.get_required_int_field("type");
++        if (r_type.is_error() || r_type.ok() != requested_type) {
++          continue;
++        }
++        auto r_data = record.get_required_string_field("data");
++        if (r_data.is_error()) {
++          continue;
++        }
++        IPAddress ip;
++        auto status = requested_type == 28 ? ip.init_ipv6_port(r_data.ok(), 1) : ip.init_ipv4_port(r_data.ok(), 1);
++        if (status.is_ok()) {
++          return ip;
++        }
+       }
+-      auto &answer_0 = array[0].get_object();
+-      TRY_RESULT(ip_str, answer_0.get_required_string_field("data"));
+-      IPAddress ip;
+-      TRY_STATUS(ip.init_host_port(ip_str, 0));
+-      return ip;
++      return Status::Error("Failed to parse DNS result: no valid address record of requested type");
+     };
+     if (!http_query->get_arg("Answer").empty()) {
+       TRY_RESULT(answer, json_decode(http_query->get_arg("Answer")));
+@@ -89,9 +102,15 @@ class GoogleDnsResolver final : public Actor {
+   }
+ 
+   void on_result(Result<unique_ptr<HttpQuery>> r_http_query) {
++    auto result = get_ip_address(std::move(r_http_query), prefer_ipv6_ && !querying_ipv4_fallback_ ? 28 : 1);
++    if (result.is_error() && prefer_ipv6_ && !querying_ipv4_fallback_) {
++      querying_ipv4_fallback_ = true;
++      wget_.reset();
++      query(false);
++      return;
++    }
+     auto end_time = Time::now();
+-    auto result = get_ip_address(std::move(r_http_query));
+-    VLOG(dns_resolver) << "Init IPv" << (prefer_ipv6_ ? "6" : "4") << " host = " << host_ << " in "
++    VLOG(dns_resolver) << "Init IPv" << (prefer_ipv6_ && !querying_ipv4_fallback_ ? "6" : "4") << " host = " << host_ << " in "
+                        << end_time - begin_time_ << " seconds to "
+                        << (result.is_ok() ? (PSLICE() << result.ok()) : CSlice("[invalid]"));
+     promise_.set_result(std::move(result));

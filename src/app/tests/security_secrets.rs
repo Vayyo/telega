@@ -144,6 +144,259 @@ fn security_fix_password_apply_without_a_previous_account_can_create_its_first_a
 }
 
 #[test]
+fn security_weak_pin_is_rejected_before_derivation() {
+    let mut app = app();
+    drop(app.update(Msg::Password(PasswordMsg::New("1234".into()))));
+    drop(app.update(Msg::Password(PasswordMsg::Repeat("1234".into()))));
+
+    let task = app.update(Msg::Password(PasswordMsg::Apply { remove: false }));
+
+    assert!(
+        into_stream(task).is_none(),
+        "a four-character PIN must not schedule key derivation"
+    );
+    assert!(!app.session.password_form.busy);
+    assert!(matches!(
+        &app.session.password_form.message,
+        Some(Err(error)) if error.contains("12")
+    ));
+    assert_eq!(app.session.db_key, None);
+}
+
+#[test]
+fn security_new_password_boundary_is_twelve_characters() {
+    for (password, accepted) in [("12345678901", false), ("123456789012", true)] {
+        let mut app = app();
+        drop(app.update(Msg::Password(PasswordMsg::New(password.into()))));
+        drop(app.update(Msg::Password(PasswordMsg::Repeat(password.into()))));
+        let task = app.update(Msg::Password(PasswordMsg::Apply { remove: false }));
+        assert_eq!(
+            into_stream(task).is_some(),
+            accepted,
+            "new password boundary: {password}"
+        );
+        assert_eq!(app.session.password_form.busy, accepted);
+    }
+}
+
+/// Owns only the synthetic slot and archive obstruction under the test data root.
+struct ResetFailurePaths {
+    slot_dir: std::path::PathBuf,
+    archive: std::path::PathBuf,
+}
+
+impl ResetFailurePaths {
+    fn new() -> (Self, u32, i64) {
+        let accounts = crate::paths::base().join("accounts");
+        std::fs::create_dir_all(&accounts).unwrap();
+        let mut slot = 1_000_000;
+        let slot_dir = loop {
+            let path = crate::paths::account_dir(slot);
+            match std::fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => slot += 1,
+                Err(error) => panic!("cannot reserve synthetic account slot: {error}"),
+            }
+        };
+        let mut user_id = 1_000_000_000_000_i64;
+        let archive = loop {
+            let path = crate::paths::archive(user_id);
+            match std::fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => user_id += 1,
+                Err(error) => {
+                    let _ = std::fs::remove_dir(&slot_dir);
+                    panic!("cannot reserve synthetic archive path: {error}");
+                }
+            }
+        };
+        (Self { slot_dir, archive }, slot, user_id)
+    }
+}
+
+impl Drop for ResetFailurePaths {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.archive);
+        let _ = std::fs::remove_dir(&self.slot_dir);
+    }
+}
+
+#[test]
+fn security_reset_retains_key_after_archive_remove_failure() {
+    let (_fixture, slot, user_id) = ResetFailurePaths::new();
+    let salt = "synthetic-reset-salt";
+    let check =
+        crate::lock::check_value(&crate::lock::derive("synthetic-reset-password", salt).unwrap());
+    let mut app = app();
+    app.session.slot = slot;
+    app.session.archive = None;
+    app.session.auth = Auth::Locked {
+        error: None,
+        forgot: true,
+    };
+    app.settings.accounts.push(Account {
+        slot,
+        user_id: Some(user_id),
+        name: "synthetic locked account".into(),
+        lock_salt: Some(salt.into()),
+        lock_check: Some(check.clone()),
+        ..Default::default()
+    });
+    let before = app.settings.clone();
+    app.settings.save(&app.settings_path).unwrap();
+
+    let task = app.update(Msg::Password(PasswordMsg::ResetAccount));
+
+    assert_eq!(app.settings.accounts[0].lock_salt.as_deref(), Some(salt));
+    assert_eq!(
+        app.settings.accounts[0].lock_check.as_deref(),
+        Some(check.as_str())
+    );
+    assert_eq!(app.settings.accounts[0].user_id, Some(user_id));
+    assert_eq!(app.settings, before);
+    assert_eq!(Settings::load(&app.settings_path).unwrap(), before);
+    assert!(
+        app.error
+            .as_deref()
+            .is_some_and(|error| error.contains("данные аккаунта"))
+    );
+    assert!(matches!(app.session.auth, Auth::Locked { .. }));
+    assert!(
+        !app.session.busy,
+        "reset failure must not restart TDLib parameters"
+    );
+    assert!(
+        into_stream(task).is_none(),
+        "reset failure must not schedule TDLib parameters"
+    );
+}
+
+#[test]
+fn security_unlock_origin_stale_client_result_cannot_unlock_the_new_session() {
+    let mut app = app();
+    let old_key = crate::lock::derive("synthetic old password", "synthetic-old-salt").unwrap();
+    let new_key = crate::lock::derive("synthetic new password", "synthetic-new-salt").unwrap();
+    app.settings.accounts = vec![
+        Account {
+            slot: 0,
+            user_id: Some(501),
+            lock_salt: Some("synthetic-old-salt".into()),
+            lock_check: Some(crate::lock::check_value(&old_key)),
+            ..Default::default()
+        },
+        Account {
+            slot: 3,
+            user_id: Some(502),
+            lock_salt: Some("synthetic-new-salt".into()),
+            lock_check: Some(crate::lock::check_value(&new_key)),
+            ..Default::default()
+        },
+    ];
+    app.session.auth = Auth::Locked {
+        error: None,
+        forgot: false,
+    };
+    app.session.archive = None;
+    drop(app.update(Msg::Password(PasswordMsg::Input(
+        "synthetic old password".into(),
+    ))));
+    drop(app.update(Msg::Password(PasswordMsg::Unlock)));
+    assert!(app.session.busy, "old unlock must be in flight");
+    let old_client = app.session.client_id;
+
+    app.session = Session::new(old_client + 1, app.main_window, 3);
+    app.session.auth = Auth::Locked {
+        error: None,
+        forgot: false,
+    };
+    drop(app.update(Msg::Password(PasswordMsg::Input(
+        "synthetic new password".into(),
+    ))));
+    drop(app.update(Msg::Password(PasswordMsg::Unlock)));
+    assert!(app.session.busy, "new unlock must be in flight");
+    assert_eq!(app.session.db_key, None);
+
+    drop(app.update(Msg::ForClient(
+        old_client,
+        Box::new(Msg::Password(PasswordMsg::Unlocked(Ok((
+            Some(old_key),
+            None,
+        ))))),
+    )));
+
+    assert_eq!(app.session.slot, 3);
+    assert_eq!(app.session.client_id, old_client + 1);
+    assert_eq!(
+        app.session.db_key, None,
+        "old client's key must not be adopted"
+    );
+    assert!(
+        app.session.busy,
+        "old completion must not finish the new unlock"
+    );
+    assert_eq!(
+        app.session.auth,
+        Auth::Locked {
+            error: None,
+            forgot: false
+        }
+    );
+}
+
+#[test]
+fn security_unlock_origin_reset_while_unlock_busy_preserves_account_and_schedules_no_tdlib() {
+    let (fixture, slot, user_id) = ResetFailurePaths::new();
+    // This fixture owns both paths. Leave the archive absent so an unguarded
+    // reset would succeed and expose the metadata loss instead of failing on I/O.
+    std::fs::remove_dir(&fixture.archive).unwrap();
+    let key = crate::lock::derive("synthetic reset password", "synthetic-reset-salt").unwrap();
+    let mut app = app();
+    app.session.slot = slot;
+    app.session.archive = None;
+    app.session.auth = Auth::Locked {
+        error: None,
+        forgot: true,
+    };
+    app.settings.accounts.push(Account {
+        slot,
+        user_id: Some(user_id),
+        name: "synthetic locked account".into(),
+        lock_salt: Some("synthetic-reset-salt".into()),
+        lock_check: Some(crate::lock::check_value(&key)),
+        ..Default::default()
+    });
+    let before = app.settings.clone();
+    app.settings.save(&app.settings_path).unwrap();
+    drop(app.update(Msg::Password(PasswordMsg::Input(
+        "synthetic reset password".into(),
+    ))));
+    drop(app.update(Msg::Password(PasswordMsg::Unlock)));
+    assert!(app.session.busy, "Argon2 unlock must be in flight");
+
+    let task = app.update(Msg::Password(PasswordMsg::ResetAccount));
+
+    assert_eq!(app.settings, before, "reset must not clear lock metadata");
+    assert_eq!(Settings::load(&app.settings_path).unwrap(), before);
+    assert!(
+        fixture.slot_dir.is_dir(),
+        "reset must not remove TDLib data"
+    );
+    assert!(
+        app.error.as_deref().is_some_and(|error| !error.is_empty()),
+        "reset while unlock is in progress must report failure"
+    );
+    assert!(
+        app.session.busy,
+        "reset must not interrupt the in-flight unlock"
+    );
+    assert!(matches!(app.session.auth, Auth::Locked { .. }));
+    assert!(
+        into_stream(task).is_none(),
+        "reset while unlock is in progress must not schedule a TDLib request"
+    );
+}
+
+#[test]
 fn security_fix_stale_password_replies_cannot_change_the_current_account() {
     let mut app = password_change_in_progress();
     let stale_client = app.session.client_id + 1;

@@ -1,7 +1,7 @@
-//! Sound and motion: voice messages (play, record), looped animations
-//! (GIFs, animated stickers) and videos opened externally.
+//! Sound and motion: voice messages (play, record), inline looped GIFs
+//! and animated stickers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -12,7 +12,7 @@ use iced::Task;
 use iced::futures::{SinkExt, Stream};
 use iced::widget::image;
 
-use super::media::{Media, Motion, STICKER_SIZE};
+use super::media::{FileState, Media, Motion, STICKER_SIZE};
 use super::{App, Msg, WinId};
 use crate::av::audio::{Pcm, Player, Recorder};
 use crate::av::lottie::Lottie;
@@ -75,14 +75,16 @@ pub(crate) struct Playback {
     pub(crate) voice: Option<(i32, Duration, bool)>,
     pub(crate) recording: Option<Recording>,
     anims: HashMap<i32, Anim>,
-    /// Animations on screen waiting for their file.
+    /// Visible animations awaiting a download or a free UI/native decoder slot.
     wanted: HashMap<i32, Motion>,
+    /// User clicks outrank automatically started/queued animations.
+    requested: HashSet<i32>,
+    /// Motion of real running workers, so a preempted visible sticker can resume.
+    running: HashMap<i32, Motion>,
     /// How many message bubbles currently show each animated file: hiding
     /// one copy must not stop another still on screen (the same sticker
     /// sent twice, a forwarded GIF, or the chat open in two windows).
     shown: HashMap<i32, usize>,
-    /// Videos to open in the system player once downloaded.
-    open_when_done: Vec<i32>,
 }
 
 impl Playback {
@@ -94,8 +96,13 @@ impl Playback {
         self.anims.get(&file_id).and_then(|a| a.prev.as_ref())
     }
 
-    pub(crate) fn busy(&self) -> bool {
-        self.voice.is_some_and(|v| v.2) || self.recording.is_some()
+    pub(crate) fn busy(&self, files: &HashMap<i32, FileState>) -> bool {
+        self.voice.is_some_and(|v| v.2)
+            || self.recording.is_some()
+            || self
+                .wanted
+                .keys()
+                .any(|id| self.shown.contains_key(id) && files.get(id).is_some_and(|f| f.done))
     }
 
     #[cfg(test)]
@@ -354,11 +361,9 @@ impl App {
         Task::none()
     }
 
-    /// Periodic refresh of the voice player and recording timer. A
-    /// recording stops and is sent at the length the decoder can play
-    /// back, unless its window no longer shows its chat (closing the
-    /// window or switching the chat already cancels it, but this covers
-    /// any other path that changes what a window shows).
+    /// Periodic refresh of the voice player, recording timer, and visible
+    /// ready animations waiting for a decoder (including workers that have
+    /// been canceled but have not yet released their native permit).
     pub(super) fn playback_tick(&mut self) -> Task<Msg> {
         if let Some(rec) = self.session.playback.recording.as_ref()
             && rec.started.elapsed() >= crate::av::audio::MAX_DECODE
@@ -375,7 +380,29 @@ impl App {
                 .state()
                 .map(|(id, position, playing)| (id as i32, position, playing));
         }
-        Task::none()
+        let mut tasks = Vec::new();
+        for _ in 0..MAX_ANIMATIONS {
+            let ready = self
+                .session
+                .playback
+                .wanted
+                .iter()
+                .filter(|(id, _)| {
+                    self.session.playback.shown.contains_key(id)
+                        && !self.session.playback.anims.contains_key(id)
+                        && self.session.files.get(id).is_some_and(|f| f.done)
+                })
+                .map(|(&id, &motion)| (id, motion))
+                .max_by_key(|(id, _)| self.session.playback.requested.contains(id));
+            let Some((id, motion)) = ready else {
+                break;
+            };
+            tasks.push(self.start_animation(id, motion));
+            if self.session.playback.wanted.contains_key(&id) {
+                break;
+            }
+        }
+        Task::batch(tasks)
     }
 
     /// A finished download may be waited for by playback.
@@ -386,38 +413,10 @@ impl App {
             self.session.playback.voice = None;
             tasks.push(self.voice_toggle(file_id));
         }
-        if let Some(motion) = self.session.playback.wanted.remove(&file_id) {
+        if let Some(&motion) = self.session.playback.wanted.get(&file_id) {
             tasks.push(self.start_animation(file_id, motion));
         }
-        if let Some(i) = self
-            .session
-            .playback
-            .open_when_done
-            .iter()
-            .position(|&f| f == file_id)
-        {
-            self.session.playback.open_when_done.remove(i);
-            self.open_file(file_id, false);
-        }
         Task::batch(tasks)
-    }
-
-    /// Video: open in the system player (with sound), downloading first.
-    pub(super) fn play_video(&mut self, file_id: i32) -> Task<Msg> {
-        match self.session.files.get(&file_id) {
-            Some(f) if f.done => {
-                self.open_file(file_id, false);
-                Task::none()
-            }
-            Some(f) if f.downloading => {
-                self.session.playback.open_when_done.push(file_id);
-                Task::none()
-            }
-            _ => {
-                self.session.playback.open_when_done.push(file_id);
-                self.request_download(file_id, 28)
-            }
-        }
     }
 
     /// An animation came on screen: play it (downloading first). The same
@@ -430,30 +429,47 @@ impl App {
         if *refs > 1 {
             return Task::none();
         }
-        // Large files are not fetched just because they scrolled by: those
-        // play on click (system player) instead.
+        // The cap applies to a new automatic download, not to a file
+        // already present in TDLib's local cache.
         let limit = match motion {
             Motion::Video if self.is_sticker(file_id) => MAX_AUTO_STICKER,
             Motion::Lottie | Motion::Still => MAX_AUTO_STICKER,
             Motion::Video => MAX_AUTO_ANIMATION,
         };
-        if self
-            .session
-            .files
-            .get(&file_id)
-            .is_some_and(|f| f.size > limit)
-        {
-            return Task::none();
-        }
         match self.session.files.get(&file_id) {
             Some(f) if f.done => self.start_animation(file_id, motion),
             Some(f) if f.downloading => {
                 self.session.playback.wanted.insert(file_id, motion);
                 Task::none()
             }
+            // A failed automatic request must not be restarted by scrolling.
+            Some(f) if f.failed || f.size > limit => Task::none(),
             _ => {
                 self.session.playback.wanted.insert(file_id, motion);
                 self.request_download(file_id, 12)
+            }
+        }
+    }
+
+    /// A click explicitly requests inline playback even for an animation
+    /// beyond the automatic-download cap or a previously failed download.
+    pub(super) fn animation_play(&mut self, file_id: i32) -> Task<Msg> {
+        if !self.session.playback.shown.contains_key(&file_id) {
+            return Task::none();
+        }
+        self.session.playback.requested.insert(file_id);
+        if self.session.playback.anims.contains_key(&file_id) {
+            return Task::none();
+        }
+        match self.session.files.get(&file_id) {
+            Some(f) if f.done => self.start_animation(file_id, Motion::Video),
+            Some(f) if f.downloading => {
+                self.session.playback.wanted.insert(file_id, Motion::Video);
+                Task::none()
+            }
+            _ => {
+                self.session.playback.wanted.insert(file_id, Motion::Video);
+                self.request_download(file_id, 28)
             }
         }
     }
@@ -466,6 +482,8 @@ impl App {
             }
             self.session.playback.shown.remove(&file_id);
         }
+        self.session.playback.requested.remove(&file_id);
+        self.session.playback.running.remove(&file_id);
         self.session.playback.wanted.remove(&file_id);
         if let Some(anim) = self.session.playback.anims.remove(&file_id) {
             anim.stop.abort();
@@ -479,6 +497,7 @@ impl App {
     /// entry is already gone (e.g. `animation_hidden` ran first).
     pub(super) fn animation_ended(&mut self, file_id: i32) {
         self.session.playback.anims.remove(&file_id);
+        self.session.playback.running.remove(&file_id);
     }
 
     fn start_animation(&mut self, file_id: i32, motion: Motion) -> Task<Msg> {
@@ -492,10 +511,50 @@ impl App {
         motion: Motion,
         workers: &Arc<tokio::sync::Semaphore>,
     ) -> Task<Msg> {
-        if self.session.playback.anims.len() >= MAX_ANIMATIONS {
+        if !self.session.playback.shown.contains_key(&file_id) {
+            self.session.playback.wanted.remove(&file_id);
             return Task::none();
         }
-        let Some(path) = self.session.files.get(&file_id).map(|f| f.path.clone()) else {
+        if self.session.playback.anims.contains_key(&file_id) {
+            self.session.playback.wanted.remove(&file_id);
+            return Task::none();
+        }
+        // Never evict a playing animation for a file that is not ready.
+        if !self.session.files.get(&file_id).is_some_and(|f| f.done) {
+            return Task::none();
+        }
+        if self.session.playback.anims.len() >= MAX_ANIMATIONS {
+            // A click yields one automatic UI slot immediately. Its native
+            // worker still owns its permit until cancellation actually exits;
+            // the clicked file remains queued until that permit is released.
+            if self.session.playback.requested.contains(&file_id)
+                && let Some(&victim) = self
+                    .session
+                    .playback
+                    .anims
+                    .keys()
+                    .find(|id| !self.session.playback.requested.contains(id))
+            {
+                if let Some(anim) = self.session.playback.anims.remove(&victim) {
+                    anim.stop.abort();
+                }
+                if let Some(old_motion) = self.session.playback.running.remove(&victim)
+                    && self.session.playback.shown.contains_key(&victim)
+                {
+                    self.session.playback.wanted.insert(victim, old_motion);
+                }
+            } else {
+                self.session.playback.wanted.insert(file_id, motion);
+                return Task::none();
+            }
+        }
+        let Some(path) = self
+            .session
+            .files
+            .get(&file_id)
+            .filter(|f| f.done)
+            .map(|f| f.path.clone())
+        else {
             return Task::none();
         };
         let (w, h) = match motion {
@@ -512,6 +571,7 @@ impl App {
                 _ => play_video(&path, w, h, &tx, cancel),
             };
         }) else {
+            self.session.playback.wanted.insert(file_id, motion);
             return Task::none();
         };
         let (task, stop) = Task::run(frames(rx, cancel), move |(fw, fh, rgba)| {
@@ -523,6 +583,8 @@ impl App {
         // cleanup.
         .chain(Task::done(Msg::AnimEnded(file_id)))
         .abortable();
+        self.session.playback.wanted.remove(&file_id);
+        self.session.playback.running.insert(file_id, motion);
         self.session.playback.anims.insert(
             file_id,
             Anim {
@@ -543,8 +605,15 @@ impl App {
     }
 
     pub(super) fn animation_frame(&mut self, file_id: i32, w: u32, h: u32, rgba: Vec<u8>) {
-        if let Some(anim) = self.session.playback.anims.get_mut(&file_id) {
+        let first_frame = if let Some(anim) = self.session.playback.anims.get_mut(&file_id) {
+            let first_frame = anim.frame.is_none();
             anim.prev = anim.frame.replace(image::Handle::from_rgba(w, h, rgba));
+            first_frame
+        } else {
+            false
+        };
+        if first_frame {
+            self.clear_animation_thumbnails(file_id);
         }
     }
 
@@ -604,7 +673,7 @@ impl App {
                 }
                 sent
             },
-            Msg::Done,
+            move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r))),
         )
     }
 
@@ -800,5 +869,279 @@ mod frame_tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    struct RequestedClip(std::path::PathBuf);
+
+    impl RequestedClip {
+        fn new(id: i32) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "telega-requested-animation-{}-{id}.mp4",
+                std::process::id()
+            ));
+            crate::av::video::tests::encode_test_clip(&path, 32, 24, 3);
+            Self(path)
+        }
+    }
+
+    impl Drop for RequestedClip {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn requested_changes_ready_mp4_waits_for_native_slot_then_can_play() {
+        let clip = RequestedClip::new(44);
+
+        let mut app = crate::app::tests::app();
+        let file_id = 44;
+        app.session.files.insert(
+            file_id,
+            super::super::media::FileState {
+                path: clip.0.to_string_lossy().into_owned(),
+                done: true,
+                ..Default::default()
+            },
+        );
+        app.session.playback.shown.insert(file_id, 1);
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let occupied = workers.clone().try_acquire_owned().unwrap();
+
+        let _ = app.start_animation_with_workers(file_id, Motion::Video, &workers);
+        assert!(!app.session.playback.playing(file_id));
+        assert!(
+            app.session.playback.waiting(file_id),
+            "a visible ready MP4 must remain queued while its native slot is occupied"
+        );
+        drop(occupied);
+        let _ = app.start_animation_with_workers(file_id, Motion::Video, &workers);
+        assert!(
+            app.session.playback.playing(file_id),
+            "the queued MP4 should become playable after a native slot opens"
+        );
+        assert!(!app.session.playback.waiting(file_id));
+        app.animation_hidden(file_id);
+    }
+
+    #[test]
+    fn requested_changes_ui_quota_keeps_visible_ready_mp4_queued() {
+        let mut app = crate::app::tests::app();
+        for id in 100..100 + MAX_ANIMATIONS as i32 {
+            let (_, stop) = Task::<Msg>::none().abortable();
+            app.session.playback.anims.insert(
+                id,
+                Anim {
+                    frame: None,
+                    prev: None,
+                    stop,
+                },
+            );
+        }
+        let file_id = 77;
+        app.session.files.insert(
+            file_id,
+            super::super::media::FileState {
+                path: "ready-video.mp4".into(),
+                done: true,
+                ..Default::default()
+            },
+        );
+        app.session.playback.shown.insert(file_id, 1);
+        app.session.playback.wanted.insert(file_id, Motion::Video);
+        let _ = app.playback_file_done(file_id);
+        assert!(!app.session.playback.playing(file_id));
+        assert!(
+            app.session.playback.waiting(file_id),
+            "the three-stream UI limit postpones a visible ready MP4, not forgets it"
+        );
+        assert_eq!(app.session.playback.anims.len(), MAX_ANIMATIONS);
+    }
+
+    #[test]
+    fn requested_changes_clicked_ready_mp4_yields_auto_slot_without_losing_intent() {
+        let mut app = crate::app::tests::app();
+        let automatic = [100, 101, 102];
+        for id in automatic {
+            let (_, stop) = Task::<Msg>::none().abortable();
+            app.session.playback.anims.insert(
+                id,
+                Anim {
+                    frame: None,
+                    prev: None,
+                    stop,
+                },
+            );
+            app.session.playback.shown.insert(id, 1);
+        }
+        let file_id = 80;
+        let clip = RequestedClip::new(file_id);
+        app.session.files.insert(
+            file_id,
+            super::super::media::FileState {
+                path: clip.0.to_string_lossy().into_owned(),
+                done: true,
+                ..Default::default()
+            },
+        );
+        app.session.playback.shown.insert(file_id, 1);
+
+        let _ = app.animation_play(file_id);
+
+        assert!(
+            automatic
+                .iter()
+                .filter(|&&id| app.session.playback.playing(id))
+                .count()
+                < MAX_ANIMATIONS,
+            "a clicked ready MP4 must yield at least one looping auto-animation"
+        );
+        assert!(
+            app.session.playback.playing(file_id) || app.session.playback.waiting(file_id),
+            "clicked playback remains active or queued after yielding an auto slot"
+        );
+        assert!(app.session.playback.anims.len() <= MAX_ANIMATIONS);
+        app.animation_hidden(file_id);
+    }
+
+    #[test]
+    fn requested_changes_cached_mp4_above_download_cap_is_still_eligible() {
+        let mut app = crate::app::tests::app();
+        for id in 100..100 + MAX_ANIMATIONS as i32 {
+            let (_, stop) = Task::<Msg>::none().abortable();
+            app.session.playback.anims.insert(
+                id,
+                Anim {
+                    frame: None,
+                    prev: None,
+                    stop,
+                },
+            );
+        }
+        let file_id = 79;
+        let clip = RequestedClip::new(file_id);
+        app.session.files.insert(
+            file_id,
+            super::super::media::FileState {
+                path: clip.0.to_string_lossy().into_owned(),
+                size: MAX_AUTO_ANIMATION + 1,
+                done: true,
+                ..Default::default()
+            },
+        );
+        let _ = app.animation_shown(file_id, Motion::Video);
+        assert!(
+            app.session.playback.waiting(file_id),
+            "the automatic download cap cannot disqualify an already cached visible MP4"
+        );
+        assert!(!app.session.playback.playing(file_id));
+        assert_eq!(app.session.playback.anims.len(), MAX_ANIMATIONS);
+        app.session.playback.anims.remove(&100);
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let _ = app.start_animation_with_workers(file_id, Motion::Video, &workers);
+        assert!(
+            app.session.playback.playing(file_id),
+            "a cached MP4 larger than the download cap plays from its existing path"
+        );
+        app.animation_hidden(file_id);
+    }
+
+    #[test]
+    fn requested_changes_hidden_waiter_does_not_start_after_slot_release() {
+        let mut app = crate::app::tests::app();
+        let file_id = 78;
+        app.session.files.insert(
+            file_id,
+            super::super::media::FileState {
+                path: "not-opened-for-hidden-animation.mp4".into(),
+                done: true,
+                ..Default::default()
+            },
+        );
+        app.session.playback.shown.insert(file_id, 1);
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let occupied = workers.clone().try_acquire_owned().unwrap();
+        let _ = app.start_animation_with_workers(file_id, Motion::Video, &workers);
+        assert!(app.session.playback.waiting(file_id));
+        app.animation_hidden(file_id);
+        drop(occupied);
+        let _ = app.start_animation_with_workers(file_id, Motion::Video, &workers);
+        assert!(
+            !app.session.playback.playing(file_id),
+            "releasing a decoder must never resurrect a hidden animation"
+        );
+        assert!(!app.session.playback.waiting(file_id));
+    }
+
+    #[tokio::test]
+    #[ignore = "uses the real global native-worker pool; run this smoke alone"]
+    async fn requested_changes_smoke_queued_mp4_autoplays_and_loops_after_native_slot_releases() {
+        use iced::futures::StreamExt;
+        use iced_runtime::{Action, task::into_stream};
+
+        let clip = RequestedClip::new(44);
+        let mut app = crate::app::tests::app();
+        let file_id = 44;
+        app.session.files.insert(
+            file_id,
+            super::super::media::FileState {
+                path: clip.0.to_string_lossy().into_owned(),
+                done: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ANIMATION_WORKERS.available_permits(), MAX_ANIMATIONS);
+        let mut occupied = Vec::new();
+        for _ in 0..MAX_ANIMATIONS {
+            occupied.push(
+                Arc::clone(&ANIMATION_WORKERS)
+                    .try_acquire_owned()
+                    .expect("reserve a native decoder slot"),
+            );
+        }
+        let _ = app.animation_shown(file_id, Motion::Video);
+        assert!(app.session.playback.waiting(file_id));
+        assert!(!app.session.playback.playing(file_id));
+        assert_eq!(ANIMATION_WORKERS.available_permits(), 0);
+
+        drop(occupied.pop());
+        let mut stream = into_stream(app.playback_tick()).expect("released slot starts MP4 task");
+        assert!(app.session.playback.playing(file_id));
+        let mut observed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while observed.len() < 4 {
+                match stream.next().await.expect("MP4 task must emit frames") {
+                    Action::Output(Msg::AnimFrame(id, w, h, rgba)) if id == file_id => {
+                        assert_eq!((w, h, rgba.len()), (32, 24, 32 * 24 * 4));
+                        observed.push(rgba.clone());
+                        let _ = app.update(Msg::AnimFrame(id, w, h, rgba));
+                        assert!(app.session.playback.frame(file_id).is_some());
+                    }
+                    Action::Output(Msg::AnimEnded(id)) if id == file_id => {
+                        panic!("a valid MP4 ended before its loop")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("MP4 should display advancing frames and loop");
+        assert_ne!(observed[0], observed[1], "the video advances");
+        assert_eq!(observed[0], observed[3], "the fourth frame starts the loop");
+        assert_eq!(ANIMATION_WORKERS.available_permits(), 0);
+
+        app.animation_hidden(file_id);
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ANIMATION_WORKERS.available_permits() != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("hiding the stream cancels and releases its native worker");
+        assert!(!app.session.playback.playing(file_id));
+        assert!(!app.session.playback.waiting(file_id));
+        drop(occupied);
+        assert_eq!(ANIMATION_WORKERS.available_permits(), MAX_ANIMATIONS);
     }
 }

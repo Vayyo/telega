@@ -414,6 +414,7 @@ pub(crate) mod tests {
             let mut packet = ff::Packet::empty();
             while encoder.receive_packet(&mut packet).is_ok() {
                 packet.set_stream(ost_index);
+                packet.set_duration(1);
                 packet.rescale_ts((1, 25), out_tb);
                 packet.write_interleaved(&mut octx).expect("write packet");
             }
@@ -422,6 +423,7 @@ pub(crate) mod tests {
         let mut packet = ff::Packet::empty();
         while encoder.receive_packet(&mut packet).is_ok() {
             packet.set_stream(ost_index);
+            packet.set_duration(1);
             packet.rescale_ts((1, 25), out_tb);
             packet.write_interleaved(&mut octx).expect("write packet");
         }

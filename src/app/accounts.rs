@@ -58,7 +58,10 @@ impl App {
         if let Some(host) = &self.plugin_host {
             host.send(HostCmd::Account(None));
         }
-        Task::perform(td::close(self.session.client_id), Msg::Done)
+        let client_id = self.session.client_id;
+        Task::perform(td::close(client_id), move |r| {
+            Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+        })
     }
 
     /// A fresh slot with a login screen; the current account stays.
@@ -94,7 +97,10 @@ impl App {
         if let Some(host) = &self.plugin_host {
             host.send(HostCmd::Account(None));
         }
-        Task::perform(td::close(self.session.client_id), Msg::Done)
+        let client_id = self.session.client_id;
+        Task::perform(td::close(client_id), move |r| {
+            Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+        })
     }
 
     /// The logged-in user is known: remember the account in its slot. The
@@ -118,7 +124,10 @@ impl App {
             if let Some(host) = &self.plugin_host {
                 host.send(HostCmd::Account(None));
             }
-            return Task::perform(td::log_out(self.session.client_id), Msg::Done);
+            let client_id = self.session.client_id;
+            return Task::perform(td::log_out(client_id), move |r| {
+                Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+            });
         }
         let name = self
             .session

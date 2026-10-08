@@ -40,6 +40,38 @@ fn noise(seed: &mut u64, n: usize) -> Vec<u8> {
 }
 
 #[test]
+fn requested_changes_valid_mp4_decodes_distinct_frames_and_loops() {
+    let clip = Temp::path("requested-changes-video.mp4");
+    super::video::tests::encode_test_clip(&clip.0, 32, 24, 3);
+
+    let mut stream = super::video::FrameStream::open(&clip.0, 32, 24)
+        .expect("a locally encoded MP4 is supported");
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.next_frame().expect("MP4 frame decodes") {
+        assert_eq!(
+            (frame.width, frame.height, frame.rgba.len()),
+            (32, 24, 32 * 24 * 4)
+        );
+        frames.push(frame.rgba);
+    }
+    assert_eq!(frames.len(), 3);
+    assert_ne!(
+        frames[0], frames[1],
+        "the MP4 should advance rather than freeze"
+    );
+    stream.rewind().expect("loop an MP4");
+    assert_eq!(
+        stream
+            .next_frame()
+            .expect("loop frame decodes")
+            .unwrap()
+            .rgba,
+        frames[0],
+        "a loop returns to the first frame"
+    );
+}
+
+#[test]
 fn garbage_behind_real_signatures_is_an_error() {
     let mut seed = 7;
     let cases: [(&str, &[u8], usize); 9] = [

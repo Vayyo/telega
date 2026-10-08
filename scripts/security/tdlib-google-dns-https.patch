@@ -1,0 +1,21 @@
+diff --git a/tdnet/td/net/GetHostByNameActor.cpp b/tdnet/td/net/GetHostByNameActor.cpp
+--- a/tdnet/td/net/GetHostByNameActor.cpp
++++ b/tdnet/td/net/GetHostByNameActor.cpp
+@@ -42,7 +42,7 @@ class GoogleDnsResolver final : public Actor {
+     }
+ 
+     const int timeout = 10;
+-    const int ttl = 3;
++    const int ttl = 0;
+     begin_time_ = Time::now();
+     auto wget_promise = PromiseCreator::lambda([actor_id = actor_id(this)](Result<unique_ptr<HttpQuery>> r_http_query) {
+       send_closure(actor_id, &GoogleDnsResolver::on_result, std::move(r_http_query));
+@@ -51,7 +51,7 @@ class GoogleDnsResolver final : public Actor {
+         "GoogleDnsResolver", std::move(wget_promise),
+         PSTRING() << "https://dns.google/resolve?name=" << url_encode(host_) << "&type=" << (prefer_ipv6_ ? 28 : 1),
+         std::vector<std::pair<string, string>>({{"Host", "dns.google"}}), timeout, ttl, prefer_ipv6_,
+-        SslCtx::VerifyPeer::Off);
++        SslCtx::VerifyPeer::On);
+   }
+ 
+   static Result<IPAddress> get_ip_address(Result<unique_ptr<HttpQuery>> r_http_query) {

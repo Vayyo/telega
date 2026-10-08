@@ -4719,7 +4719,7 @@ checksum = "3d792369bc9984e0a469c0acff4dea61f3bc63c4a6a4a70005e109ba899d7762"
 
 [[package]]
 name = "telega"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arboard",
  "argon2",

@@ -13,7 +13,7 @@ use crate::td;
 use super::accounts::Leave;
 use super::avatars::Avatars;
 use super::card::UserCard;
-use super::media::{FileState, ImageCache};
+use super::media::{FileState, ImageCache, PhotoEpoch, PhotoOwner};
 use super::pane::ChatPane;
 use super::password;
 use super::picker::Catalog;
@@ -173,7 +173,12 @@ pub(super) struct Session {
     /// TDLib files referenced by shown messages.
     pub(super) files: HashMap<i32, FileState>,
     pub(super) images: ImageCache,
-    /// Photos that were on screen: decoded as soon as their download ends.
+    /// Each displayed widget, scoped to its window; identical files in two
+    /// windows or two widgets have independent visibility lifetimes.
+    pub(super) photo_owners: HashMap<(WinId, PhotoOwner), (i32, PhotoEpoch)>,
+    /// Bounded to opened windows; bump when a rendered widget tree is reset.
+    pub(super) photo_generations: HashMap<WinId, u64>,
+    /// Derived file-level lookup for cache trimming and completed downloads.
     pub(super) wanted_photos: HashSet<i32>,
     /// Replied-to messages not loaded in any pane: (chat, id) → preview.
     pub(super) reply_previews: HashMap<(i64, i64), MsgItem>,
@@ -278,6 +283,8 @@ impl Session {
             background: HashMap::new(),
             files: HashMap::new(),
             images: ImageCache::default(),
+            photo_owners: HashMap::new(),
+            photo_generations: HashMap::new(),
             wanted_photos: HashSet::new(),
             reply_previews: HashMap::new(),
             playback: Playback::default(),

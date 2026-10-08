@@ -5,6 +5,7 @@
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer;
+use iced::advanced::renderer::Renderer as _;
 use iced::advanced::text::{self as core_text, Paragraph as _, Span};
 use iced::advanced::widget::{Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell};
@@ -304,6 +305,289 @@ where
     Renderer: core_text::Renderer<Font = iced::Font> + 'a,
 {
     fn from(widget: Selectable<'a, Link, Message>) -> Self {
+        Element::new(widget)
+    }
+}
+
+/// A transparent wrapper around a laid-out history column or a real bubble.
+/// The column starts drags only after its children have declined the press;
+/// bubble hit-testing uses its own bounds, never the full-width row.
+pub(crate) struct Gesture<'a> {
+    content: Element<'a, super::Msg>,
+    window: super::WinId,
+    bubble: Option<(i64, bool)>,
+    rectangle: Option<(Point, Point)>,
+}
+
+impl<'a> Gesture<'a> {
+    pub(crate) fn history(
+        content: impl Into<Element<'a, super::Msg>>,
+        window: super::WinId,
+        rectangle: Option<(Point, Point)>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            window,
+            bubble: None,
+            rectangle,
+        }
+    }
+
+    pub(crate) fn bubble(
+        content: impl Into<Element<'a, super::Msg>>,
+        window: super::WinId,
+        id: i64,
+        eligible: bool,
+        rectangle: Option<(Point, Point)>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            window,
+            bubble: Some((id, eligible)),
+            rectangle,
+        }
+    }
+}
+
+#[derive(Default)]
+struct GestureState {
+    bubble_press: Option<Point>,
+}
+
+impl Widget<super::Msg, iced::Theme, iced::Renderer> for Gesture<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<GestureState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(GestureState::default())
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, super::Msg>,
+        viewport: &Rectangle,
+    ) {
+        let at = cursor
+            .position()
+            .filter(|p| layout.bounds().contains(*p) && viewport.contains(*p));
+        // The child must see its press first: links, text selection, media
+        // controls and scrollbars keep their ordinary event priority.
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        let pointer_control = self.bubble.is_some_and(|_| {
+            self.content.as_widget().mouse_interaction(
+                &tree.children[0],
+                layout,
+                cursor,
+                viewport,
+                renderer,
+            ) == mouse::Interaction::Pointer
+        });
+        if let Some((id, eligible)) = self.bubble {
+            if let Some((anchor, _)) = self.rectangle
+                && let Some(focus) = cursor.position()
+                && matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }))
+            {
+                let rect = Rectangle::new(
+                    Point::new(anchor.x.min(focus.x), anchor.y.min(focus.y)),
+                    Size::new((anchor.x - focus.x).abs(), (anchor.y - focus.y).abs()),
+                );
+                let visible_bubble = layout.bounds().intersection(viewport);
+                let intersects = eligible
+                    && (rect.width > 3.0 || rect.height > 3.0)
+                    && visible_bubble.is_some_and(|bounds| rect.intersects(&bounds));
+                shell.publish(super::Msg::Pane(
+                    self.window,
+                    super::PaneMsg::RectangleHit(id, intersects),
+                ));
+            }
+            let state = tree.state.downcast_mut::<GestureState>();
+            match event {
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if at.is_some() => {
+                    if eligible && !pointer_control && self.rectangle.is_none() {
+                        state.bubble_press = at;
+                        shell.publish(super::Msg::Pane(
+                            self.window,
+                            super::PaneMsg::BubblePress(id),
+                        ));
+                    } else {
+                        state.bubble_press = None;
+                        shell.publish(super::Msg::Pane(self.window, super::PaneMsg::BubbleCancel));
+                    }
+                    // An inert part of a bubble is still not free background.
+                    shell.capture_event();
+                }
+                Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                    if state.bubble_press.is_some_and(|origin| {
+                        cursor.position().is_some_and(|at| {
+                            (at.x - origin.x).abs() > 4.0 || (at.y - origin.y).abs() > 4.0
+                        })
+                    }) {
+                        state.bubble_press = None;
+                        shell.publish(super::Msg::Pane(self.window, super::PaneMsg::BubbleCancel));
+                    }
+                }
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    if state.bubble_press.take().is_some() && at.is_some() {
+                        shell.publish(super::Msg::Pane(
+                            self.window,
+                            super::PaneMsg::BubbleRelease(id),
+                        ));
+                    }
+                }
+                Event::Mouse(mouse::Event::CursorLeft) => state.bubble_press = None,
+                _ => {}
+            }
+        } else if let Some(at) = at {
+            match event {
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                    if !shell.is_event_captured() =>
+                {
+                    shell.publish(super::Msg::Pane(
+                        self.window,
+                        super::PaneMsg::RectangleStart(at),
+                    ));
+                    shell.capture_event();
+                }
+                Event::Mouse(mouse::Event::CursorMoved { .. }) if self.rectangle.is_some() => {
+                    shell.publish(super::Msg::Pane(
+                        self.window,
+                        super::PaneMsg::RectangleMove(at),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        defaults: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            defaults,
+            layout,
+            cursor,
+            viewport,
+        );
+        if self.bubble.is_none()
+            && let Some((anchor, focus)) = self.rectangle
+        {
+            let rect = Rectangle::new(
+                Point::new(anchor.x.min(focus.x), anchor.y.min(focus.y)),
+                Size::new((anchor.x - focus.x).abs(), (anchor.y - focus.y).abs()),
+            );
+            if let Some(bounds) = rect.intersection(viewport) {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds,
+                        border: iced::border::rounded(2)
+                            .width(1)
+                            .color(theme.extended_palette().primary.strong.color),
+                        ..Default::default()
+                    },
+                    iced::Color::from_rgba(0.3, 0.55, 0.9, 0.16),
+                );
+            }
+        }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<iced::advanced::overlay::Element<'b, super::Msg, iced::Theme, iced::Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<'a> From<Gesture<'a>> for Element<'a, super::Msg> {
+    fn from(widget: Gesture<'a>) -> Self {
         Element::new(widget)
     }
 }

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use iced::widget::{button, column, container, image, row, scrollable, sensor, text, text_editor};
 use iced::{Element, Fill, Task};
 
-use super::media::FileState;
+use super::media::{FileState, PhotoOwner};
 use super::{App, Msg, PaneMsg, WinId, rich};
 use crate::td::{self, StickerRef};
 
@@ -39,7 +39,7 @@ pub(crate) const EMOJI: [(&str, &str); 6] = [
 ];
 
 /// Which part of the panel is shown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Tab {
     Emoji,
     Recent,
@@ -57,24 +57,33 @@ pub(crate) struct Catalog {
 impl App {
     /// Opens the panel on a tab, loading what it needs.
     pub(crate) fn picker_tab(&mut self, window: WinId, tab: Tab) -> Task<Msg> {
+        if self
+            .session
+            .panes
+            .get(&window)
+            .is_some_and(|p| p.picker.is_some_and(|old| old != tab))
+        {
+            self.clear_picker_photos(window);
+        }
         if let Some(pane) = self.session.panes.get_mut(&window) {
             pane.picker = Some(tab);
         }
         let client = self.session.client_id;
         let mut tasks = Vec::new();
         if self.session.stickers.sets.is_none() {
-            tasks.push(Task::perform(td::sticker_sets(client), Msg::StickerSets));
+            tasks.push(Task::perform(td::sticker_sets(client), move |r| {
+                Msg::ForClient(client, Box::new(Msg::StickerSets(r)))
+            }));
         }
         match tab {
             Tab::Recent if self.session.stickers.recent.is_none() => {
-                tasks.push(Task::perform(
-                    td::recent_stickers(client),
-                    Msg::RecentStickers,
-                ));
+                tasks.push(Task::perform(td::recent_stickers(client), move |r| {
+                    Msg::ForClient(client, Box::new(Msg::RecentStickers(r)))
+                }));
             }
             Tab::Set(id) if !self.session.stickers.set_stickers.contains_key(&id) => {
                 tasks.push(Task::perform(td::sticker_set(client, id), move |r| {
-                    Msg::StickerSet(id, r)
+                    Msg::ForClient(client, Box::new(Msg::StickerSet(id, r)))
                 }));
             }
             _ => {}
@@ -91,7 +100,7 @@ impl App {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 td::recent_stickers(client).await
             },
-            Msg::RecentStickers,
+            move |r| Msg::ForClient(client, Box::new(Msg::RecentStickers(r))),
         )
     }
 
@@ -102,7 +111,7 @@ impl App {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 td::sticker_sets(client).await
             },
-            Msg::StickerSets,
+            move |r| Msg::ForClient(client, Box::new(Msg::StickerSets(r))),
         )
     }
 
@@ -113,7 +122,7 @@ impl App {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 td::sticker_set(client, id).await
             },
-            move |r| Msg::StickerSet(id, r),
+            move |r| Msg::ForClient(client, Box::new(Msg::StickerSet(id, r))),
         )
     }
 
@@ -172,11 +181,13 @@ impl App {
             }
             Tab::Recent => self.sticker_grid(
                 window,
+                tab,
                 self.session.stickers.recent.as_deref(),
                 "Недавних стикеров нет",
             ),
             Tab::Set(id) => self.sticker_grid(
                 window,
+                tab,
                 self.session
                     .stickers
                     .set_stickers
@@ -206,6 +217,7 @@ impl App {
     fn sticker_grid<'a>(
         &'a self,
         window: WinId,
+        tab: Tab,
         stickers: Option<&'a [StickerRef]>,
         empty: &'static str,
     ) -> Element<'a, Msg> {
@@ -216,7 +228,8 @@ impl App {
         if stickers.is_empty() {
             return text(empty).size(13).into();
         }
-        let cells = stickers.iter().map(|s| {
+        let epoch = self.photo_epoch(window);
+        let cells = stickers.iter().enumerate().map(|(index, s)| {
             let picture: Element<'a, Msg> = match s
                 .picture
                 .as_ref()
@@ -232,8 +245,11 @@ impl App {
                 // Pictures load when they come into view.
                 Some(p) => {
                     let id = p.id;
+                    let owner = PhotoOwner::Picker(tab, index);
                     sensor(picture)
-                        .on_show(move |_| on_pane(PaneMsg::MediaVisible(id)))
+                        .key((tab, index, id, epoch))
+                        .on_show(move |_| on_pane(PaneMsg::MediaShown(owner, id, epoch)))
+                        .on_hide(on_pane(PaneMsg::MediaGone(owner, id, epoch)))
                         .into()
                 }
                 None => picture,

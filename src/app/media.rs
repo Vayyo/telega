@@ -21,6 +21,96 @@ const MAX_IMAGE_SIDE: u32 = 4096;
 const MAX_IMAGE_ALLOC: u64 = 64 * 1024 * 1024;
 /// Decoded images kept in memory at most, bytes (RGBA).
 const IMAGE_BUDGET: usize = 64 * 1024 * 1024;
+const PHOTO_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Stable identity of one picture widget within one window. A sensor can be
+/// removed or change its key without ever publishing `on_hide`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PhotoOwner {
+    Message(i64, i64, PhotoKind),
+    Picker(super::picker::Tab, usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PhotoKind {
+    Photo,
+    Sticker,
+    Thumbnail,
+    Link,
+}
+
+/// One account/session and one window widget-tree incarnation. Every sensor
+/// captures this value so queued callbacks cannot mutate a later incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PhotoEpoch {
+    client: i32,
+    generation: u64,
+}
+
+/// Read-only snapshot of currently constructed media sources. Shared by
+/// immediate show validation and periodic removal reconciliation.
+struct PhotoSources<'a> {
+    window: WinId,
+    pane: &'a super::pane::ChatPane,
+    stickers: &'a super::picker::Catalog,
+    video: Option<&'a super::video::VideoPlayback>,
+    playback: &'a super::playback::Playback,
+}
+
+impl PhotoSources<'_> {
+    fn contains(&self, owner: PhotoOwner, file_id: i32, range: (usize, usize)) -> bool {
+        match owner {
+            PhotoOwner::Message(chat_id, message_id, kind) => {
+                if self.pane.chat_id != Some(chat_id)
+                    || self.pane.forward.is_some()
+                    || self.pane.search.as_ref().is_some_and(|search| {
+                        search.results.is_some()
+                            || search.paging.pending.is_some()
+                            || search.paging.error.is_some()
+                    })
+                {
+                    return false;
+                }
+                self.pane.messages[range.0..range.1].iter().any(|message| {
+                    message.id == message_id
+                        && match kind {
+                            PhotoKind::Photo => matches!(&message.media, Some(Media::Photo { file_id: id, spoiler, .. })
+                                if *id == file_id && (!*spoiler || self.pane.revealed.contains(&message.id))),
+                            PhotoKind::Sticker => matches!(&message.media, Some(Media::Sticker { file_id: id, kind: Motion::Still, .. }) if *id == file_id),
+                            PhotoKind::Thumbnail => match &message.media {
+                                Some(Media::Video { file_id: video_id, thumb: Some(id), spoiler, .. }) =>
+                                    *id == file_id && (!*spoiler || self.pane.revealed.contains(&message.id))
+                                        && !self.video.is_some_and(|video| video.window == self.window
+                                            && video.chat_id == chat_id && video.message_id == message_id
+                                            && video.file_id == *video_id && !video.expanded),
+                                Some(Media::Animation { file_id: animation_id, thumb: Some(id), spoiler, .. }) =>
+                                    *id == file_id && (!*spoiler || self.pane.revealed.contains(&message.id))
+                                        && self.playback.frame(*animation_id).is_none(),
+                                _ => false,
+                            },
+                            PhotoKind::Link => matches!(message.extra.as_deref(), Some(super::extra::Extra::Link { thumb: Some(id), .. }) if *id == file_id),
+                        }
+                })
+            }
+            PhotoOwner::Picker(tab, index) => {
+                if self.pane.picker != Some(tab) {
+                    return false;
+                }
+                let stickers = match tab {
+                    super::picker::Tab::Emoji => None,
+                    super::picker::Tab::Recent => self.stickers.recent.as_deref(),
+                    super::picker::Tab::Set(set) => {
+                        self.stickers.set_stickers.get(&set).map(Vec::as_slice)
+                    }
+                };
+                stickers
+                    .and_then(|list| list.get(index))
+                    .and_then(|sticker| sticker.picture.as_ref())
+                    .is_some_and(|picture| picture.id == file_id)
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum Media {
@@ -360,11 +450,10 @@ impl FileState {
     }
 }
 
-/// Decoded photos, least recently used evicted beyond the memory budget.
-/// Evicted photos are decoded again from the file cache when shown.
+/// Decoded photos; offscreen entries are LRU-evicted under pressure.
 #[derive(Default)]
 pub(crate) struct ImageCache {
-    entries: HashMap<i32, (image::Handle, usize, u64)>,
+    entries: HashMap<i32, (image::Handle, usize, u64, Option<std::time::Instant>)>,
     total: usize,
     clock: u64,
     /// Files being decoded right now.
@@ -385,9 +474,16 @@ impl ImageCache {
         self.entries.get(&file_id).map(|e| &e.0)
     }
 
-    /// `visible` are photos on screen right now (see `wanted_photos`):
-    /// eviction skips them, so scrolling past a photo and back does not
-    /// leave the one still shown wiped from under the user.
+    pub(crate) fn has_entries(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
+    /// None while a photo is visible; first time it became invisible otherwise.
+    #[cfg(test)]
+    pub(crate) fn inactive_since(&self, file_id: i32) -> Option<std::time::Instant> {
+        self.entries.get(&file_id).and_then(|entry| entry.3)
+    }
+
     pub(crate) fn insert(
         &mut self,
         file_id: i32,
@@ -399,12 +495,33 @@ impl ImageCache {
         self.decoding.remove(&file_id);
         let bytes = rgba.len();
         self.clock += 1;
+        let now = std::time::Instant::now();
         let handle = image::Handle::from_rgba(width, height, rgba);
-        if let Some((_, old, _)) = self.entries.insert(file_id, (handle, bytes, self.clock)) {
+        let since = (!visible.contains(&file_id)).then_some(now);
+        if let Some((_, old, _, old_since)) = self
+            .entries
+            .insert(file_id, (handle, bytes, self.clock, since))
+        {
             self.total -= old;
+            if since.is_some() {
+                self.entries.get_mut(&file_id).unwrap().3 = old_since.or(since);
+            }
         }
         self.total += bytes;
-        while self.total > IMAGE_BUDGET && self.entries.len() > 1 {
+        self.trim(visible, now);
+    }
+
+    /// Maintains ownership timestamps and evicts oldest unowned photos until
+    /// under budget; visible photos alone may exceed the 64 MiB limit.
+    pub(crate) fn trim(&mut self, visible: &HashSet<i32>, now: std::time::Instant) {
+        for (id, entry) in &mut self.entries {
+            if visible.contains(id) {
+                entry.3 = None;
+            } else if entry.3.is_none() {
+                entry.3 = Some(now);
+            }
+        }
+        while self.total > IMAGE_BUDGET {
             let Some((&oldest, _)) = self
                 .entries
                 .iter()
@@ -413,10 +530,26 @@ impl ImageCache {
             else {
                 break;
             };
-            if let Some((_, b, _)) = self.entries.remove(&oldest) {
+            if let Some((_, b, _, _)) = self.entries.remove(&oldest) {
                 self.total -= b;
             }
         }
+    }
+
+    /// Unlike pressure trimming, time-based reclamation includes small images.
+    /// An out-of-order sweep cannot expire a future inactivity timestamp.
+    pub(crate) fn expire_inactive(&mut self, visible: &HashSet<i32>, now: std::time::Instant) {
+        self.entries.retain(|id, (_, bytes, _, since)| {
+            let expired = !visible.contains(id)
+                && since
+                    .as_ref()
+                    .and_then(|at| now.checked_duration_since(*at))
+                    .is_some_and(|age| age >= PHOTO_IDLE);
+            if expired {
+                self.total -= *bytes;
+            }
+            !expired
+        });
     }
 
     #[cfg(test)]
@@ -612,6 +745,294 @@ pub(crate) fn clean_paste_dir() {
 }
 
 impl super::App {
+    pub(crate) fn photo_epoch(&self, window: WinId) -> PhotoEpoch {
+        PhotoEpoch {
+            client: self.session.client_id,
+            generation: self
+                .session
+                .photo_generations
+                .get(&window)
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    /// Advance one window's widget generation without dropping unrelated
+    /// pictures that remain displayed there.
+    fn advance_photo_epoch(&mut self, window: WinId) {
+        let generation = self.session.photo_generations.entry(window).or_default();
+        *generation = generation
+            .checked_add(1)
+            .expect("photo generation exhausted");
+        let epoch = PhotoEpoch {
+            client: self.session.client_id,
+            generation: *generation,
+        };
+        for ((owner_window, _), (_, shown_epoch)) in &mut self.session.photo_owners {
+            if *owner_window == window {
+                *shown_epoch = epoch;
+            }
+        }
+    }
+
+    /// A widget show is idempotent for its identity and cannot resurrect a
+    /// prior widget generation or a media source removed by a server update.
+    pub(super) fn photo_shown(
+        &mut self,
+        window: WinId,
+        owner: PhotoOwner,
+        file_id: i32,
+        epoch: PhotoEpoch,
+    ) -> Task<Msg> {
+        if epoch != self.photo_epoch(window) {
+            return Task::none();
+        }
+        let Some(pane) = self.session.panes.get(&window) else {
+            return Task::none();
+        };
+        if (window == self.main_window
+            && (self.main_window_state != super::MainWindowState::Open
+                || self.session.settings_open))
+            || pane.list.archive_settings.is_some()
+        {
+            return Task::none();
+        }
+        let sources = PhotoSources {
+            window,
+            pane,
+            stickers: &self.session.stickers,
+            video: self.session.video.as_ref(),
+            playback: &self.session.playback,
+        };
+        let bounds = if matches!(owner, PhotoOwner::Message(..)) {
+            let visible = pane.visible();
+            (visible.start, visible.end)
+        } else {
+            (0, pane.messages.len())
+        };
+        if !sources.contains(owner, file_id, bounds) {
+            return Task::none();
+        }
+        if self
+            .session
+            .photo_owners
+            .insert((window, owner), (file_id, epoch))
+            != Some((file_id, epoch))
+        {
+            self.refresh_photo_owners(std::time::Instant::now());
+        }
+        self.show_photo(file_id)
+    }
+
+    pub(super) fn photo_hidden(
+        &mut self,
+        window: WinId,
+        owner: PhotoOwner,
+        file_id: i32,
+        epoch: PhotoEpoch,
+    ) {
+        let key = (window, owner);
+        if epoch == self.photo_epoch(window)
+            && self.session.photo_owners.get(&key) == Some(&(file_id, epoch))
+        {
+            self.session.photo_owners.remove(&key);
+            self.refresh_photo_owners(std::time::Instant::now());
+        }
+    }
+
+    pub(super) fn clear_photo_owners(&mut self, window: WinId) {
+        let before = self.session.photo_owners.len();
+        self.session.photo_owners.retain(|(w, _), _| *w != window);
+        self.advance_photo_epoch(window);
+        if self.session.photo_owners.len() != before {
+            self.refresh_photo_owners(std::time::Instant::now());
+        }
+    }
+
+    pub(super) fn clear_picker_photos(&mut self, window: WinId) {
+        let before = self.session.photo_owners.len();
+        self.session
+            .photo_owners
+            .retain(|(w, owner), _| *w != window || !matches!(owner, PhotoOwner::Picker(..)));
+        self.advance_photo_epoch(window);
+        if self.session.photo_owners.len() != before {
+            self.refresh_photo_owners(std::time::Instant::now());
+        }
+    }
+
+    pub(super) fn clear_history_photos(&mut self, window: WinId) {
+        let before = self.session.photo_owners.len();
+        self.session
+            .photo_owners
+            .retain(|(w, owner), _| *w != window || !matches!(owner, PhotoOwner::Message(..)));
+        self.advance_photo_epoch(window);
+        if self.session.photo_owners.len() != before {
+            self.refresh_photo_owners(std::time::Instant::now());
+        }
+    }
+
+    /// A server replacement invalidates every displayed copy of this one
+    /// message, without touching other messages using the same file.
+    pub(super) fn clear_message_photos(&mut self, chat_id: i64, message_id: i64) {
+        let before = self.session.photo_owners.len();
+        self.session.photo_owners.retain(|(_, owner), _| {
+            !matches!(owner, PhotoOwner::Message(chat, message, _) if *chat == chat_id && *message == message_id)
+        });
+        for (&window, pane) in &self.session.panes {
+            if pane.chat_id != Some(chat_id) {
+                continue;
+            }
+            let generation = self.session.photo_generations.entry(window).or_default();
+            *generation = generation
+                .checked_add(1)
+                .expect("photo generation exhausted");
+        }
+        for ((window, _), (_, shown_epoch)) in &mut self.session.photo_owners {
+            if self
+                .session
+                .panes
+                .get(window)
+                .is_some_and(|pane| pane.chat_id == Some(chat_id))
+            {
+                *shown_epoch = PhotoEpoch {
+                    client: self.session.client_id,
+                    generation: self
+                        .session
+                        .photo_generations
+                        .get(window)
+                        .copied()
+                        .unwrap_or(0),
+                };
+            }
+        }
+        if self.session.photo_owners.len() != before {
+            self.refresh_photo_owners(std::time::Instant::now());
+        }
+    }
+
+    /// The inline player replaces this particular video's still preview.
+    pub(super) fn clear_video_thumbnail(&mut self, window: WinId, chat_id: i64, message_id: i64) {
+        if self
+            .session
+            .photo_owners
+            .remove(&(
+                window,
+                PhotoOwner::Message(chat_id, message_id, PhotoKind::Thumbnail),
+            ))
+            .is_some()
+        {
+            self.refresh_photo_owners(std::time::Instant::now());
+        }
+    }
+
+    /// The first decoded animation frame replaces its still thumbnail in
+    /// every window displaying the animation.
+    pub(super) fn clear_animation_thumbnails(&mut self, animation_id: i32) {
+        let before = self.session.photo_owners.len();
+        self.session.photo_owners.retain(|(window, owner), _| {
+            let PhotoOwner::Message(chat_id, message_id, PhotoKind::Thumbnail) = *owner else {
+                return true;
+            };
+            !self.session.panes.get(window).is_some_and(|pane| {
+                pane.chat_id == Some(chat_id) && pane.messages.iter().any(|message| {
+                    message.id == message_id
+                        && matches!(&message.media, Some(Media::Animation { file_id, .. }) if *file_id == animation_id)
+                })
+            })
+        });
+        if self.session.photo_owners.len() != before {
+            self.refresh_photo_owners(std::time::Instant::now());
+        }
+    }
+
+    fn refresh_photo_owners(&mut self, now: std::time::Instant) {
+        self.session.wanted_photos.clear();
+        self.session.wanted_photos.extend(
+            self.session
+                .photo_owners
+                .values()
+                .map(|(file_id, _)| *file_id),
+        );
+        self.session.images.trim(&self.session.wanted_photos, now);
+    }
+
+    /// Reconcile against constructed widget sources: iced never publishes a
+    /// hide when a sensor is removed or changes its key.
+    fn reconcile_photo_owners(&mut self, now: std::time::Instant, only_window: Option<WinId>) {
+        // A scroll event visits one pane and does not allocate. The periodic
+        // sweep caches one visible range per pane rather than walking its
+        // entire history once for every displayed image.
+        let scrolled_range = only_window
+            .and_then(|window| self.session.panes.get(&window).map(|pane| pane.visible()));
+        let mut ranges = HashMap::new();
+        if only_window.is_none() {
+            for &(window, owner) in self.session.photo_owners.keys() {
+                if matches!(owner, PhotoOwner::Message(..))
+                    && let Some(pane) = self.session.panes.get(&window)
+                {
+                    ranges.entry(window).or_insert_with(|| pane.visible());
+                }
+            }
+        }
+        let before = self.session.photo_owners.len();
+        self.session
+            .photo_owners
+            .retain(|(window, owner), (file_id, epoch)| {
+                if only_window.is_some_and(|target| target != *window) {
+                    return true;
+                }
+                let Some(pane) = self.session.panes.get(window) else {
+                    return false;
+                };
+                if epoch.client != self.session.client_id
+                    || epoch.generation
+                        != self
+                            .session
+                            .photo_generations
+                            .get(window)
+                            .copied()
+                            .unwrap_or(0)
+                    || (*window == self.main_window
+                        && (self.main_window_state != super::MainWindowState::Open
+                            || self.session.settings_open))
+                    || pane.list.archive_settings.is_some()
+                {
+                    return false;
+                }
+                let range = scrolled_range.as_ref().or_else(|| ranges.get(window));
+                let bounds = range.map_or((0, pane.messages.len()), |visible| {
+                    (visible.start, visible.end)
+                });
+                PhotoSources {
+                    window: *window,
+                    pane,
+                    stickers: &self.session.stickers,
+                    video: self.session.video.as_ref(),
+                    playback: &self.session.playback,
+                }
+                .contains(*owner, *file_id, bounds)
+            });
+        if before != self.session.photo_owners.len() {
+            self.refresh_photo_owners(now);
+        } else if only_window.is_none() {
+            self.session.images.trim(&self.session.wanted_photos, now);
+        }
+    }
+
+    pub(super) fn photo_scrolled(&mut self, window: WinId, now: std::time::Instant) {
+        if self.session.photo_owners.keys().any(|(w, _)| *w == window) {
+            self.reconcile_photo_owners(now, Some(window));
+        }
+    }
+
+    pub(super) fn memory_sweep(&mut self, now: std::time::Instant) {
+        self.reconcile_photo_owners(now, None);
+        self.session
+            .images
+            .expire_inactive(&self.session.wanted_photos, now);
+        self.reclaim_inactive_history(now);
+    }
+
     /// Remembers a file from a snapshot (a message parsed, a peer's photo).
     /// A stale snapshot repeats a file object that confirms no download at
     /// all, so what the client already knows — a download in flight, done,
@@ -698,15 +1119,17 @@ impl super::App {
             state.downloading = true;
             state.failed = false;
         }
+        let client_id = self.session.client_id;
         Task::perform(
-            td::download_file(self.session.client_id, file_id, priority),
-            move |result| Msg::FileRequestDone(file_id, result),
+            td::download_file(client_id, file_id, priority),
+            move |result| {
+                Msg::ForClient(client_id, Box::new(Msg::FileRequestDone(file_id, result)))
+            },
         )
     }
 
     /// A photo came into view: decode it if downloaded, else download it.
     pub(super) fn show_photo(&mut self, file_id: i32) -> Task<Msg> {
-        self.session.wanted_photos.insert(file_id);
         if self.session.images.get(file_id).is_some() {
             return Task::none();
         }
@@ -784,7 +1207,7 @@ impl super::App {
                     path.to_string_lossy().into_owned(),
                     as_photo,
                 ),
-                Msg::Done,
+                move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r))),
             )
         }))
     }

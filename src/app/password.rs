@@ -97,6 +97,7 @@ impl App {
                     return Task::none();
                 }
                 self.session.busy = true;
+                let client_id = self.session.client_id;
                 let password = std::mem::take(&mut self.session.input);
                 return Task::perform(
                     async move {
@@ -117,7 +118,9 @@ impl App {
                         .await
                         .map_err(|e| e.to_string())?
                     },
-                    |r| Msg::Password(PasswordMsg::Unlocked(r)),
+                    move |r| {
+                        Msg::ForClient(client_id, Box::new(Msg::Password(PasswordMsg::Unlocked(r))))
+                    },
                 );
             }
             PasswordMsg::Unlocked(result) => {
@@ -162,7 +165,7 @@ impl App {
                 }
             }
             PasswordMsg::ResetAccount => {
-                if self.key_transition_active() {
+                if self.session.busy || self.key_transition_active() {
                     self.error = Some("сначала завершите восстановление ключа".into());
                     return Task::none();
                 }
@@ -183,6 +186,7 @@ impl App {
                     && let Err(e) = crate::paths::remove_account_data(user)
                 {
                     self.error = Some(format!("данные аккаунта: {e}"));
+                    return Task::none();
                 }
                 if let Some(account) = self.settings.accounts.iter_mut().find(|a| a.slot == slot) {
                     account.lock_salt = None;
@@ -536,8 +540,8 @@ impl App {
         }
         let form = &mut self.session.password_form;
         if !remove {
-            if form.new.chars().count() < 4 {
-                form.message = Some(Err("пароль — не короче 4 символов".into()));
+            if form.new.chars().count() < 12 {
+                form.message = Some(Err("пароль — не короче 12 символов".into()));
                 form.current.clear();
                 form.new.clear();
                 form.repeat.clear();
@@ -618,7 +622,7 @@ impl App {
                             button("Удалить и войти заново")
                                 .style(button::danger)
                                 .on_press_maybe(
-                                    (!self.key_transition_active())
+                                    (!self.session.busy && !self.key_transition_active())
                                         .then_some(Msg::Password(PasswordMsg::ResetAccount))
                                 ),
                             button("Отмена")

@@ -72,7 +72,10 @@ pub(crate) fn pieces(text: &FormattedText) -> Vec<Piece> {
     let spans: Vec<(usize, usize, &TextEntityType)> = text
         .entities
         .iter()
-        .map(|e| (byte_at(e.offset), byte_at(e.offset + e.length), &e.r#type))
+        .filter_map(|e| {
+            let end = e.offset.checked_add(e.length)?;
+            Some((byte_at(e.offset), byte_at(end), &e.r#type))
+        })
         .filter(|(s, e, _)| s < e)
         .collect();
     let mut cuts: Vec<usize> = spans.iter().flat_map(|&(s, e, _)| [s, e]).collect();
@@ -298,6 +301,27 @@ mod tests {
                 ("кур".into(), false, true),
                 ("сив".into(), false, false),
             ]
+        );
+    }
+
+    #[test]
+    fn overflowing_entity_does_not_crash() {
+        let t = text(
+            "hello",
+            vec![
+                (i32::MAX, 1, TextEntityType::Bold),
+                (0, 5, TextEntityType::Italic),
+            ],
+        );
+        assert_eq!(
+            pieces(&t),
+            vec![Piece {
+                text: "hello".into(),
+                style: Style {
+                    italic: true,
+                    ..Style::default()
+                },
+            }]
         );
     }
 

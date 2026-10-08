@@ -42,7 +42,7 @@ use crate::archive::Archive;
 use crate::plugins::{self, Action, HostCmd, HostEvent, HostHandle, PluginInfo};
 use crate::settings::{CacheLimits, Settings};
 use crate::td;
-use media::Media;
+use media::{Media, PhotoEpoch, PhotoOwner};
 use pane::{ChatPane, Page};
 use session::{
     FolderCreation, FolderReorder, FolderReorderState, ListRead, Session, SettingsSection,
@@ -66,6 +66,10 @@ const FOLDER_CREATE_UNCONFIRMED: &str =
 #[derive(Debug, Clone)]
 pub(crate) enum Msg {
     Td(i32, Box<Update>),
+    /// Client that initiated an asynchronous pane or reply result.
+    ForClient(i32, Box<Msg>),
+    /// Initial history answer with its client and pane occupancy request.
+    HistoryResult(i32, u64, WinId, i64, Result<Vec<Message>, String>),
     Done(Result<(), String>),
     /// Completion of loading a separate archive window for one client.
     ArchiveWindowLoaded(WinId, i32, Result<(), String>),
@@ -88,6 +92,8 @@ pub(crate) enum Msg {
     CachePolicyApplied(i32, CacheLimits, Result<(), String>),
     AvatarSweepDone,
     AvatarSweepTick,
+    /// Periodic cache-pressure and ownership maintenance (real monotonic time).
+    MemorySweep(std::time::Instant),
     /// Opens a separate chat window, optionally with a chat already selected.
     OpenChatWindow(Option<i64>),
     /// Opens the archive list in its own window.
@@ -146,6 +152,9 @@ pub(crate) enum Msg {
     /// A picture's sensor reported it on screen: fetch it if missing, or
     /// keep it from being evicted from the cache while it stays there.
     AvatarShown(avatars::Peer),
+    /// High-resolution profile photo, requested only for displayed profiles.
+    ProfileAvatarShown(avatars::Peer),
+    ProfileAvatarDecoded(i32, i32, Result<Vec<u8>, String>),
     /// A file dragged onto a window: sent to its chat.
     FileDropped(WinId, PathBuf),
     /// Result of reading an image from the clipboard (Ctrl+V).
@@ -174,6 +183,7 @@ pub(crate) enum Msg {
     /// Where a Telegram link leads (`None`: open it in the browser).
     LinkResolved(WinId, String, Result<Option<td::LinkTarget>, String>),
     Joined(WinId, Result<Option<i64>, String>),
+    /// Left-button release also commits a finished history rectangle.
     MouseReleased,
     /// Click on a photo: the full-window viewer.
     ViewPhoto(WinId, i32),
@@ -187,8 +197,10 @@ pub(crate) enum Msg {
     OpenProfile(WinId, i64),
     Profile(WinId, ProfileAction),
     ProfileLoaded(WinId, i64, Result<td::Profile, String>),
-    /// A folder tab: its chats (`None` = all chats).
+    /// A folder in the left rail (`None` = all chats).
     ShowFolder(WinId, Option<i32>),
+    /// Show or hide this window's existing folder management controls.
+    ToggleFolderSettings(WinId),
     /// Move a folder among folder IDs, never the main chat list (true = up).
     ReorderFolder(WinId, i32, bool),
     FolderReordered(WinId, i32, u64, Result<(), String>),
@@ -272,6 +284,7 @@ pub(crate) enum Msg {
     VoiceToggle(i32),
     VoiceDecoded(i32, Result<playback::PcmHandle, String>),
     PlaybackTick,
+    AnimPlay(i32),
     /// Looped animations on screen / off screen / next frame / stream end.
     AnimShow(i32, media::Motion),
     AnimHide(i32),
@@ -279,8 +292,6 @@ pub(crate) enum Msg {
     /// The frame stream ended on its own (broken/empty file): frees the
     /// `MAX_ANIMATIONS` slot it held.
     AnimEnded(i32),
-    /// A video: opened in the system player once downloaded.
-    PlayVideo(i32),
     /// Voice recording in a chat window.
     RecordStart(WinId),
     RecordStarted(WinId, i64, Result<playback::RecorderHandle, String>),
@@ -293,6 +304,10 @@ pub(crate) enum Msg {
 pub(crate) enum PaneMsg {
     SelectChat(i64),
     HistoryLoaded(i64, Result<Vec<Message>, String>),
+    /// Response to this occupancy's refetch of a released tab.
+    ColdHistoryLoaded(i64, u64, Result<Vec<Message>, String>),
+    /// Bounded by-ID coherence read of a page affected by excessive updates.
+    ColdHistoryVerified(i64, u64, Result<Vec<Message>, String>),
     /// Page of messages older than the given id.
     OlderLoaded(i64, i64, Result<Vec<Message>, String>),
     /// Chat scrolled; near the top older history is requested.
@@ -303,6 +318,15 @@ pub(crate) enum PaneMsg {
     SearchScrolled(iced::widget::Id, Viewport),
     /// A rendered message reported its height (virtualization).
     Measured(i64, f32),
+    /// Press on a bubble without activating a child link or media control.
+    BubblePress(i64),
+    /// The second click completed on the same bubble without dragging.
+    BubbleRelease(i64),
+    /// A bubble drag or an interactive child interrupted a click sequence.
+    BubbleCancel,
+    RectangleStart(iced::Point),
+    RectangleMove(iced::Point),
+    RectangleHit(i64, bool),
     /// Typing in the input field.
     Compose(iced::widget::text_editor::Action),
     Send,
@@ -322,7 +346,6 @@ pub(crate) enum PaneMsg {
     ReactionsReady(i64, Result<Vec<String>, String>),
     /// "Переслать": pick a chat for these messages.
     Forward(Vec<i64>),
-    ForwardSelection,
     ForwardQuery(String),
     ForwardTo(i64),
     CancelForward,
@@ -361,11 +384,9 @@ pub(crate) enum PaneMsg {
     },
     /// Drop an archived copy of a message deleted on the server.
     Forget(i64),
-    /// A photo scrolled into view: download or decode it.
-    MediaVisible(i32),
-    /// A photo's sensor reported it left the screen: it may be evicted
-    /// from the cache again without hiding a picture the user still sees.
-    MediaHidden(i32),
+    /// A keyed picture widget came into view / left its viewport.
+    MediaShown(PhotoOwner, i32, PhotoEpoch),
+    MediaGone(PhotoOwner, i32, PhotoEpoch),
     /// "Прикрепить": pick files to send.
     Attach,
     FilesChosen(Vec<PathBuf>),
@@ -716,10 +737,10 @@ impl App {
         ) {
             return Task::none();
         }
-        Task::perform(
-            td::chat_roles(self.session.client_id, chat_id, kind),
-            move |r| Msg::RolesLoaded(chat_id, r),
-        )
+        let client_id = self.session.client_id;
+        Task::perform(td::chat_roles(client_id, chat_id, kind), move |r| {
+            Msg::ForClient(client_id, Box::new(Msg::RolesLoaded(chat_id, r)))
+        })
     }
 
     /// What goes next to a sender's name: the role (owner, admin, or an
@@ -750,10 +771,13 @@ impl App {
     }
 
     fn load_pinned(&self, window: WinId, chat_id: i64) -> Task<Msg> {
-        Task::perform(
-            td::pinned_messages(self.session.client_id, chat_id),
-            move |r| Msg::Pane(window, PaneMsg::PinnedLoaded(chat_id, r)),
-        )
+        let client_id = self.session.client_id;
+        Task::perform(td::pinned_messages(client_id, chat_id), move |r| {
+            Msg::ForClient(
+                client_id,
+                Box::new(Msg::Pane(window, PaneMsg::PinnedLoaded(chat_id, r))),
+            )
+        })
     }
 
     /// Receipt of an own message; `None` for others' messages.
@@ -933,7 +957,12 @@ impl App {
             Ok((api_id, api_hash)) => {
                 let client_id = tdlib_rs::create_client();
                 let app = Self::new(client_id, api_id, api_hash, settings, path, main_window);
-                (app, Task::perform(td::start(client_id), Msg::Done))
+                (
+                    app,
+                    Task::perform(td::start(client_id), move |r| {
+                        Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                    }),
+                )
             }
             Err(message) => {
                 // No TDLib client is created or started until configuration is fixed
@@ -966,7 +995,9 @@ impl App {
         }
         let client_id = tdlib_rs::create_client();
         self.session = Session::new(client_id, self.main_window, self.settings.active_account);
-        Task::perform(td::start(client_id), Msg::Done)
+        Task::perform(td::start(client_id), move |r| {
+            Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+        })
     }
 
     fn new(
@@ -1147,6 +1178,17 @@ impl App {
                 .map(|(slot, chat_id)| Msg::NotificationClicked(slot, chat_id)),
             iced::system::theme_changes().map(Msg::SystemTheme),
             iced::time::every(std::time::Duration::from_secs(86_400)).map(|_| Msg::AvatarSweepTick),
+            if !self.session.photo_owners.is_empty()
+                || self.session.images.has_entries()
+                || self.session.background.values().any(|pane| {
+                    pane.inactive_since.is_some()
+                        && (pane.messages.capacity() > 0 || !pane.heights.is_empty())
+                })
+            {
+                iced::time::every(std::time::Duration::from_secs(15)).map(Msg::MemorySweep)
+            } else {
+                Subscription::none()
+            },
             #[cfg(target_os = "linux")]
             Subscription::run(tray::run).map(Msg::Tray),
             if self.session.video.is_some() {
@@ -1163,7 +1205,7 @@ impl App {
             } else {
                 Subscription::none()
             },
-            if self.session.playback.busy() {
+            if self.session.playback.busy(&self.session.files) {
                 iced::time::every(std::time::Duration::from_millis(150)).map(|_| Msg::PlaybackTick)
             } else {
                 Subscription::none()
@@ -1415,13 +1457,17 @@ impl App {
                     if let Some(host) = &self.plugin_host {
                         host.send(HostCmd::Account(None));
                     }
-                    return Task::perform(td::log_out(self.session.client_id), Msg::Done);
+                    let client_id = self.session.client_id;
+                    return Task::perform(td::log_out(client_id), move |r| {
+                        Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                    });
                 }
             }
             Msg::OpenSettings => {
                 self.session.accounts_open = false;
                 self.session.confirm_logout = false;
                 self.session.settings_open = true;
+                self.clear_photo_owners(self.main_window);
                 if let Some(pane) = self.session.panes.get_mut(&self.main_window) {
                     pane.menu = None;
                     pane.list.archive_settings = None;
@@ -1502,6 +1548,7 @@ impl App {
                     return self.schedule_avatar_sweep();
                 }
             }
+            Msg::MemorySweep(now) => self.memory_sweep(now),
             Msg::SetKeepDeleted(keep) => return self.set_keep_deleted(keep),
             Msg::OpenChatWindow(chat_id) => {
                 if chat_id.is_some() {
@@ -1529,6 +1576,29 @@ impl App {
             }
             Msg::WindowClosed(window) => return self.on_window_closed(window),
             Msg::Key(window, key, modifiers) => return self.on_key(window, key, modifiers),
+            Msg::ForClient(client, msg) => {
+                if client != self.session.client_id {
+                    return Task::none();
+                }
+                return self.update_inner(*msg);
+            }
+            Msg::HistoryResult(client, request, window, chat_id, result) => {
+                if client != self.session.client_id {
+                    return Task::none();
+                }
+                let Some(pane) = self.session.panes.get_mut(&window) else {
+                    return Task::none();
+                };
+                if !pane.shows(chat_id)
+                    || pane.history_request != Some(request)
+                    || pane.cold.is_some()
+                {
+                    return Task::none();
+                }
+                pane.history_request = None;
+                return self
+                    .update_inner(Msg::Pane(window, PaneMsg::HistoryLoaded(chat_id, result)));
+            }
             Msg::Pane(window, msg) => return self.on_pane(window, msg),
             Msg::Plugin(event) => return self.on_plugin(event),
             Msg::PluginDone(origin, id, action, result) => {
@@ -1645,6 +1715,12 @@ impl App {
                 }
             }
             Msg::AvatarShown(peer) => return self.avatar_shown(peer),
+            Msg::ProfileAvatarShown(peer) => return self.profile_avatar_shown(peer),
+            Msg::ProfileAvatarDecoded(client_id, file_id, result) => {
+                if client_id == self.session.client_id {
+                    self.profile_avatar_decoded(file_id, result);
+                }
+            }
             Msg::ImageDecoded(file_id, result) => match result {
                 Ok((w, h, rgba)) => {
                     self.session
@@ -1673,8 +1749,18 @@ impl App {
             Msg::WindowFocus(window, focused) => {
                 if focused {
                     self.focused = Some(window);
-                } else if self.focused == Some(window) {
-                    self.focused = None;
+                } else {
+                    if let Some(pane) = self.session.panes.get_mut(&window) {
+                        pane.rectangle = None;
+                        pane.last_bubble_press = None;
+                        pane.pending_reply = None;
+                        if let Some(selection) = &mut pane.text_selection {
+                            selection.dragging = false;
+                        }
+                    }
+                    if self.focused == Some(window) {
+                        self.focused = None;
+                    }
                 }
             }
             #[cfg(target_os = "linux")]
@@ -1784,8 +1870,14 @@ impl App {
             },
             Msg::MouseReleased => {
                 for pane in self.session.panes.values_mut() {
+                    pane.pending_reply = None;
                     if let Some(sel) = &mut pane.text_selection {
                         sel.dragging = false;
+                    }
+                    if let Some(rectangle) = pane.rectangle.take() {
+                        pane.selected = (!rectangle.hits.is_empty()).then_some(rectangle.hits);
+                        pane.delete_selection = None;
+                        pane.menu = None;
                     }
                 }
             }
@@ -1849,6 +1941,11 @@ impl App {
                     *data = Some(result);
                 }
             }
+            Msg::ToggleFolderSettings(window) => {
+                if let Some(pane) = self.session.panes.get_mut(&window) {
+                    pane.list.folder_settings_open = !pane.list.folder_settings_open;
+                }
+            }
             Msg::ShowFolder(window, folder) => {
                 if let Some(pane) = self.session.panes.get_mut(&window) {
                     pane.list.folder = folder;
@@ -1871,7 +1968,10 @@ impl App {
                         ChatList::Folder(tdlib_rs::types::ChatListFolder { chat_folder_id: id });
                     return Task::batch([
                         reset,
-                        Task::perform(td::load_list(self.session.client_id, list, 100), Msg::Done),
+                        Task::perform(td::load_list(self.session.client_id, list, 100), {
+                            let client_id = self.session.client_id;
+                            move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                        }),
                     ]);
                 }
                 return reset;
@@ -2073,7 +2173,10 @@ impl App {
                         reset,
                         Task::perform(
                             td::load_list(self.session.client_id, ChatList::Archive, 100),
-                            Msg::Done,
+                            {
+                                let client_id = self.session.client_id;
+                                move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                            },
                         ),
                     ]);
                 }
@@ -2300,7 +2403,10 @@ impl App {
                 if self.session.auth == Auth::Phone && !self.session.busy {
                     self.session.busy = true;
                     self.error = None;
-                    return Task::perform(td::request_qr(self.session.client_id), Msg::Done);
+                    let client_id = self.session.client_id;
+                    return Task::perform(td::request_qr(client_id), move |r| {
+                        Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                    });
                 }
             }
             Msg::TypingTick => self.session.typing.tick(std::time::Instant::now()),
@@ -2367,11 +2473,11 @@ impl App {
                 Err(e) => self.error = Some(e),
             },
             Msg::PlaybackTick => return self.playback_tick(),
+            Msg::AnimPlay(file_id) => return self.animation_play(file_id),
             Msg::AnimShow(file_id, motion) => return self.animation_shown(file_id, motion),
             Msg::AnimHide(file_id) => self.animation_hidden(file_id),
             Msg::AnimFrame(file_id, w, h, rgba) => self.animation_frame(file_id, w, h, rgba),
             Msg::AnimEnded(file_id) => self.animation_ended(file_id),
-            Msg::PlayVideo(file_id) => return self.play_video(file_id),
             Msg::RecordStart(window) => {
                 if window != self.main_window || self.main_window_state == MainWindowState::Open {
                     return self.record_start(window);
@@ -2448,6 +2554,14 @@ impl App {
         }
         match key.as_ref() {
             Key::Named(keyboard::key::Named::Escape) => {
+                if let Some(pane) = self.session.panes.get_mut(&window) {
+                    let cancelled_rectangle = pane.rectangle.take().is_some();
+                    let cancelled_reply = pane.pending_reply.take().is_some();
+                    if cancelled_rectangle || cancelled_reply {
+                        pane.last_bubble_press = None;
+                        return Task::none();
+                    }
+                }
                 if window == self.main_window
                     && (self.session.accounts_open || self.session.confirm_logout)
                 {
@@ -2456,6 +2570,11 @@ impl App {
                     return Task::none();
                 }
                 // Esc closes the innermost thing: menu, reply, edit, then search.
+                if let Some(pane) = self.session.panes.get_mut(&window)
+                    && pane.menu.is_some()
+                {
+                    pane.delete_selection = None;
+                }
                 if let Some(pane) = self.session.panes.get_mut(&window)
                     && pane.list.new_folder_name.is_some()
                 {
@@ -2684,6 +2803,7 @@ impl App {
     }
 
     fn on_window_closed(&mut self, window: WinId) -> Task<Msg> {
+        self.clear_photo_owners(window);
         if window == self.main_window {
             if self.key_transition_active() {
                 // A compositor may destroy the window without sending a
@@ -2718,6 +2838,7 @@ impl App {
         }
         self.close_video_in(window);
         let cancel = self.cancel_recording_in(window);
+        self.session.photo_generations.remove(&window);
         let Some(pane) = self.session.panes.remove(&window) else {
             return cancel;
         };
@@ -2878,7 +2999,10 @@ impl App {
 
                 self.announce_account();
                 return Task::batch([
-                    Task::perform(td::load_chats(self.session.client_id, 200), Msg::Done),
+                    Task::perform(td::load_chats(self.session.client_id, 200), {
+                        let client_id = self.session.client_id;
+                        move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                    }),
                     Task::perform(td::enable_notifications(self.session.client_id), |()| {
                         Msg::Ignore
                     }),
@@ -2944,16 +3068,16 @@ impl App {
         let request = match self.session.auth {
             Auth::Phone => Task::perform(
                 td::send_phone(id, self.session.input.trim().to_owned()),
-                Msg::Done,
+                move |r| Msg::ForClient(id, Box::new(Msg::Done(r))),
             ),
             Auth::Code => Task::perform(
                 td::send_code(id, self.session.input.trim().to_owned()),
-                Msg::Done,
+                move |r| Msg::ForClient(id, Box::new(Msg::Done(r))),
             ),
             // Password is not trimmed: spaces may be part of it.
             Auth::Password { .. } => Task::perform(
                 td::send_password(id, std::mem::take(&mut self.session.input)),
-                Msg::Done,
+                move |r| Msg::ForClient(id, Box::new(Msg::Done(r))),
             ),
             _ => return Task::none(),
         };
@@ -2979,15 +3103,23 @@ impl App {
         if window == self.main_window {
             return cancel.chain(self.show_in_main(chat_id));
         }
+        if self
+            .session
+            .panes
+            .get(&window)
+            .is_some_and(|pane| pane.shows(chat_id))
+        {
+            return cancel;
+        }
+        self.clear_photo_owners(window);
         let Some(pane) = self.session.panes.get_mut(&window) else {
             return cancel;
         };
-        if pane.shows(chat_id) {
-            return cancel;
-        }
         let previous = pane.chat_id;
         let left_draft = pane.draft();
         pane.switch_to(chat_id);
+        let request = nav::request_id();
+        pane.history_request = Some(request);
         let close = match previous {
             Some(prev) => Task::batch([
                 self.sync_draft(prev, left_draft),
@@ -2995,10 +3127,12 @@ impl App {
             ]),
             None => Task::none(),
         };
-        cancel.chain(close).chain(Task::perform(
-            td::open_chat(self.session.client_id, chat_id),
-            move |r| Msg::Pane(window, PaneMsg::HistoryLoaded(chat_id, r)),
-        ))
+        let client_id = self.session.client_id;
+        cancel
+            .chain(close)
+            .chain(Task::perform(td::open_chat(client_id, chat_id), move |r| {
+                Msg::HistoryResult(client_id, request, window, chat_id, r)
+            }))
     }
 
     /// A chat's input field was left: its text becomes the chat's draft in
@@ -3021,10 +3155,10 @@ impl App {
             return Task::none();
         }
         self.session.synced_drafts.insert(chat_id, text.clone());
-        Task::perform(
-            td::save_draft(self.session.client_id, chat_id, text),
-            Msg::Done,
-        )
+        let client_id = self.session.client_id;
+        Task::perform(td::save_draft(client_id, chat_id, text), move |r| {
+            Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+        })
     }
 
     /// An opened chat with an empty input field gets its saved draft.
@@ -3040,10 +3174,15 @@ impl App {
             .get(&chat_id)
             .and_then(|c| c.draft.clone())
         {
-            Some(draft) if empty => Task::perform(
-                td::draft_markdown(self.session.client_id, draft),
-                move |r| Msg::Pane(window, PaneMsg::DraftLoaded(chat_id, r)),
-            ),
+            Some(draft) if empty => {
+                let client_id = self.session.client_id;
+                Task::perform(td::draft_markdown(client_id, draft), move |r| {
+                    Msg::ForClient(
+                        client_id,
+                        Box::new(Msg::Pane(window, PaneMsg::DraftLoaded(chat_id, r))),
+                    )
+                })
+            }
             _ => Task::none(),
         }
     }
@@ -3108,12 +3247,18 @@ impl App {
         if !self.auth_ready() || self.session.leave.is_some() {
             return Task::none();
         }
+        if !self
+            .session
+            .panes
+            .get(&window)
+            .is_some_and(|pane| pane.list.archive && pane.list.archive_settings.is_none())
+        {
+            return Task::none();
+        }
+        self.clear_photo_owners(window);
         let Some(pane) = self.session.panes.get_mut(&window) else {
             return Task::none();
         };
-        if !pane.list.archive || pane.list.archive_settings.is_some() {
-            return Task::none();
-        }
         pane.list.archive_settings = Some(pane::ArchiveSettings {
             request: 0,
             loading: false,
@@ -3356,8 +3501,9 @@ impl App {
         else {
             return Task::none();
         };
-        Task::perform(td::profile(self.session.client_id, kind), move |r| {
-            Msg::ProfileLoaded(window, chat_id, r)
+        let client_id = self.session.client_id;
+        Task::perform(td::profile(client_id, kind), move |r| {
+            Msg::ForClient(client_id, Box::new(Msg::ProfileLoaded(window, chat_id, r)))
         })
     }
 
@@ -3662,21 +3808,27 @@ impl App {
             ChatList::Main
         };
         match op {
-            ChatOp::Pin(on) => Task::perform(td::pin_chat(client, chat_id, list, on), Msg::Done),
+            ChatOp::Pin(on) => Task::perform(td::pin_chat(client, chat_id, list, on), move |r| {
+                Msg::ForClient(client, Box::new(Msg::Done(r)))
+            }),
             ChatOp::Archive(on) => {
                 let to = if on {
                     ChatList::Archive
                 } else {
                     ChatList::Main
                 };
-                Task::perform(td::move_chat(client, chat_id, to), Msg::Done)
+                Task::perform(td::move_chat(client, chat_id, to), move |r| {
+                    Msg::ForClient(client, Box::new(Msg::Done(r)))
+                })
             }
             ChatOp::Mute(on) => {
                 let mut settings = chat.notify.clone();
                 settings.use_default_mute_for = false;
                 // "Forever" is the largest period TDLib accepts.
                 settings.mute_for = if on { i32::MAX } else { 0 };
-                Task::perform(td::set_notifications(client, chat_id, settings), Msg::Done)
+                Task::perform(td::set_notifications(client, chat_id, settings), move |r| {
+                    Msg::ForClient(client, Box::new(Msg::Done(r)))
+                })
             }
             ChatOp::Close => Task::none(),
             ChatOp::LocalPin(_) | ChatOp::Folders | ChatOp::NewFolder => Task::none(),
@@ -4049,10 +4201,13 @@ impl App {
             return Task::none();
         };
         pane.loading_older = true;
-        Task::perform(
-            td::history_page(self.session.client_id, chat_id, before),
-            move |r| Msg::Pane(window, PaneMsg::OlderLoaded(chat_id, before, r)),
-        )
+        let client_id = self.session.client_id;
+        Task::perform(td::history_page(client_id, chat_id, before), move |r| {
+            Msg::ForClient(
+                client_id,
+                Box::new(Msg::Pane(window, PaneMsg::OlderLoaded(chat_id, before, r))),
+            )
+        })
     }
 
     /// Converts a history page (ids below `upper`) into confirmed items sorted
@@ -4107,10 +4262,9 @@ impl App {
     }
 
     /// Turning the setting off hides archived deleted messages (the archive
-    /// is kept); turning it on merges them back into every pane's currently
-    /// loaded range, foreground or background, without touching compose,
-    /// reply, edit or selection state (no TDLib round trip is needed: the
-    /// archive already has them).
+    /// is kept); turning it on merges them back into loaded pane ranges,
+    /// foreground or warm background. Cold tabs stay released until their
+    /// keyed refetch; compose, reply, edit and selection are unchanged.
     fn set_keep_deleted(&mut self, keep: bool) -> Task<Msg> {
         if self.settings.keep_deleted == keep {
             return Task::none();
@@ -4127,6 +4281,9 @@ impl App {
             let Some(chat_id) = pane.chat_id else {
                 continue;
             };
+            if pane.cold.is_some() {
+                continue;
+            }
             if !keep {
                 pane.messages.retain(|m| !m.deleted);
                 continue;

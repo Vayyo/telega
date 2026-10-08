@@ -253,3 +253,102 @@ fn composer_icon(icon: usize, color: Color) -> image::Handle {
         .collect();
     image::Handle::from_rgba(SIDE, SIDE, rgba)
 }
+
+/// Cached rail icons; switching themes only selects a handle.
+#[derive(Clone, Copy)]
+pub(crate) enum FolderRailIcon {
+    All,
+    Folder,
+    Settings,
+}
+
+impl FolderRailIcon {
+    pub(crate) fn handle(self, light: bool) -> image::Handle {
+        let icons = if light {
+            &*FOLDER_RAIL_LIGHT
+        } else {
+            &*FOLDER_RAIL_DARK
+        };
+        icons[self as usize].clone()
+    }
+}
+
+static FOLDER_RAIL_LIGHT: LazyLock<[image::Handle; 3]> = LazyLock::new(|| {
+    std::array::from_fn(|i| folder_rail_icon(i, Color::from_rgba8(255, 255, 255, 255)))
+});
+static FOLDER_RAIL_DARK: LazyLock<[image::Handle; 3]> =
+    LazyLock::new(|| std::array::from_fn(|i| folder_rail_icon(i, Color::from_rgba8(0, 0, 0, 255))));
+
+fn folder_rail_icon(icon: usize, color: Color) -> image::Handle {
+    let mut pixmap = Pixmap::new(SIDE, SIDE).expect("icon size");
+    let paint = Paint {
+        anti_alias: true,
+        shader: tiny_skia::Shader::SolidColor(color),
+        ..Paint::default()
+    };
+    let stroke = Stroke {
+        width: 3.2,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Stroke::default()
+    };
+    let mut path = PathBuilder::new();
+    match icon {
+        0 => {
+            path.move_to(6.0, 9.0);
+            path.line_to(34.0, 9.0);
+            path.line_to(34.0, 27.0);
+            path.line_to(24.0, 27.0);
+            path.line_to(18.0, 33.0);
+            path.line_to(18.0, 27.0);
+            path.line_to(6.0, 27.0);
+            path.close();
+            path.move_to(12.0, 16.0);
+            path.line_to(28.0, 16.0);
+            path.move_to(12.0, 21.0);
+            path.line_to(23.0, 21.0);
+        }
+        1 => {
+            path.move_to(4.0, 11.0);
+            path.line_to(16.0, 11.0);
+            path.line_to(20.0, 15.0);
+            path.line_to(36.0, 15.0);
+            path.line_to(33.0, 32.0);
+            path.line_to(7.0, 32.0);
+            path.close();
+        }
+        _ => {
+            path.push_circle(20.0, 20.0, 9.0);
+            path.push_circle(20.0, 20.0, 3.0);
+            for (dx, dy) in [
+                (0.0, 1.0),
+                (0.0, -1.0),
+                (1.0, 0.0),
+                (-1.0, 0.0),
+                (0.7, 0.7),
+                (-0.7, 0.7),
+                (0.7, -0.7),
+                (-0.7, -0.7),
+            ] {
+                path.move_to(20.0 + dx * 11.0, 20.0 + dy * 11.0);
+                path.line_to(20.0 + dx * 15.0, 20.0 + dy * 15.0);
+            }
+        }
+    }
+    pixmap.stroke_path(
+        &path.finish().unwrap(),
+        &paint,
+        &stroke,
+        Transform::identity(),
+        None,
+    );
+    let rgba: Vec<u8> = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|p| {
+            let c = p.demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+        .collect();
+    image::Handle::from_rgba(SIDE, SIDE, rgba)
+}

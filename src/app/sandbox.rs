@@ -323,6 +323,13 @@ pub(super) fn world() -> App {
         [240, 150, 90],
         [200, 60, 100],
     );
+    photo(
+        &mut app,
+        avatars::Peer::User(ME),
+        9003,
+        [110, 190, 150],
+        [35, 85, 110],
+    );
     app
 }
 
@@ -523,7 +530,16 @@ fn cards(app: &mut App) {
         vec![link, poll(2, false), poll(3, true), contact, venue],
     );
     // The link picture as the app gets it: shown, decoded, cached.
-    let _ = app.update(Msg::Pane(window_of(app), PaneMsg::MediaVisible(9100)));
+    let window = window_of(app);
+    let epoch = app.photo_epoch(window);
+    let _ = app.update(Msg::Pane(
+        window,
+        PaneMsg::MediaShown(
+            media::PhotoOwner::Message(4, 1, media::PhotoKind::Link),
+            9100,
+            epoch,
+        ),
+    ));
     let decoded = media::decode(&thumb.to_string_lossy());
     let _ = app.update(Msg::ImageDecoded(9100, decoded));
 }
@@ -590,6 +606,77 @@ fn sandbox_looks() {
         ));
         println!("{}", scene(name, &mut app).display());
     }
+
+    // The same synthetic account and cached portraits in the actual main-window
+    // layout. Extra tabs make the avatar strip overflow in the narrow scene.
+    let mut app = world();
+    let window = app.main_window;
+    for chat in [2, 3, 4, 5, 6, 7, 1] {
+        let _ = app.update(Msg::Pane(window, PaneMsg::SelectChat(chat)));
+    }
+    group(&mut app);
+    println!("{}", scene("folder-rail-normal", &mut app).display());
+
+    let clicked = click_sized(&mut app, window, SIZE, iced::Point::new(36.0, 670.0));
+    assert!(
+        clicked
+            .iter()
+            .any(|message| matches!(message, Msg::ToggleFolderSettings(id) if *id == window)),
+        "the bottom folder-settings control must receive the click"
+    );
+    assert!(
+        app.session.panes[&window].list.folder_settings_open,
+        "clicking the footer must open the folder controls"
+    );
+    println!("{}", scene("folder-rail-settings", &mut app).display());
+
+    let mut overflow = world();
+    let window = overflow.main_window;
+    for chat in [2, 3, 4, 5, 6, 7, 1] {
+        let _ = overflow.update(Msg::Pane(window, PaneMsg::SelectChat(chat)));
+    }
+    group(&mut overflow);
+    let mut folders = folders_update(&[
+        (1, "Личные"),
+        (2, "Работа"),
+        (3, "Семья"),
+        (4, "Долгие обсуждения"),
+        (5, "Очень важные проекты"),
+        (6, "Новости"),
+        (7, "Учёба"),
+        (8, "Поездки"),
+        (9, "Друзья"),
+        (10, "Книги и заметки"),
+        (11, "Объявления"),
+        (12, "Сохранённые обсуждения"),
+    ]);
+    folders["main_chat_list_position"] = json!(2);
+    td(&mut overflow, folders);
+    overflow.set_folder_order(1, 5, 99);
+    overflow.session.folder_unread.insert(5, (9, 4));
+    overflow.session.folder_unread.insert(10, (18, 12));
+    let _ = overflow.update(Msg::ShowFolder(window, Some(5)));
+    assert_eq!(overflow.session.panes[&window].list.folder, Some(5));
+    println!(
+        "{}",
+        scene_sized(
+            "folder-rail-overflow",
+            &mut overflow,
+            Size::new(1000.0, 600.0)
+        )
+        .display()
+    );
+
+    let mut narrow = world();
+    let window = narrow.main_window;
+    for chat in [2, 3, 4, 5, 6, 7, 1] {
+        let _ = narrow.update(Msg::Pane(window, PaneMsg::SelectChat(chat)));
+    }
+    group(&mut narrow);
+    println!(
+        "{}",
+        scene_sized("folder-rail-narrow", &mut narrow, Size::new(760.0, 450.0)).display()
+    );
 }
 
 #[test]
@@ -669,12 +756,12 @@ fn sandbox_main_header() {
     assert!(app.session.accounts_open);
     println!("{}", scene("main-header-accounts", &mut app).display());
 
-    let logout = click(&mut app, window, iced::Point::new(92.0, 88.0));
+    let logout = click(&mut app, window, iced::Point::new(92.0, 94.0));
     assert!(logout.iter().any(|m| matches!(m, Msg::LogOut)));
     assert!(!app.session.accounts_open && app.session.confirm_logout);
     println!("{}", scene("main-header-confirm", &mut app).display());
 
-    let cancel = click(&mut app, window, iced::Point::new(94.0, 105.0));
+    let cancel = click(&mut app, window, iced::Point::new(94.0, 111.0));
     assert!(
         cancel
             .iter()
@@ -683,7 +770,7 @@ fn sandbox_main_header() {
     assert_eq!(app.session.auth, Auth::Ready);
     assert!(!app.session.confirm_logout);
     let _ = click(&mut app, window, iced::Point::new(21.0, 19.0));
-    let outside = click(&mut app, window, iced::Point::new(720.0, 400.0));
+    let outside = click(&mut app, window, iced::Point::new(32.0, 400.0));
     assert!(
         outside
             .iter()
@@ -691,8 +778,8 @@ fn sandbox_main_header() {
     );
     assert!(!app.session.accounts_open);
     let _ = click(&mut app, window, iced::Point::new(21.0, 19.0));
-    let _ = click(&mut app, window, iced::Point::new(92.0, 88.0));
-    let outside = click(&mut app, window, iced::Point::new(720.0, 400.0));
+    let _ = click(&mut app, window, iced::Point::new(92.0, 94.0));
+    let outside = click(&mut app, window, iced::Point::new(32.0, 400.0));
     assert!(
         outside
             .iter()
@@ -747,12 +834,12 @@ fn sandbox_main_header() {
     assert!(tab.iter().any(|m| matches!(m, Msg::SelectTab(2))));
     assert!(!app.session.settings_open);
     assert_eq!(app.session.panes[&window].chat_id, Some(2));
-    let trash = click(&mut app, window, iced::Point::new(99.0, 19.0));
+    let trash = click(&mut app, window, iced::Point::new(105.0, 19.0));
     assert!(trash.iter().any(|m| matches!(m, Msg::CloseAllTabs)));
     assert_eq!(app.session.tabs.chats, [2]);
     let _ = click(&mut app, window, iced::Point::new(21.0, 19.0));
-    let _ = click(&mut app, window, iced::Point::new(92.0, 88.0));
-    let yes = click(&mut app, window, iced::Point::new(35.0, 103.0));
+    let _ = click(&mut app, window, iced::Point::new(92.0, 94.0));
+    let yes = click(&mut app, window, iced::Point::new(35.0, 109.0));
     assert!(yes.iter().any(|m| matches!(m, Msg::ConfirmLogOut(true))));
     assert_eq!(app.session.auth, Auth::LoggingOut);
 }
@@ -1662,9 +1749,18 @@ fn sandbox_scenes() {
         window_of(&app),
         PaneMsg::PickerTab(picker::Tab::Set(77)),
     ));
-    for s in &stickers {
+    for (index, s) in stickers.iter().enumerate() {
         let id = s.file.id;
-        let _ = app.update(Msg::Pane(window_of(&app), PaneMsg::MediaVisible(id)));
+        let window = window_of(&app);
+        let epoch = app.photo_epoch(window);
+        let _ = app.update(Msg::Pane(
+            window,
+            PaneMsg::MediaShown(
+                media::PhotoOwner::Picker(picker::Tab::Set(77), index),
+                id,
+                epoch,
+            ),
+        ));
         let decoded = media::decode(&s.file.local.path);
         let _ = app.update(Msg::ImageDecoded(id, decoded));
     }
@@ -1912,11 +2008,11 @@ fn sandbox_sidebar_status() {
         label: &str,
     ) {
         let (left, right, top, bottom) = if pin {
-            (190, 295, row_top + 4, row_top + 27)
+            (262, 367, row_top + 4, row_top + 27)
         } else {
-            (55, 190, row_top + 26, row_top + 49)
+            (127, 262, row_top + 26, row_top + 49)
         };
-        let background = pixel(shown, 180, row_top + 46);
+        let background = pixel(shown, 252, row_top + 46);
         let mut glyph = 0;
         let mut readable = 0;
         let mut max_contrast = 0.0_f64;
@@ -2014,12 +2110,12 @@ fn sandbox_sidebar_status() {
             }
             // Find the selected row from its *rendered* background, not from
             // a theme definition or a fabricated style copy.
-            let sidebar = pixel(&shown, 180, 450);
+            let sidebar = pixel(&shown, 252, 450);
             let first = (90..400)
                 .find(|&y| {
-                    let color = pixel(&shown, 180, y);
+                    let color = pixel(&shown, 252, y);
                     color != sidebar
-                        && (0..38).all(|offset| pixel(&shown, 180, y + offset) == color)
+                        && (0..38).all(|offset| pixel(&shown, 252, y + offset) == color)
                 })
                 .expect("selected chat's painted row");
             assert_eq!(app.displayed_chat_ids(window).unwrap()[..2], [2, 3]);
@@ -2027,7 +2123,7 @@ fn sandbox_sidebar_status() {
             for (row, name) in [(first, "selected"), (first + 52, "unselected")] {
                 check_status(&shown, &baseline, row, row == first, true, name);
                 check_status(&shown, &baseline, row, row == first, false, name);
-                let cursor = Some(iced::Point::new(180.0, (row + 36) as f32));
+                let cursor = Some(iced::Point::new(252.0, (row + 36) as f32));
                 app.session.local_main.clear();
                 app.session.typing = Default::default();
                 let without_hover = draw(&mut app, window, cursor);

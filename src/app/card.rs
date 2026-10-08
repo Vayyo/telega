@@ -135,8 +135,9 @@ impl App {
                 };
                 card.busy = true;
                 let (user, name) = (card.user_id, data.name.clone());
-                return Task::perform(td::add_contact(self.session.client_id, user, name), |r| {
-                    Msg::Card(CardMsg::Done(r))
+                let client_id = self.session.client_id;
+                return Task::perform(td::add_contact(client_id, user, name), move |r| {
+                    Msg::ForClient(client_id, Box::new(Msg::Card(CardMsg::Done(r))))
                 });
             }
             CardMsg::Block => {
@@ -154,8 +155,9 @@ impl App {
                 card.confirm_block = false;
                 card.busy = true;
                 let (user, block) = (card.user_id, !data.blocked);
-                return Task::perform(td::set_blocked(self.session.client_id, user, block), |r| {
-                    Msg::Card(CardMsg::Done(r))
+                let client_id = self.session.client_id;
+                return Task::perform(td::set_blocked(client_id, user, block), move |r| {
+                    Msg::ForClient(client_id, Box::new(Msg::Card(CardMsg::Done(r))))
                 });
             }
             CardMsg::Done(result) => {

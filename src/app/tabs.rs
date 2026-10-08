@@ -1,9 +1,11 @@
 //! Browser-like tabs of recent chats in the main window.
 //!
 //! The active tab is the main window's pane; background tabs keep their pane
-//! (history, draft, scroll position) in `App::background` and still receive
-//! updates, but TDLib considers only the active chat opened. Chats shown in a
-//! separate window are hidden from the tab bar while that window is open.
+//! (history and draft) in `App::background`; inactive histories expire after
+//! five minutes, but TDLib considers only the active chat opened. Chats shown
+//! in a separate window are hidden from the tab bar while that window is open.
+
+use std::time::{Duration, Instant};
 
 use iced::Task;
 use iced::widget::scrollable::AbsoluteOffset;
@@ -118,19 +120,55 @@ impl App {
     /// Shows a chat in the main window, as a tab.
     pub(crate) fn show_in_main(&mut self, chat_id: i64) -> Task<Msg> {
         if self.main_chat() == Some(chat_id) {
+            // A failed cold page (or failed jump from one) stays cold until
+            // the user explicitly selects this tab again.
+            let retry = self
+                .session
+                .panes
+                .get_mut(&self.main_window)
+                .filter(|pane| pane.jump_pending.is_none())
+                .and_then(|pane| pane.cold.as_mut())
+                .filter(|cold| cold.request.is_none())
+                .map(|cold| {
+                    let request = super::nav::request_id();
+                    cold.request = Some(request);
+                    cold.pending_page = None;
+                    cold.verified_ids.clear();
+                    (request, cold.anchor)
+                });
+            if let Some((request, anchor)) = retry {
+                return self.request_cold_page(self.main_window, chat_id, request, anchor);
+            }
             return Task::none();
         }
+        self.clear_photo_owners(self.main_window);
         self.add_tab(chat_id);
         self.session.tabs.touch(chat_id);
         let restored = self.session.background.remove(&chat_id);
-        // A pane cached with no history at all (its answer was lost while
-        // backgrounded, see the flag reset below) must reload like a fresh
-        // chat instead of the light `reopen_chat` path.
-        let has_history = restored.as_ref().is_some_and(|p| p.oldest_loaded.is_some());
+        // A released tab must reload independently of an initially empty
+        // chat; its saved reading anchor determines which TDLib page to fetch.
+        let has_history = restored
+            .as_ref()
+            .is_some_and(|p| p.cold.is_none() && p.oldest_loaded.is_some());
         let mut next = restored.unwrap_or_else(|| {
             let mut pane = ChatPane::default();
             pane.switch_to(chat_id);
             pane
+        });
+        next.inactive_since = None;
+        next.history_request = None;
+        let cold = next.cold.as_mut().map(|cold| {
+            let request = super::nav::request_id();
+            cold.request = Some(request);
+            cold.changes.clear();
+            cold.pending_page = None;
+            cold.verified_ids.clear();
+            cold.preexisting.clear();
+            cold.preexisting.extend(next.messages.iter().map(|m| m.id));
+            cold.preexisting
+                .extend(next.held_messages.iter().map(|m| m.id));
+            cold.overflowed = false;
+            (request, cold.anchor)
         });
         next.list = self.take_main_list();
         let Some(slot) = self.session.panes.get_mut(&self.main_window) else {
@@ -166,9 +204,19 @@ impl App {
                     // moved, so its answer is dropped and must not leave
                     // the tab stuck "loading" forever once restored.
                     previous.loading_older = false;
-                    previous.loading_newer = false;
+                    previous.pause_newer_loading();
                     previous.jump_pending = None;
                     previous.jumped = false;
+                    previous.inactive_since = Some(Instant::now());
+                    previous.history_request = None;
+                    previous.restoring_anchor = None;
+                    if let Some(cold) = &mut previous.cold {
+                        cold.request = None;
+                        cold.changes.clear();
+                        cold.pending_page = None;
+                        cold.verified_ids.clear();
+                        cold.overflowed = false;
+                    }
                     if let Some(search) = &mut previous.search
                         && search.paging.pending.take().is_some()
                         && search.results.is_none()
@@ -184,9 +232,11 @@ impl App {
         let saved = self.save_tabs();
         let client_id = self.session.client_id;
         let window = self.main_window;
-        let open = if has_history {
-            // History is kept current by updates; only tell TDLib the chat is
-            // opened again, mark what is visible as read and restore scroll.
+        let open = if let Some((request, anchor)) = cold {
+            self.request_cold_page(window, chat_id, request, anchor)
+        } else if has_history {
+            // Warm history stays current by updates. Reopen the chat, mark
+            // visible messages read and restore its viewport.
             // Pinned messages are not: an `updateMessageIsPinned` while this
             // tab was backgrounded may have arrived before its very first
             // load finished and been lost with it, so it is refetched here.
@@ -200,11 +250,48 @@ impl App {
                 self.load_pinned(window, chat_id),
             ])
         } else {
+            let request = super::nav::request_id();
+            self.session.panes.get_mut(&window).unwrap().history_request = Some(request);
             Task::perform(td::open_chat(client_id, chat_id), move |r| {
-                Msg::Pane(window, PaneMsg::HistoryLoaded(chat_id, r))
+                Msg::HistoryResult(client_id, request, window, chat_id, r)
             })
         };
         Task::batch([close.chain(open), search_scroll, saved])
+    }
+
+    /// Open this chat once, then load its latest or anchored TDLib page.
+    pub(super) fn request_cold_page(
+        &self,
+        window: super::WinId,
+        chat_id: i64,
+        request: u64,
+        anchor: Option<super::pane::HistoryAnchor>,
+    ) -> Task<Msg> {
+        let client_id = self.session.client_id;
+        Task::perform(
+            async move {
+                let latest = td::open_chat(client_id, chat_id).await?;
+                if let Some(anchor) = anchor {
+                    let around = td::history_around(client_id, chat_id, anchor.id).await?;
+                    if around.is_empty() {
+                        Ok(latest)
+                    } else {
+                        Ok(around)
+                    }
+                } else {
+                    Ok(latest)
+                }
+            },
+            move |r| {
+                Msg::ForClient(
+                    client_id,
+                    Box::new(Msg::Pane(
+                        window,
+                        PaneMsg::ColdHistoryLoaded(chat_id, request, r),
+                    )),
+                )
+            },
+        )
     }
 
     /// Closes a tab; closing the active one switches to its neighbour.
@@ -265,6 +352,7 @@ impl App {
         match next {
             Some(next) => self.show_in_main(next),
             None => {
+                self.clear_photo_owners(self.main_window);
                 let list = self.take_main_list();
                 let fresh = ChatPane {
                     list,
@@ -292,6 +380,7 @@ impl App {
         if self.main_chat() != Some(chat_id) {
             return Task::none();
         }
+        self.clear_photo_owners(self.main_window);
         let tabs = self.session.tabs.chats.clone();
         let i = tabs.iter().position(|&c| c == chat_id);
         let visible = |c: &i64| *c != chat_id && !self.in_chat_window(*c);
@@ -318,9 +407,18 @@ impl App {
         // See `show_in_main`: an answer in flight would target a pane that
         // just moved, so its stuck flags must be cleared before it goes idle.
         pane.loading_older = false;
-        pane.loading_newer = false;
+        pane.pause_newer_loading();
         pane.jump_pending = None;
         pane.jumped = false;
+        pane.inactive_since = Some(Instant::now());
+        pane.restoring_anchor = None;
+        if let Some(cold) = &mut pane.cold {
+            cold.request = None;
+            cold.changes.clear();
+            cold.pending_page = None;
+            cold.verified_ids.clear();
+            cold.overflowed = false;
+        }
         let draft = self.sync_draft(chat_id, pane.draft());
         // The window loads and syncs its own draft separately; this cached
         // pane must not carry the compose text along too, or leaving the
@@ -340,6 +438,24 @@ impl App {
         }
     }
 
+    /// Called with the same monotonic timestamp as media maintenance. Only
+    /// background tabs qualify, never panes visible in any window.
+    pub(super) fn reclaim_inactive_history(&mut self, now: Instant) {
+        for pane in self.session.background.values_mut() {
+            let expired = pane
+                .inactive_since
+                .and_then(|since| now.checked_duration_since(since))
+                .is_some_and(|age| age >= Duration::from_secs(300));
+            if !expired {
+                continue;
+            }
+            if pane.cold.is_some() {
+                pane.trim_cold_records();
+            } else {
+                pane.make_cold();
+            }
+        }
+    }
     /// A chat window closed: its chat becomes a tab again.
     pub(crate) fn chat_window_closed(&mut self, chat_id: i64) -> Task<Msg> {
         if !self.session.tabs.chats.contains(&chat_id) && self.auth_ready() {

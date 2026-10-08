@@ -121,6 +121,7 @@ impl App {
                     id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     token: Arc::new(()),
                 });
+                self.clear_video_thumbnail(window, chat_id, message_id);
                 // Voice messages and videos do not talk over each other.
                 self.playback_pause_voice();
             }

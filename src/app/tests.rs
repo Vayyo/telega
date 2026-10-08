@@ -17,8 +17,16 @@ mod security_input;
 #[path = "tests/security_secrets.rs"]
 mod security_secrets;
 
+#[path = "tests/memory_media.rs"]
+mod memory_media;
 #[path = "tests/security_plugins.rs"]
 mod security_plugins;
+
+#[path = "tests/memory_history.rs"]
+mod memory_history;
+
+#[path = "tests/security_async.rs"]
+mod security_async;
 
 #[test]
 fn api_credentials_reject_missing_and_invalid_id_without_exposing_hash() {
@@ -1504,6 +1512,19 @@ fn photo_content() -> Value {
     })
 }
 
+fn photo_shown(app: &mut App) -> iced::Task<Msg> {
+    let window = app.main_window;
+    let epoch = app.photo_epoch(window);
+    app.update(Msg::Pane(
+        window,
+        PaneMsg::MediaShown(
+            media::PhotoOwner::Message(1, 10, media::PhotoKind::Photo),
+            103,
+            epoch,
+        ),
+    ))
+}
+
 #[test]
 fn photo_uses_largest_size_up_to_1280_and_loads_when_shown() {
     let mut app = app();
@@ -1519,7 +1540,7 @@ fn photo_uses_largest_size_up_to_1280_and_loads_when_shown() {
     assert_eq!(item.text, "[Фото] море");
 
     // Seen on screen before the download finished: decoded right when it does.
-    let _ = app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)));
+    let _ = photo_shown(&mut app);
     assert!(app.session.images.decoding.is_empty());
     td(
         &mut app,
@@ -2777,18 +2798,10 @@ fn repeated_photo_show_while_in_flight_does_not_duplicate_the_download() {
     new_message_value(&mut app, media_message(1, 10, photo_content()));
 
     // First sight starts the download of the largest size up to 1280 px.
-    assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
-        1
-    );
+    assert_eq!(photo_shown(&mut app).units(), 1);
     // The same bubble reported again while TDLib is still fetching it: no
     // second request for a file that is already on its way.
-    assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
-        0
-    );
+    assert_eq!(photo_shown(&mut app).units(), 0);
 }
 
 #[test]
@@ -2796,11 +2809,7 @@ fn failed_photo_download_is_not_retried_by_the_sensor() {
     let mut app = app();
     open(&mut app, 1, &[]);
     new_message_value(&mut app, media_message(1, 10, photo_content()));
-    assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
-        1
-    );
+    assert_eq!(photo_shown(&mut app).units(), 1);
 
     // The bubble's download runs, then dies without completing.
     td(
@@ -2814,11 +2823,7 @@ fn failed_photo_download_is_not_retried_by_the_sensor() {
 
     // Scrolling the photo back into view must not silently restart a
     // download that already failed.
-    assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
-        0
-    );
+    assert_eq!(photo_shown(&mut app).units(), 0);
 }
 
 #[test]
@@ -2826,11 +2831,7 @@ fn explicit_download_retries_a_failed_photo_and_keeps_the_sensor_out() {
     let mut app = app();
     open(&mut app, 1, &[]);
     new_message_value(&mut app, media_message(1, 10, photo_content()));
-    assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
-        1
-    );
+    assert_eq!(photo_shown(&mut app).units(), 1);
 
     // The download runs, then dies without completing: the file is now
     // marked as failed, like in the test above.
@@ -2843,8 +2844,7 @@ fn explicit_download_retries_a_failed_photo_and_keeps_the_sensor_out() {
         json!({"@type": "updateFile", "file": file(103, 1000, 0, false, "")}),
     );
     assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
+        photo_shown(&mut app).units(),
         0,
         "a failed file stays failed for the sensor"
     );
@@ -2858,8 +2858,7 @@ fn explicit_download_retries_a_failed_photo_and_keeps_the_sensor_out() {
     // And the retry puts the file back in flight, so the sensor that fired
     // a moment ago still adds no request of its own.
     assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
+        photo_shown(&mut app).units(),
         0,
         "the retried file is in flight again"
     );
@@ -2874,18 +2873,13 @@ fn reparsing_a_message_keeps_the_in_flight_photo_marker() {
     let mut app = app();
     open(&mut app, 1, &[]);
     new_message_value(&mut app, media_message(1, 10, photo_content()));
-    assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
-        1
-    );
+    assert_eq!(photo_shown(&mut app).units(), 1);
 
     // TDLib reports the same message again (a re-delivery, or the pane
     // re-parsing it): the bubble stays, its file snapshot is unchanged.
     new_message_value(&mut app, media_message(1, 10, photo_content()));
     assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
+        photo_shown(&mut app).units(),
         0,
         "the reparse must not put a second request for the picture in flight"
     );
@@ -2899,11 +2893,7 @@ fn reparsing_a_message_keeps_the_failed_photo_marker() {
     let mut app = app();
     open(&mut app, 1, &[]);
     new_message_value(&mut app, media_message(1, 10, photo_content()));
-    assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
-        1
-    );
+    assert_eq!(photo_shown(&mut app).units(), 1);
     td(
         &mut app,
         json!({"@type": "updateFile", "file": file(103, 1000, 500, false, "")}),
@@ -2912,16 +2902,11 @@ fn reparsing_a_message_keeps_the_failed_photo_marker() {
         &mut app,
         json!({"@type": "updateFile", "file": file(103, 1000, 0, false, "")}),
     );
-    assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
-        0
-    );
+    assert_eq!(photo_shown(&mut app).units(), 0);
 
     new_message_value(&mut app, media_message(1, 10, photo_content()));
     assert_eq!(
-        app.update(Msg::Pane(app.main_window, PaneMsg::MediaVisible(103)))
-            .units(),
+        photo_shown(&mut app).units(),
         0,
         "the reparse must not revive a failed download for the sensor"
     );
@@ -3052,7 +3037,7 @@ fn video_note_player_note(file_id: i32) -> Value {
 }
 
 /// Send a real iced pointer press into the selected rendered media bubble.
-/// Do not dispatch unrelated clicks: the old GIF action launches a system player.
+/// Do not dispatch probe clicks or execute their TDLib tasks.
 fn video_note_player_press_media(app: &App, bubble_index: usize) -> Msg {
     use iced_runtime::user_interface::{Cache, UserInterface};
 
@@ -3073,18 +3058,15 @@ fn video_note_player_press_media(app: &App, bubble_index: usize) -> Msg {
                 &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
                     iced::mouse::Button::Left,
                 ))],
-                iced::mouse::Cursor::Available(iced::Point::new(400.0, y as f32)),
+                iced::mouse::Cursor::Available(iced::Point::new(472.0, y as f32)),
                 &mut renderer,
                 &mut iced_runtime::core::clipboard::Null,
                 &mut messages,
             );
         }
-        let hit = messages.into_iter().find(|message| {
-            matches!(
-                message,
-                Msg::Video(video::VideoMsg::Play(..)) | Msg::PlayVideo(_)
-            )
-        });
+        let hit = messages
+            .into_iter()
+            .find(|message| matches!(message, Msg::Video(video::VideoMsg::Play(..))));
         if let Some(message) = hit {
             if !previous_hit {
                 if seen_bubbles == bubble_index {
@@ -3141,25 +3123,6 @@ fn video_note_player_click_opens_round_file_in_inline_player() {
         (window, 1, 306)
     );
     // Dropping App stops the streaming player.
-}
-
-#[test]
-fn video_note_player_gif_stays_on_animation_path() {
-    let mut app = app();
-    open(&mut app, 1, &[]);
-    let gif = json!({"@type": "messageAnimation", "show_caption_above_media": false,
-        "has_spoiler": false, "is_secret": false,
-        "caption": {"@type": "formattedText", "text": "", "entities": []},
-        "animation": {"@type": "animation", "duration": 3, "width": 480, "height": 270,
-            "file_name": "g.mp4", "mime_type": "video/mp4", "has_stickers": false,
-            "animation": file(304, 9000, 0, false, "")}});
-    new_message_value(&mut app, media_message(1, 11, gif));
-
-    assert!(
-        matches!(video_note_player_press_media(&app, 0), Msg::PlayVideo(304)),
-        "GIF click must keep its animation action rather than open the inline video player"
-    );
-    assert!(app.session.video.is_none());
 }
 
 #[test]
@@ -3317,7 +3280,7 @@ fn video_note_player_drag_volume(
     app: &mut App,
     range: std::ops::RangeInclusive<f32>,
 ) -> (f32, Vec<Msg>) {
-    let (slider_x, slider_y) = [350_u32, 450, 550, 650, 750, 850]
+    let (slider_x, slider_y) = [422_u32, 522, 622, 722, 822, 922]
         .into_iter()
         .find_map(|x| {
             (100..695)
@@ -3442,7 +3405,7 @@ fn video_note_player_click_after_media_edit_plays_new_file() {
     let pressed = (100..695)
         .step_by(2)
         .find_map(|y| {
-            video_note_player_pointer(&mut app, 400.0, y as f32)
+            video_note_player_pointer(&mut app, 472.0, y as f32)
                 .into_iter()
                 .find(|m| {
                     matches!(
@@ -4371,8 +4334,7 @@ fn forwarding_picks_a_chat_and_opens_it() {
     open(&mut app, 1, &[(10, "a"), (11, "b")]);
     pane_msg(&mut app, PaneMsg::Select(10));
     pane_msg(&mut app, PaneMsg::Select(11));
-    pane_msg(&mut app, PaneMsg::ForwardSelection);
-    assert_eq!(pane(&app).forward, Some((vec![10, 11], String::new())));
+    pane_msg(&mut app, PaneMsg::Forward(vec![10, 11]));
     pane_msg(&mut app, PaneMsg::ForwardQuery("rust".into()));
     pane_msg(&mut app, PaneMsg::ForwardTo(2));
     assert_eq!(pane(&app).forward, None);
@@ -4594,7 +4556,7 @@ fn archived_chat_found_in_main_search_offers_return_from_archive() {
     let _ = app.update(Msg::ListChats(window, "Старый".into(), Ok(vec![6])));
     assert_eq!(app.displayed_chat_ids(window).unwrap(), [6]);
     let _ = app.update(Msg::ChatMenu(window, Some(6)));
-    let messages = sandbox::click(&mut app, window, iced::Point::new(100.0, 246.0));
+    let messages = sandbox::click(&mut app, window, iced::Point::new(172.0, 218.0));
     assert!(
         messages
             .iter()
@@ -4933,7 +4895,7 @@ fn empty_archive_moves_between_sidebar_and_menu_without_changing_chat_lists() {
         ..Default::default()
     });
     assert!(app.session.archived.is_empty());
-    let entry = sandbox::click(&mut app, main, iced::Point::new(120.0, 125.0));
+    let entry = sandbox::click(&mut app, main, iced::Point::new(192.0, 131.0));
     assert!(
         entry
             .iter()
@@ -4944,7 +4906,7 @@ fn empty_archive_moves_between_sidebar_and_menu_without_changing_chat_lists() {
     assert!(app.session.archived.is_empty() && app.session.order.is_empty());
     let _ = app.update(Msg::ShowArchive(main, false));
     let _ = app.update(Msg::ToggleAccounts);
-    let open = sandbox::click(&mut app, main, iced::Point::new(70.0, 132.0));
+    let open = sandbox::click(&mut app, main, iced::Point::new(70.0, 138.0));
     assert!(
         open.iter()
             .any(|m| matches!(m, Msg::OpenArchiveFromMenu(c) if *c == client))
@@ -4954,14 +4916,14 @@ fn empty_archive_moves_between_sidebar_and_menu_without_changing_chat_lists() {
     let _ = app.update(Msg::SetArchiveCollapsed(main, client, false));
     assert!(!app.archive_collapsed());
     let _ = app.update(Msg::ShowArchive(main, false));
-    let collapse = sandbox::click(&mut app, main, iced::Point::new(252.0, 125.0));
+    let collapse = sandbox::click(&mut app, main, iced::Point::new(324.0, 131.0));
     assert!(
         collapse.iter().any(
             |m| matches!(m, Msg::SetArchiveCollapsed(w, c, true) if *w == main && *c == client)
         )
     );
     let _ = app.update(Msg::ToggleAccounts);
-    let restore = sandbox::click(&mut app, main, iced::Point::new(70.0, 164.0));
+    let restore = sandbox::click(&mut app, main, iced::Point::new(70.0, 170.0));
     assert!(
         restore.iter().any(
             |m| matches!(m, Msg::SetArchiveCollapsed(w, c, false) if *w == main && *c == client)
@@ -4969,7 +4931,7 @@ fn empty_archive_moves_between_sidebar_and_menu_without_changing_chat_lists() {
     );
     assert!(!app.archive_collapsed());
     assert!(app.session.archived.is_empty() && app.session.order.is_empty());
-    let entry = sandbox::click(&mut app, main, iced::Point::new(120.0, 125.0));
+    let entry = sandbox::click(&mut app, main, iced::Point::new(192.0, 131.0));
     assert!(
         entry
             .iter()
@@ -5036,14 +4998,14 @@ fn empty_archive_has_a_clickable_entry_and_settings_even_with_search() {
     let mut app = app();
     let window = app.main_window;
     assert!(app.session.archived.is_empty());
-    let messages = sandbox::click(&mut app, window, iced::Point::new(120.0, 125.0));
+    let messages = sandbox::click(&mut app, window, iced::Point::new(192.0, 131.0));
     assert!(
         messages
             .iter()
             .any(|msg| matches!(msg, Msg::ShowArchive(id, true) if *id == window))
     );
     assert!(pane(&app).list.archive);
-    let messages = sandbox::click(&mut app, window, iced::Point::new(120.0, 88.0));
+    let messages = sandbox::click(&mut app, window, iced::Point::new(192.0, 94.0));
     assert!(
         messages
             .iter()
@@ -5053,7 +5015,7 @@ fn empty_archive_has_a_clickable_entry_and_settings_even_with_search() {
     let _ = app.update(Msg::ToggleArchiveSettings(window, false));
     let _ = app.update(Msg::ListQuery(window, "not found".into()));
     assert_eq!(app.filtered_chats(window), Some(Vec::new()));
-    let messages = sandbox::click(&mut app, window, iced::Point::new(120.0, 88.0));
+    let messages = sandbox::click(&mut app, window, iced::Point::new(192.0, 94.0));
     assert!(
         messages
             .iter()
@@ -5068,7 +5030,7 @@ fn empty_archive_opens_distinct_window_from_entry_and_archive_page() {
     let main = app.main_window;
     let client = app.session.client_id;
     assert!(app.session.archived.is_empty());
-    let messages = sandbox::click(&mut app, main, iced::Point::new(280.0, 125.0));
+    let messages = sandbox::click(&mut app, main, iced::Point::new(352.0, 131.0));
     assert_eq!(
         messages
             .iter()
@@ -5083,7 +5045,7 @@ fn empty_archive_opens_distinct_window_from_entry_and_archive_page() {
     assert_eq!(app.session.client_id, client);
 
     let _ = app.update(Msg::ShowArchive(main, true));
-    let messages = sandbox::click(&mut app, main, iced::Point::new(120.0, 125.0));
+    let messages = sandbox::click(&mut app, main, iced::Point::new(192.0, 131.0));
     assert_eq!(
         messages
             .iter()
@@ -5247,7 +5209,7 @@ fn queued_archive_click_cannot_open_window_after_client_replacement_or_source_cl
     let mut app = app();
     let main = app.main_window;
     let old_client = app.session.client_id;
-    let messages = sandbox::click(&mut app, main, iced::Point::new(280.0, 125.0));
+    let messages = sandbox::click(&mut app, main, iced::Point::new(352.0, 131.0));
     let queued = messages
         .into_iter()
         .find(|msg| {
@@ -5360,7 +5322,7 @@ fn main_settings_take_precedence_and_close_archive_panel_on_entry() {
         .list
         .archive_settings = None;
     app.session.settings_open = true;
-    let messages = sandbox::click(&mut app, window, iced::Point::new(120.0, 88.0));
+    let messages = sandbox::click(&mut app, window, iced::Point::new(192.0, 94.0));
     assert!(
         messages
             .iter()
@@ -7338,8 +7300,15 @@ fn last_chat_gone_can_acknowledge_unconfirmed_creation_from_sidebar() {
         app.session.folder_creation.is_some(),
         "stale recovery ignored"
     );
-    let clicked = (150..280).step_by(5).any(|y| {
-        sandbox::click(&mut app, window, iced::Point::new(85.0, y as f32))
+    let footer = sandbox::click(&mut app, window, iced::Point::new(36.0, 670.0));
+    assert!(
+        footer
+            .iter()
+            .any(|msg| matches!(msg, Msg::ToggleFolderSettings(id) if *id == window)),
+        "folder settings footer must be reachable with no chats or folders"
+    );
+    let clicked = (150..320).step_by(5).any(|y| {
+        sandbox::click(&mut app, window, iced::Point::new(157.0, y as f32))
             .iter()
             .any(|msg| {
                 matches!(msg, Msg::AcknowledgeFolderCreation(id, 0, r)
@@ -7702,11 +7671,8 @@ fn locked_account_waits_for_the_password_and_rejects_invalid_forms() {
 
     // Settings: the form checks its fields before any work.
     app.session.auth = Auth::Ready;
-    let _ = app.update(Msg::Password(PasswordMsg::New("abc".into())));
-    let _ = app.update(Msg::Password(PasswordMsg::Apply { remove: false }));
-    assert!(matches!(&app.session.password_form.message, Some(Err(e)) if e.contains("4")));
-    let _ = app.update(Msg::Password(PasswordMsg::New("abcd".into())));
-    let _ = app.update(Msg::Password(PasswordMsg::Repeat("abce".into())));
+    let _ = app.update(Msg::Password(PasswordMsg::New("abcdefghijkl".into())));
+    let _ = app.update(Msg::Password(PasswordMsg::Repeat("abcdefghijkm".into())));
     let _ = app.update(Msg::Password(PasswordMsg::Apply { remove: false }));
     assert!(
         matches!(&app.session.password_form.message, Some(Err(e)) if e.contains("не совпадают"))
@@ -8631,12 +8597,12 @@ fn ui_hover_and_bot_round_note_controls_only_cover_the_circle_while_hovered() {
     let first_y = (100..610)
         .step_by(2)
         .find(|&y| {
-            video_note_player_pointer(&mut app, 400.0, y as f32)
+            video_note_player_pointer(&mut app, 472.0, y as f32)
                 .iter()
                 .any(|msg| matches!(msg, Msg::Video(video::VideoMsg::TogglePause)))
         })
         .expect("round note picture receives a real pointer press");
-    let rect = (340, first_y + 125, 520, (first_y + 218).min(695));
+    let rect = (412, first_y + 125, 592, (first_y + 218).min(695));
     let mut renderer = sandbox::renderer();
     let (cache, outside) = ui_hover_and_bot_pointer_frame(
         &mut app,
@@ -8648,7 +8614,7 @@ fn ui_hover_and_bot_round_note_controls_only_cover_the_circle_while_hovered() {
         &mut app,
         cache,
         &mut renderer,
-        iced::Point::new(400.0, (first_y + 60) as f32),
+        iced::Point::new(472.0, (first_y + 60) as f32),
     );
     let (_, after_exit) = ui_hover_and_bot_pointer_frame(
         &mut app,
@@ -8677,14 +8643,14 @@ fn ui_hover_and_bot_round_note_corner_does_not_show_controls() {
     let first_y = (100..610)
         .step_by(2)
         .find(|&y| {
-            video_note_player_pointer(&mut app, 400.0, y as f32)
+            video_note_player_pointer(&mut app, 472.0, y as f32)
                 .iter()
                 .any(|msg| matches!(msg, Msg::Video(video::VideoMsg::TogglePause)))
         })
         .expect("round note picture receives a real pointer press");
     // Find the left edge at the note's vertical center, where even a
     // circular hit target spans its full diameter.
-    let left_x = (200..=400)
+    let left_x = (272..=472)
         .step_by(2)
         .find(|&x| {
             video_note_player_pointer(&mut app, x as f32, (first_y + 110) as f32)
@@ -8692,7 +8658,7 @@ fn ui_hover_and_bot_round_note_corner_does_not_show_controls() {
                 .any(|msg| matches!(msg, Msg::Video(video::VideoMsg::TogglePause)))
         })
         .expect("round note center receives a real pointer press");
-    let rect = (340, first_y + 125, 520, (first_y + 218).min(695));
+    let rect = (412, first_y + 125, 592, (first_y + 218).min(695));
     let mut renderer = sandbox::renderer();
     let (cache, outside) = ui_hover_and_bot_pointer_frame(
         &mut app,
@@ -8710,7 +8676,7 @@ fn ui_hover_and_bot_round_note_corner_does_not_show_controls() {
         &mut app,
         cache,
         &mut renderer,
-        iced::Point::new(400.0, (first_y + 60) as f32),
+        iced::Point::new(472.0, (first_y + 60) as f32),
     );
     assert_eq!(
         ui_hover_and_bot_changed(&outside, &corner, rect),

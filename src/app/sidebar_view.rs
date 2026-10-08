@@ -1,12 +1,13 @@
-//! Chat list, folder tabs, account switcher, and settings views.
+//! Chat list, folder rail, account switcher, and settings views.
 
 use iced::widget::{
-    button, column, container, mouse_area, rich_text, row, scrollable, slider, space, span, text,
-    text_input, toggler, tooltip,
+    button, column, container, image, mouse_area, responsive, rich_text, row, scrollable, slider,
+    space, span, text, text_input, toggler, tooltip,
 };
-use iced::{Element, Fill};
+use iced::{Element, Fill, Shrink};
 
 use super::avatars::Peer;
+use super::icons::FolderRailIcon;
 use super::pane::{ChatPane, Visible};
 use super::rich;
 use super::session::{FolderReorderState, SettingsSection};
@@ -140,6 +141,7 @@ impl App {
         window: WinId,
         pane: &'a ChatPane,
         full: bool,
+        list_width: f32,
     ) -> Element<'a, Msg> {
         let archive = pane.list.archive;
         let searching = !pane.list.query.trim().is_empty();
@@ -455,14 +457,11 @@ impl App {
             .on_submit(Msg::ListSearchMessages(window))
             .size(13);
         let mut top = column![container(filter).padding([4, 6])];
-        if full
-            && (!self.session.folders.is_empty()
-                || self.session.folder_reorder.is_some()
-                || self.session.folder_reorder_error.is_some()
-                || self.session.folder_creation.is_some()
-                || self.session.folder_creation_warning.is_some())
-        {
-            top = top.push(self.view_folder_tabs(window, pane.list.folder));
+        if full && pane.list.folder_settings_open {
+            top = top.push(
+                container(scrollable(self.view_folder_settings(window)).height(Shrink))
+                    .max_height(240),
+            );
         }
         if archive {
             top = top.push(
@@ -593,55 +592,36 @@ impl App {
         let sidebar = self.look.sidebar;
         let panel = move |_: &iced::Theme| container::background(sidebar);
         if !full {
-            return container(list).width(220).height(Fill).style(panel).into();
+            return container(list)
+                .width(list_width)
+                .height(Fill)
+                .style(panel)
+                .into();
         }
-        container(list).width(300).height(Fill).style(panel).into()
+        row![
+            self.view_folder_rail(window, pane.list.folder, pane.list.folder_settings_open),
+            container(list).width(list_width).height(Fill).style(panel)
+        ]
+        .height(Fill)
+        .into()
     }
 
-    /// Tabs of Telegram folders above the chat list, with unread counters.
-    fn view_folder_tabs(&self, window: WinId, current: Option<i32>) -> Element<'_, Msg> {
-        let tab = |label: &str, folder: Option<i32>, unread: (i32, i32)| {
-            let mut content = row![text(label.to_owned()).size(13)]
-                .spacing(4)
-                .align_y(iced::Center);
-            let count = if unread.1 > 0 { unread.1 } else { unread.0 };
-            if count > 0 {
-                let accent = unread.1 > 0 && current != folder;
-                content = content.push(text(count).size(11).style(if accent {
-                    text::primary
-                } else {
-                    text::base
-                }));
-            }
-            button(content)
-                .padding([3, 8])
-                .style(if current == folder {
-                    button::primary
-                } else {
-                    button::text
-                })
-                .on_press(Msg::ShowFolder(window, folder))
-                .into()
-        };
-        let len = self.session.folders.len();
-        let mut tabs: Vec<Element<'_, Msg>> = self
-            .session
-            .folders
-            .iter()
-            .enumerate()
-            .map(|(index, (id, name))| {
-                let mut up = button("↑").padding([3, 3]).style(button::secondary);
-                let mut down = button("↓").padding([3, 3]).style(button::secondary);
-                if self.session.folder_reorder.is_none() && self.session.folder_creation.is_none() {
-                    if index > 0 {
-                        up = up.on_press(Msg::ReorderFolder(window, *id, true));
-                    }
-                    if index + 1 < len {
-                        down = down.on_press(Msg::ReorderFolder(window, *id, false));
-                    }
-                }
-                row![
-                    tab(
+    /// Folder selection scrolls independently of the fixed settings footer.
+    fn view_folder_rail(
+        &self,
+        window: WinId,
+        current: Option<i32>,
+        settings_open: bool,
+    ) -> Element<'_, Msg> {
+        let sidebar = self.look.sidebar;
+        responsive(move |size| {
+            let mut entries: Vec<Element<'_, Msg>> = self
+                .session
+                .folders
+                .iter()
+                .map(|(id, name)| {
+                    self.folder_rail_entry(
+                        window,
                         name,
                         Some(*id),
                         self.session
@@ -649,25 +629,159 @@ impl App {
                             .get(id)
                             .copied()
                             .unwrap_or_default(),
-                    ),
+                        current,
+                    )
+                })
+                .collect();
+            entries.insert(
+                self.session.main_tab.min(entries.len()),
+                self.folder_rail_entry(window, "Все чаты", None, self.session.unread, current),
+            );
+            let folders = container(scrollable(column(entries).width(Fill)).height(Shrink))
+                .max_height((size.height - 62.0).max(0.0));
+            let divider = container(space().height(1))
+                .width(Fill)
+                .style(|theme: &iced::Theme| {
+                    container::background(theme.extended_palette().background.strong.color)
+                });
+            let footer = tooltip(
+                button(
+                    column![
+                        image(FolderRailIcon::Settings.handle(if settings_open {
+                            self.look.theme.extended_palette().primary.base.text.r > 0.5
+                        } else {
+                            sidebar.r < 0.5
+                        }))
+                        .width(22)
+                        .height(22),
+                        text("Настройки").size(10),
+                    ]
+                    .align_x(iced::Center)
+                    .spacing(2),
+                )
+                .width(Fill)
+                .height(56)
+                .padding(2)
+                .style(if settings_open {
+                    button::primary
+                } else {
+                    button::text
+                })
+                .on_press(Msg::ToggleFolderSettings(window)),
+                "Настройки папок",
+                tooltip::Position::Right,
+            );
+            container(column![folders, divider, space().height(Fill), footer].width(Fill))
+                .width(72)
+                .height(Fill)
+                .style(move |_: &iced::Theme| container::background(sidebar))
+                .into()
+        })
+        .height(Fill)
+        .width(72)
+        .into()
+    }
+
+    fn folder_rail_entry<'a>(
+        &'a self,
+        window: WinId,
+        label: &'a str,
+        folder: Option<i32>,
+        unread: (i32, i32),
+        current: Option<i32>,
+    ) -> Element<'a, Msg> {
+        let name = if label.chars().count() > 8 {
+            let (mut short, cut) = take_clusters(label, 8);
+            if cut {
+                short.push('…');
+            }
+            std::borrow::Cow::Owned(short)
+        } else {
+            std::borrow::Cow::Borrowed(label)
+        };
+        let count = if unread.1 > 0 { unread.1 } else { unread.0 };
+        let selected = current == folder;
+        let light = if selected {
+            self.look.theme.extended_palette().primary.base.text.r > 0.5
+        } else {
+            self.look.sidebar.r < 0.5
+        };
+        let icon = if folder.is_some() {
+            FolderRailIcon::Folder
+        } else {
+            FolderRailIcon::All
+        };
+        let badge = if count > 0 {
+            text(count.to_string())
+                .size(10)
+                .style(if unread.1 > 0 && !selected {
+                    text::primary
+                } else {
+                    text::base
+                })
+        } else {
+            text("").size(10)
+        };
+        tooltip(
+            button(
+                column![
+                    container(
+                        row![image(icon.handle(light)).width(22).height(22), badge]
+                            .spacing(2)
+                            .align_y(iced::Center)
+                    )
+                    .width(Fill)
+                    .center_x(Fill),
+                    container(text(name).size(10).wrapping(text::Wrapping::None))
+                        .width(Fill)
+                        .center_x(Fill)
+                        .clip(true),
+                ]
+                .spacing(2)
+                .align_x(iced::Center),
+            )
+            .width(Fill)
+            .height(58)
+            .padding(2)
+            .style(if selected {
+                button::primary
+            } else {
+                button::text
+            })
+            .on_press(Msg::ShowFolder(window, folder)),
+            label,
+            tooltip::Position::Right,
+        )
+        .into()
+    }
+
+    /// Existing reorder and acknowledgement controls, kept in the list header.
+    fn view_folder_settings(&self, window: WinId) -> Element<'_, Msg> {
+        let len = self.session.folders.len();
+        let mut section = column![text("Настройки папок").size(14)]
+            .spacing(4)
+            .width(Fill);
+        for (index, (id, name)) in self.session.folders.iter().enumerate() {
+            let mut up = button("↑").padding([3, 6]).style(button::secondary);
+            let mut down = button("↓").padding([3, 6]).style(button::secondary);
+            if self.session.folder_reorder.is_none() && self.session.folder_creation.is_none() {
+                if index > 0 {
+                    up = up.on_press(Msg::ReorderFolder(window, *id, true));
+                }
+                if index + 1 < len {
+                    down = down.on_press(Msg::ReorderFolder(window, *id, false));
+                }
+            }
+            section = section.push(
+                row![
+                    text(name).size(12).width(Fill),
                     tooltip(up, "Переместить папку выше", tooltip::Position::Bottom),
                     tooltip(down, "Переместить папку ниже", tooltip::Position::Bottom)
                 ]
                 .spacing(2)
-                .align_y(iced::Center)
-                .into()
-            })
-            .collect();
-        tabs.insert(
-            self.session.main_tab.min(tabs.len()),
-            tab("Все чаты", None, self.session.unread),
-        );
-        let tabs = scrollable(row(tabs).spacing(2).padding([0, 4])).direction(
-            scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::new().width(2).scroller_width(2),
-            ),
-        );
-        let mut section = column![tabs].width(Fill);
+                .align_y(iced::Center),
+            );
+        }
         if let Some(error) = &self.session.folder_reorder_error {
             section = section.push(
                 container(text(error).size(12).style(text::danger).width(Fill))

@@ -437,10 +437,13 @@ impl Archive {
     /// Keeps the archived text in sync with edits.
     pub fn set_text(&mut self, chat_id: i64, id: i64, text: &str) -> rusqlite::Result<()> {
         let stored = self.stored(text)?;
-        self.conn
+        let updated = self
+            .conn
             .prepare_cached("UPDATE messages SET text = ?3 WHERE chat_id = ?1 AND id = ?2")?
             .execute(params![chat_id, id, stored])?;
-        self.remember(chat_id, id, text.to_owned());
+        if updated != 0 {
+            self.remember(chat_id, id, text.to_owned());
+        }
         Ok(())
     }
 
@@ -579,6 +582,18 @@ mod tests {
         assert_eq!((deleted[0].id, deleted[0].text.as_str()), (10, "edited"));
         assert!(deleted[0].deleted);
         assert!(matches!(&deleted[0].sender, MessageSender::User(u) if u.user_id == 7));
+    }
+
+    #[test]
+    fn edit_before_first_save_is_not_suppressed() {
+        let mut a = archive();
+        a.set_text(1, 10, "edited").unwrap();
+        a.save(&[msg(10, "edited")]).unwrap();
+        a.mark_deleted(1, &[10]).unwrap();
+
+        let deleted = a.deleted(1, i64::MIN, i64::MAX).unwrap();
+        assert_eq!(deleted.len(), 1, "edited message must have an archived row");
+        assert_eq!((deleted[0].id, deleted[0].text.as_str()), (10, "edited"));
     }
 
     #[test]

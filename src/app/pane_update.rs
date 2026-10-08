@@ -1,7 +1,9 @@
 //! Chat-pane message routing and pane-local actions.
 
 use super::{
-    App, Link, Menu, Msg, MsgItem, PaneMsg, WinId, card, media::Media, pane, picker, rich,
+    App, Link, Menu, Msg, MsgItem, PaneMsg, WinId, card,
+    media::{Media, PhotoKind, PhotoOwner},
+    pane, picker, rich,
 };
 use crate::td;
 use iced::Task;
@@ -25,6 +27,41 @@ impl App {
             self.error = Some("сначала завершите смену ключа".into());
             return Task::none();
         }
+        if matches!(
+            &msg,
+            PaneMsg::TogglePicker | PaneMsg::ClosePicker | PaneMsg::SendSticker(_)
+        ) {
+            self.clear_picker_photos(window);
+        }
+        if matches!(&msg, PaneMsg::Forward(_) | PaneMsg::SearchSubmit)
+            && self.session.panes.get(&window).is_some_and(|pane| {
+                matches!(&msg, PaneMsg::Forward(_))
+                    || pane
+                        .search
+                        .as_ref()
+                        .is_some_and(|s| !s.query.trim().is_empty())
+            })
+        {
+            self.clear_history_photos(window);
+        }
+        if let PaneMsg::Scrolled(viewport) = &msg {
+            let size = (viewport.bounds().height, viewport.bounds().width);
+            let correction = self.session.panes.get_mut(&window).and_then(|pane| {
+                if pane.view_size != Some(size) && pane.restoring_anchor.is_some() {
+                    pane.cold_resized(size)
+                } else {
+                    pane.cold_scrolled(viewport.absolute_offset());
+                    pane.scroll = Some(viewport.absolute_offset());
+                    pane.view_size = Some(size);
+                    None
+                }
+            });
+            self.photo_scrolled(window, std::time::Instant::now());
+            if let Some(offset) = correction {
+                let scroll_id = self.session.panes[&window].scroll_id.clone();
+                return iced::widget::operation::scroll_to(scroll_id, offset);
+            }
+        }
         // Answers for a window that was closed meanwhile are dropped here.
         let Some(pane) = self.session.panes.get_mut(&window) else {
             return Task::none();
@@ -36,8 +73,14 @@ impl App {
                 }
                 return self.select_chat(window, chat_id);
             }
+            PaneMsg::ColdHistoryLoaded(chat_id, request, result) => {
+                return self.on_cold_history_loaded(window, chat_id, request, result);
+            }
+            PaneMsg::ColdHistoryVerified(chat_id, request, result) => {
+                return self.on_cold_history_verified(window, chat_id, request, result);
+            }
             PaneMsg::HistoryLoaded(chat_id, result) => {
-                if pane.shows(chat_id) {
+                if pane.shows(chat_id) && pane.cold.is_none() {
                     match result {
                         Ok(messages) => {
                             if let Some(archive) = &self.session.archive {
@@ -53,6 +96,7 @@ impl App {
                             let history = if skip_history {
                                 Task::none()
                             } else {
+                                self.clear_history_photos(window);
                                 self.show_history(window, chat_id, &messages)
                             };
                             return Task::batch([history, pinned, draft, roles]);
@@ -141,7 +185,64 @@ impl App {
                 }
             }
             PaneMsg::Measured(id, height) => {
-                pane.heights.insert(id, height);
+                if let Some(offset) = pane.cold_measured(id, height) {
+                    return iced::widget::operation::scroll_to(pane.scroll_id.clone(), offset);
+                }
+            }
+            PaneMsg::BubblePress(id) => {
+                let eligible = pane
+                    .messages
+                    .iter()
+                    .any(|m| m.id == id && !m.pending && !m.deleted);
+                if eligible {
+                    let now = std::time::Instant::now();
+                    let double = pane.last_bubble_press.is_some_and(|(previous, when)| {
+                        previous == id && now.duration_since(when).as_millis() < 450
+                    });
+                    pane.last_bubble_press = (!double).then_some((id, now));
+                    pane.pending_reply = double.then_some(id);
+                }
+            }
+            PaneMsg::BubbleRelease(id) => {
+                if pane.pending_reply.take() == Some(id)
+                    && pane
+                        .messages
+                        .iter()
+                        .any(|m| m.id == id && !m.pending && !m.deleted)
+                {
+                    pane.menu = None;
+                    pane.finish_edit();
+                    pane.reply_to = Some(id);
+                }
+            }
+            PaneMsg::BubbleCancel => {
+                pane.last_bubble_press = None;
+                pane.pending_reply = None;
+            }
+            PaneMsg::RectangleStart(anchor) => {
+                pane.last_bubble_press = None;
+                pane.pending_reply = None;
+                pane.text_selection = None;
+                pane.menu = None;
+                pane.rectangle = Some(pane::RectangleSelection {
+                    anchor,
+                    focus: anchor,
+                    hits: Default::default(),
+                });
+            }
+            PaneMsg::RectangleMove(focus) => {
+                if let Some(rectangle) = &mut pane.rectangle {
+                    rectangle.focus = focus;
+                }
+            }
+            PaneMsg::RectangleHit(id, intersects) => {
+                if let Some(rectangle) = &mut pane.rectangle {
+                    if intersects {
+                        rectangle.hits.insert(id);
+                    } else {
+                        rectangle.hits.remove(&id);
+                    }
+                }
             }
             PaneMsg::Compose(action) => {
                 pane.compose_touched |= action.is_edit();
@@ -152,10 +253,13 @@ impl App {
                 let Some(chat_id) = pane.chat_id else {
                     return Task::none();
                 };
-                return Task::perform(
-                    td::message_markdown(self.session.client_id, chat_id, id),
-                    move |r| Msg::Pane(window, PaneMsg::EditLoaded(chat_id, id, r)),
-                );
+                let client_id = self.session.client_id;
+                return Task::perform(td::message_markdown(client_id, chat_id, id), move |r| {
+                    Msg::ForClient(
+                        client_id,
+                        Box::new(Msg::Pane(window, PaneMsg::EditLoaded(chat_id, id, r))),
+                    )
+                });
             }
             PaneMsg::EditLoaded(chat_id, id, result) => {
                 // The window switched chats while this was loading: applying
@@ -194,7 +298,10 @@ impl App {
                     pane.finish_edit();
                     return Task::perform(
                         td::edit_text(self.session.client_id, chat_id, id, text),
-                        Msg::Done,
+                        {
+                            let client_id = self.session.client_id;
+                            move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                        },
                     );
                 }
                 if let Some(chat_id) = pane.chat_id
@@ -206,7 +313,10 @@ impl App {
                     let reply_to = pane.reply_to.take();
                     return Task::perform(
                         td::send_text(self.session.client_id, chat_id, text, reply_to),
-                        Msg::Done,
+                        {
+                            let client_id = self.session.client_id;
+                            move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                        },
                     );
                 }
             }
@@ -223,10 +333,13 @@ impl App {
                 }
                 // Telegram links open inside the client.
                 if td::is_telegram_link(&url) {
-                    return Task::perform(
-                        td::resolve_link(self.session.client_id, url.clone()),
-                        move |r| Msg::LinkResolved(window, url.clone(), r),
-                    );
+                    let client_id = self.session.client_id;
+                    return Task::perform(td::resolve_link(client_id, url.clone()), move |r| {
+                        Msg::ForClient(
+                            client_id,
+                            Box::new(Msg::LinkResolved(window, url.clone(), r)),
+                        )
+                    });
                 }
                 if let Some(url) = rich::safe_link(&url)
                     && let Err(e) = open::that_detached(&url)
@@ -237,8 +350,9 @@ impl App {
             PaneMsg::CancelLink => pane.confirm_link = None,
             PaneMsg::JoinChat(link) => {
                 pane.confirm_join = None;
-                return Task::perform(td::join_by_link(self.session.client_id, link), move |r| {
-                    Msg::Joined(window, r)
+                let client_id = self.session.client_id;
+                return Task::perform(td::join_by_link(client_id, link), move |r| {
+                    Msg::ForClient(client_id, Box::new(Msg::Joined(window, r)))
                 });
             }
             PaneMsg::CancelJoin => pane.confirm_join = None,
@@ -255,8 +369,13 @@ impl App {
                         Media::Photo { file_id, .. } => Some(*file_id),
                         _ => None,
                     });
-                if let Some(file_id) = photo {
-                    return self.show_photo(file_id);
+                if let (Some(file_id), Some(chat_id)) = (photo, pane.chat_id) {
+                    return self.photo_shown(
+                        window,
+                        PhotoOwner::Message(chat_id, id, PhotoKind::Photo),
+                        file_id,
+                        self.photo_epoch(window),
+                    );
                 }
             }
             PaneMsg::Reply(id) => {
@@ -276,6 +395,9 @@ impl App {
                         }
                         Err(e) => {
                             pane.jump_pending = None;
+                            if let Some(cold) = &mut pane.cold {
+                                cold.request = None;
+                            }
                             self.error = Some(e);
                         }
                     }
@@ -284,6 +406,7 @@ impl App {
             PaneMsg::NewerLoaded(chat_id, after, result) => {
                 let current =
                     pane.shows(chat_id) && pane.messages.last().map(|m| m.id) == Some(after);
+                let was_loading = pane.loading_newer;
                 match result {
                     Ok(messages) if current => {
                         return self.append_newer(window, chat_id, after, &messages);
@@ -293,6 +416,12 @@ impl App {
                         pane.loading_newer = false;
                         self.error = Some(e);
                     }
+                }
+                if was_loading
+                    && pane.shows(chat_id)
+                    && let Some(offset) = pane.cold_realign()
+                {
+                    return iced::widget::operation::scroll_to(pane.scroll_id.clone(), offset);
                 }
             }
             PaneMsg::ToLatest => return self.back_to_latest(window),
@@ -340,8 +469,21 @@ impl App {
                 let Some(chat_id) = pane.chat_id else {
                     return Task::none();
                 };
-                let deleted = pane.messages.iter().any(|m| m.id == id && m.deleted);
+                let Some(item) = pane.messages.iter().find(|m| m.id == id) else {
+                    return Task::none();
+                };
+                pane.last_bubble_press = None;
+                if pane.selected.as_ref().is_some_and(|ids| ids.contains(&id)) {
+                    pane.delete_selection = None;
+                    pane.menu = Some(Menu {
+                        message_id: id,
+                        rights: None,
+                        reactions: Vec::new(),
+                    });
+                    return Task::none();
+                }
                 // A message deleted on the server has nothing to ask TDLib about.
+                let deleted = item.deleted;
                 let rights = deleted.then_some(td::MessageRights {
                     delete_for_self: false,
                     delete_for_all: false,
@@ -353,15 +495,20 @@ impl App {
                     reactions: Vec::new(),
                 });
                 if !deleted {
+                    let client_id = self.session.client_id;
                     return Task::batch([
-                        Task::perform(
-                            td::message_rights(self.session.client_id, chat_id, id),
-                            move |r| Msg::Pane(window, PaneMsg::MenuReady(id, r)),
-                        ),
-                        Task::perform(
-                            td::available_reactions(self.session.client_id, chat_id, id),
-                            move |r| Msg::Pane(window, PaneMsg::ReactionsReady(id, r)),
-                        ),
+                        Task::perform(td::message_rights(client_id, chat_id, id), move |r| {
+                            Msg::ForClient(
+                                client_id,
+                                Box::new(Msg::Pane(window, PaneMsg::MenuReady(id, r))),
+                            )
+                        }),
+                        Task::perform(td::available_reactions(client_id, chat_id, id), move |r| {
+                            Msg::ForClient(
+                                client_id,
+                                Box::new(Msg::Pane(window, PaneMsg::ReactionsReady(id, r))),
+                            )
+                        }),
                     ]);
                 }
             }
@@ -396,12 +543,15 @@ impl App {
                 }
             }
             PaneMsg::TogglePicker => {
+                // Owners were released before borrowing the pane.
                 if pane.picker.take().is_none() {
                     return self.picker_tab(window, picker::Tab::Emoji);
                 }
             }
             PaneMsg::PickerTab(tab) => return self.picker_tab(window, tab),
-            PaneMsg::ClosePicker => pane.picker = None,
+            PaneMsg::ClosePicker => {
+                pane.picker = None;
+            }
             PaneMsg::InsertEmoji(emoji) => {
                 pane.compose_touched = true;
                 picker::insert(&mut pane.compose, &emoji);
@@ -415,7 +565,10 @@ impl App {
                     self.session.stickers.recent = None;
                     return Task::perform(
                         td::send_sticker(self.session.client_id, chat_id, *sticker),
-                        Msg::Done,
+                        {
+                            let client_id = self.session.client_id;
+                            move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                        },
                     );
                 }
             }
@@ -423,7 +576,10 @@ impl App {
                 if let Some(chat_id) = pane.chat_id {
                     return Task::perform(
                         td::vote(self.session.client_id, chat_id, id, vec![option]),
-                        Msg::Done,
+                        {
+                            let client_id = self.session.client_id;
+                            move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                        },
                     );
                 }
             }
@@ -444,7 +600,10 @@ impl App {
                     if !options.is_empty() {
                         return Task::perform(
                             td::vote(self.session.client_id, chat_id, id, options),
-                            Msg::Done,
+                            {
+                                let client_id = self.session.client_id;
+                                move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                            },
                         );
                     }
                 }
@@ -462,17 +621,16 @@ impl App {
                     .is_some_and(|m| m.reacted(&key));
                 return Task::perform(
                     td::set_reaction(self.session.client_id, chat_id, id, key, on),
-                    Msg::Done,
+                    {
+                        let client_id = self.session.client_id;
+                        move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                    },
                 );
             }
             PaneMsg::Forward(ids) => {
+                pane.last_bubble_press = None;
                 pane.menu = None;
                 pane.forward = Some((ids, String::new()));
-            }
-            PaneMsg::ForwardSelection => {
-                if let Some(selected) = &pane.selected {
-                    pane.forward = Some((selected.iter().copied().collect(), String::new()));
-                }
             }
             PaneMsg::ForwardQuery(query) => {
                 if let Some((_, q)) = &mut pane.forward {
@@ -487,13 +645,16 @@ impl App {
                 pane.selected = None;
                 pane.delete_selection = None;
                 // Like Telegram: the chat the messages went to opens.
-                let forward = Task::perform(
-                    td::forward(self.session.client_id, to, from, ids),
-                    Msg::Done,
-                );
+                let forward = Task::perform(td::forward(self.session.client_id, to, from, ids), {
+                    let client_id = self.session.client_id;
+                    move |r| Msg::ForClient(client_id, Box::new(Msg::Done(r)))
+                });
                 return Task::batch([forward, self.select_chat(window, to)]);
             }
             PaneMsg::Select(id) => {
+                if !pane.messages.iter().any(|m| m.id == id && !m.pending) {
+                    return Task::none();
+                }
                 pane.menu = None;
                 let selected = pane.selected.get_or_insert_with(Default::default);
                 if !selected.remove(&id) {
@@ -505,20 +666,25 @@ impl App {
                 pane.delete_selection = None;
             }
             PaneMsg::ClearSelection => {
+                pane.menu = None;
+                pane.rectangle = None;
                 pane.selected = None;
                 pane.delete_selection = None;
             }
             PaneMsg::CopySelection => {
+                pane.menu = None;
                 let Some(selected) = pane.selected.take() else {
                     return Task::none();
                 };
                 pane.delete_selection = None;
-                let picked: Vec<(bool, MessageSender, String)> = pane
+                let mut picked: Vec<(i64, bool, MessageSender, String)> = pane
                     .messages
                     .iter()
+                    .chain(&pane.held_messages)
                     .filter(|m| selected.contains(&m.id))
-                    .map(|m| (m.outgoing, m.sender.clone(), m.text.clone()))
+                    .map(|m| (m.id, m.outgoing, m.sender.clone(), m.text.clone()))
                     .collect();
+                picked.sort_by_key(|(id, _, _, _)| *id);
                 let me = self
                     .session
                     .users
@@ -526,7 +692,7 @@ impl App {
                     .map_or("Я", String::as_str);
                 let lines: Vec<String> = picked
                     .iter()
-                    .map(|(outgoing, sender, text)| {
+                    .map(|(_, outgoing, sender, text)| {
                         let name = if *outgoing {
                             me
                         } else {
@@ -543,10 +709,13 @@ impl App {
                 };
                 pane.delete_selection = Some(None);
                 let ids: Vec<i64> = selected.iter().copied().collect();
-                return Task::perform(
-                    td::common_rights(self.session.client_id, chat_id, ids),
-                    move |r| Msg::Pane(window, PaneMsg::SelectionRights(r)),
-                );
+                let client_id = self.session.client_id;
+                return Task::perform(td::common_rights(client_id, chat_id, ids), move |r| {
+                    Msg::ForClient(
+                        client_id,
+                        Box::new(Msg::Pane(window, PaneMsg::SelectionRights(r))),
+                    )
+                });
             }
             PaneMsg::SelectionRights(result) => match result {
                 Ok(rights) if pane.delete_selection.is_some() => {
@@ -562,15 +731,22 @@ impl App {
                 let (Some(chat_id), Some(selected)) = (pane.chat_id, pane.selected.take()) else {
                     return Task::none();
                 };
+                pane.menu = None;
                 pane.delete_selection = None;
                 let ids: Vec<i64> = selected.into_iter().collect();
                 self.session
                     .self_deleted
                     .extend(ids.iter().map(|&id| (chat_id, id)));
                 let done_ids = ids.clone();
+                let client_id = self.session.client_id;
                 return Task::perform(
-                    td::delete_messages(self.session.client_id, chat_id, ids, revoke),
-                    move |r| Msg::DeleteDone(chat_id, done_ids.clone(), r),
+                    td::delete_messages(client_id, chat_id, ids, revoke),
+                    move |r| {
+                        Msg::ForClient(
+                            client_id,
+                            Box::new(Msg::DeleteDone(chat_id, done_ids.clone(), r)),
+                        )
+                    },
                 );
             }
             PaneMsg::TextPress(message, at) => {
@@ -586,14 +762,24 @@ impl App {
                     && sel.message == message
                     && sel.dragging
                 {
+                    if sel.anchor != at {
+                        pane.last_bubble_press = None;
+                        pane.pending_reply = None;
+                    }
                     sel.focus = at;
                 }
             }
             PaneMsg::ClickOutside => {
                 pane.menu = None;
+                pane.delete_selection = None;
+                pane.last_bubble_press = None;
+                pane.pending_reply = None;
                 pane.text_selection = None;
             }
-            PaneMsg::CloseMenu => pane.menu = None,
+            PaneMsg::CloseMenu => {
+                pane.menu = None;
+                pane.delete_selection = None;
+            }
             PaneMsg::CopyText(id) => {
                 pane.menu = None;
                 // A selection in this message is what gets copied.
@@ -610,9 +796,15 @@ impl App {
                 pane.menu = None;
                 if let Some(chat_id) = pane.chat_id {
                     self.session.self_deleted.insert((chat_id, id));
+                    let client_id = self.session.client_id;
                     return Task::perform(
-                        td::delete_message(self.session.client_id, chat_id, id, revoke),
-                        move |r| Msg::DeleteDone(chat_id, vec![id], r),
+                        td::delete_message(client_id, chat_id, id, revoke),
+                        move |r| {
+                            Msg::ForClient(
+                                client_id,
+                                Box::new(Msg::DeleteDone(chat_id, vec![id], r)),
+                            )
+                        },
                     );
                 }
             }
@@ -622,11 +814,14 @@ impl App {
                     self.forget(chat_id, &[id]);
                 }
             }
-            PaneMsg::MediaVisible(file_id) => return self.show_photo(file_id),
-            PaneMsg::MediaHidden(file_id) => {
-                self.session.wanted_photos.remove(&file_id);
+            PaneMsg::MediaShown(owner, file_id, epoch) => {
+                return self.photo_shown(window, owner, file_id, epoch);
+            }
+            PaneMsg::MediaGone(owner, file_id, epoch) => {
+                self.photo_hidden(window, owner, file_id, epoch);
             }
             PaneMsg::Attach => {
+                let client_id = self.session.client_id;
                 return Task::perform(
                     async {
                         rfd::AsyncFileDialog::new()
@@ -636,7 +831,12 @@ impl App {
                             .map(|files| files.iter().map(|f| f.path().to_path_buf()).collect())
                             .unwrap_or_default()
                     },
-                    move |paths| Msg::Pane(window, PaneMsg::FilesChosen(paths)),
+                    move |paths| {
+                        Msg::ForClient(
+                            client_id,
+                            Box::new(Msg::Pane(window, PaneMsg::FilesChosen(paths))),
+                        )
+                    },
                 );
             }
             PaneMsg::FilesChosen(paths) => return self.send_files(window, paths),

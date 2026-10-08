@@ -6,7 +6,11 @@ use iced::{ContentFit, Element, Fill};
 use tdlib_rs::enums::{LinkPreviewType, MessageContent, PollType};
 use tdlib_rs::types::{File, FormattedText, Photo};
 
-use super::{App, Link, Msg, MsgItem, PaneMsg, WinId, rich};
+use super::{
+    App, Link, Msg, MsgItem, PaneMsg, WinId,
+    media::{PhotoKind, PhotoOwner},
+    rich,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Extra {
@@ -283,8 +287,13 @@ impl App {
                             .into(),
                         None => container(text("")).width(64).height(64).into(),
                     };
+                    let owner = PhotoOwner::Message(m.chat_id, m.id, PhotoKind::Link);
+                    let epoch = self.photo_epoch(window);
                     card = card.push(
-                        sensor(picture).on_show(move |_| on_pane(PaneMsg::MediaVisible(file_id))),
+                        sensor(picture)
+                            .key((m.chat_id, m.id, file_id, epoch))
+                            .on_show(move |_| on_pane(PaneMsg::MediaShown(owner, file_id, epoch)))
+                            .on_hide(on_pane(PaneMsg::MediaGone(owner, file_id, epoch))),
                     );
                 }
                 button(card)

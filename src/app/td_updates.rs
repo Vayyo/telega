@@ -1,8 +1,8 @@
 //! TDLib update handling and propagation to chat panes.
 
 use super::{
-    App, ChatItem, Msg, MsgItem, avatars, extra, media, plugin_runtime::message_event,
-    reactions_of, rich, rich_of, session::FolderReorderState, view,
+    App, ChatItem, Msg, MsgItem, avatars, extra, media, pane::ColdContent,
+    plugin_runtime::message_event, reactions_of, rich, rich_of, session::FolderReorderState, view,
 };
 use crate::{archive::Archive, plugins, td};
 use iced::Task;
@@ -74,16 +74,14 @@ impl App {
                     },
                 );
                 self.set_positions(chat.id, &chat.positions);
-                return self.set_avatar(
-                    avatars::Peer::Chat(chat.id),
-                    chat.photo.as_ref().map(|p| &p.small),
-                );
+                let peer = avatars::Peer::Chat(chat.id);
+                self.set_profile_avatar(peer, chat.photo.as_ref().map(|p| &p.big));
+                return self.set_avatar(peer, chat.photo.as_ref().map(|p| &p.small));
             }
             Update::ChatPhoto(u) => {
-                return self.set_avatar(
-                    avatars::Peer::Chat(u.chat_id),
-                    u.photo.as_ref().map(|p| &p.small),
-                );
+                let peer = avatars::Peer::Chat(u.chat_id);
+                self.set_profile_avatar(peer, u.photo.as_ref().map(|p| &p.big));
+                return self.set_avatar(peer, u.photo.as_ref().map(|p| &p.small));
             }
             Update::ChatTitle(u) => {
                 if let Some(chat) = self.session.chats.get_mut(&u.chat_id) {
@@ -261,10 +259,10 @@ impl App {
                 }
             }
             Update::MessageIsPinned(u) => {
-                return Task::perform(
-                    td::pinned_messages(self.session.client_id, u.chat_id),
-                    move |r| Msg::PinnedRefreshed(u.chat_id, r),
-                );
+                let client_id = self.session.client_id;
+                return Task::perform(td::pinned_messages(client_id, u.chat_id), move |r| {
+                    Msg::ForClient(client_id, Box::new(Msg::PinnedRefreshed(u.chat_id, r)))
+                });
             }
             Update::ChatReadOutbox(u) => {
                 if let Some(chat) = self.session.chats.get_mut(&u.chat_id) {
@@ -295,10 +293,9 @@ impl App {
                 let name = format!("{} {}", user.first_name, user.last_name);
                 self.session.users.insert(user.id, name.trim().to_owned());
                 self.user_renamed(user.id);
-                return self.set_avatar(
-                    avatars::Peer::User(user.id),
-                    user.profile_photo.as_ref().map(|p| &p.small),
-                );
+                let peer = avatars::Peer::User(user.id);
+                self.set_profile_avatar(peer, user.profile_photo.as_ref().map(|p| &p.big));
+                return self.set_avatar(peer, user.profile_photo.as_ref().map(|p| &p.small));
             }
             Update::NewMessage(u) => {
                 let m = u.message;
@@ -309,14 +306,21 @@ impl App {
                 if m.sending_state.is_none() {
                     self.plugin_event(message_event(&m));
                 }
-                // A chat shown nowhere never displays this message, so its
-                // reply (if any) does not need a preview either.
+                // Inactive cold tabs keep only pending sends. An active
+                // latest-page restore receives live messages like any other
+                // visible chat; they are merged over a possibly older page.
                 let mut shown = false;
                 for pane in self.panes_of(m.chat_id) {
-                    shown = true;
-                    // After a jump the newest history is not loaded yet; the
-                    // message arrives with the newer pages instead.
-                    if pane.newest_loaded && !pane.messages.iter().any(|x| x.id == m.id) {
+                    let restoring_latest = pane
+                        .cold
+                        .as_ref()
+                        .is_some_and(|cold| cold.request.is_some() && cold.anchor.is_none());
+                    shown |= pane.cold.is_none() || restoring_latest;
+                    if (item.pending
+                        || pane.cold.is_none() && pane.newest_loaded
+                        || restoring_latest)
+                        && !pane.messages.iter().any(|x| x.id == m.id)
+                    {
                         pane.messages.push(item.clone());
                     }
                 }
@@ -391,13 +395,43 @@ impl App {
                 }
                 let new_extra = extra::extra_of(&u.new_content).map(|(e, _)| Box::new(e));
                 let new_rich = rich_of(&u.new_content, new_extra.as_deref());
+                let picture = |media: &Option<media::Media>, extra: Option<&extra::Extra>| {
+                    let source = media.as_ref().map(|m| {
+                        let (thumb, spoiler) = match m {
+                            media::Media::Photo { spoiler, .. } => (None, *spoiler),
+                            media::Media::Video { thumb, spoiler, .. }
+                            | media::Media::Animation { thumb, spoiler, .. } => (*thumb, *spoiler),
+                            _ => (None, false),
+                        };
+                        (std::mem::discriminant(m), m.file_id(), thumb, spoiler)
+                    });
+                    let link = match extra {
+                        Some(extra::Extra::Link { thumb, .. }) => *thumb,
+                        _ => None,
+                    };
+                    (source, link)
+                };
+                let new_picture = picture(&new_media, new_extra.as_deref());
+                let mut photo_changed = false;
                 for pane in self.panes_of(u.chat_id) {
+                    if let Some(change) = pane.cold_change(u.message_id) {
+                        change.content = Some(ColdContent {
+                            text: text.clone(),
+                            rich: new_rich.clone(),
+                            media: new_media.clone(),
+                            extra: new_extra.clone(),
+                        });
+                    }
                     if let Some(item) = pane.find_mut(u.message_id) {
+                        photo_changed |= picture(&item.media, item.extra.as_deref()) != new_picture;
                         item.media = new_media.clone();
                         item.text = text.clone();
                         item.rich = new_rich.clone();
                         item.extra = new_extra.clone();
                     }
+                }
+                if photo_changed {
+                    self.clear_message_photos(u.chat_id, u.message_id);
                 }
                 // A cached preview of this message (shown as another
                 // message's reply-to) would otherwise keep the pre-edit text.
@@ -415,6 +449,9 @@ impl App {
             Update::MessageInteractionInfo(u) => {
                 let reactions = reactions_of(u.interaction_info.as_ref());
                 for pane in self.panes_of(u.chat_id) {
+                    if let Some(change) = pane.cold_change(u.message_id) {
+                        change.reactions = Some(reactions.clone());
+                    }
                     if let Some(item) = pane.find_mut(u.message_id) {
                         item.reactions = reactions.clone();
                     }
@@ -422,6 +459,9 @@ impl App {
             }
             Update::MessageEdited(u) => {
                 for pane in self.panes_of(u.chat_id) {
+                    if let Some(change) = pane.cold_change(u.message_id) {
+                        change.edited = Some(u.edit_date > 0);
+                    }
                     if let Some(item) = pane.find_mut(u.message_id) {
                         item.edited = u.edit_date > 0;
                     }
@@ -431,6 +471,22 @@ impl App {
             Update::File(u) => return self.on_file(&u.file),
             Update::NotificationGroup(u) => return self.on_notification_group(&u),
             Update::DeleteMessages(u) if u.is_permanent && !u.from_cache => {
+                let keep_deleted = self.settings.keep_deleted && self.session.archive.is_some();
+                let own = &self.session.self_deleted;
+                for pane in self
+                    .session
+                    .panes
+                    .values_mut()
+                    .chain(self.session.background.values_mut())
+                    .filter(|pane| pane.shows(u.chat_id))
+                {
+                    for &id in &u.message_ids {
+                        if let Some(change) = pane.cold_change(id) {
+                            change.purged = own.contains(&(u.chat_id, id));
+                            change.deleted = Some(keep_deleted && !change.purged);
+                        }
+                    }
+                }
                 self.plugin_event(plugins::Event::Deleted {
                     chat_id: u.chat_id,
                     ids: u.message_ids.clone(),

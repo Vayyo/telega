@@ -36,7 +36,7 @@ jobs:
           else
             status=$?
             cat "$log"
-            report="$(tail -c 14000 "$log")"
+            report="$(tail -c 3500 "$log")"
             report="${report//'%'/'%25'}"
             report="${report//$'\r'/'%0D'}"
             report="${report//$'\n'/'%0A'}"

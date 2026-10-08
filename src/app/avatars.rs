@@ -1,6 +1,5 @@
-//! Profile photos of chats and users: small (TDLib's 160 px `small` file),
-//! decoded once into a round 64 px picture and kept in a bounded cache.
-//! Without a photo, a colored circle with initials.
+//! Profile photos of chats and users: small 64 px images for lists and
+//! lazily decoded 256 px images for profile cards. Without a photo, initials.
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,6 +14,10 @@ use super::{App, Msg};
 pub(crate) const SIDE: u32 = 64;
 /// Decoded pictures kept (16 KB each).
 const MAX_CACHED: usize = 600;
+/// Round profile pictures stay sharp at 96 px on 2× displays.
+const PROFILE_SIDE: u32 = 256;
+/// At most 8 MiB of decoded profile pictures.
+const MAX_PROFILE_CACHED: usize = 32;
 
 /// Whose picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,9 +30,9 @@ pub(crate) enum Peer {
 pub(crate) struct Avatars {
     /// Photo file of each peer that has one.
     files: HashMap<Peer, i32>,
-    /// The peer owning each file, for O(1) lookup when a download finishes
-    /// (instead of scanning every peer known to the client).
-    owners: HashMap<i32, Peer>,
+    /// Number of peers referring to a small file, for O(1) lookup when a
+    /// download finishes without losing shared files on photo removal.
+    owners: HashMap<i32, usize>,
     /// Decoded picture, last-use clock tick, and content digest for an own
     /// photo decoded before the client's account identity is known.
     /// A chat pinned at the top must not lose its picture just because
@@ -37,6 +40,15 @@ pub(crate) struct Avatars {
     decoded: HashMap<i32, (image::Handle, u64, [u8; 32])>,
     clock: u64,
     pub(crate) decoding: HashSet<i32>,
+    /// Big photo files and their live reference counts (multiple peers may
+    /// share a TDLib file id).
+    profile_files: HashMap<Peer, i32>,
+    profile_owners: HashMap<i32, usize>,
+    profile_decoded: HashMap<i32, (image::Handle, u64)>,
+    profile_decoding: HashSet<i32>,
+    /// A profile only downloads after its large avatar has actually appeared.
+    profile_wanted: HashSet<i32>,
+    profile_failed: HashSet<i32>,
 }
 
 impl Avatars {
@@ -76,6 +88,33 @@ impl Avatars {
             None => false,
         }
     }
+
+    fn profile_handle(&self, peer: Peer) -> Option<&image::Handle> {
+        let file_id = self.profile_files.get(&peer)?;
+        self.profile_decoded.get(file_id).map(|(h, _)| h)
+    }
+
+    fn touch_profile(&mut self, file_id: i32) -> bool {
+        let Some(entry) = self.profile_decoded.get_mut(&file_id) else {
+            return false;
+        };
+        self.clock += 1;
+        entry.1 = self.clock;
+        true
+    }
+
+    fn store_profile(&mut self, file_id: i32, handle: image::Handle) {
+        self.profile_decoding.remove(&file_id);
+        self.profile_failed.remove(&file_id);
+        self.clock += 1;
+        self.profile_decoded.insert(file_id, (handle, self.clock));
+        while self.profile_decoded.len() > MAX_PROFILE_CACHED {
+            let Some((&oldest, _)) = self.profile_decoded.iter().min_by_key(|(_, e)| e.1) else {
+                break;
+            };
+            self.profile_decoded.remove(&oldest);
+        }
+    }
 }
 
 impl App {
@@ -102,16 +141,75 @@ impl App {
                 self.save_settings();
             }
         }
-        if let Some(old) = self.session.avatars.files.remove(&peer) {
-            self.session.avatars.owners.remove(&old);
+        if old != small.map(|file| file.id) {
+            if let Some(old) = self.session.avatars.files.remove(&peer)
+                && let Some(count) = self.session.avatars.owners.get_mut(&old)
+            {
+                *count -= 1;
+                if *count == 0 {
+                    self.session.avatars.owners.remove(&old);
+                }
+            }
+            if let Some(file) = small {
+                self.session.avatars.files.insert(peer, file.id);
+                *self.session.avatars.owners.entry(file.id).or_default() += 1;
+            }
         }
-        let Some(file) = small else {
-            return Task::none();
-        };
-        self.session.avatars.files.insert(peer, file.id);
-        self.session.avatars.owners.insert(file.id, peer);
-        self.remember_file(file);
+        if let Some(file) = small {
+            self.remember_file(file);
+        }
         Task::none()
+    }
+
+    /// TDLib's full-sized peer photo is separate from the 64 px portrait
+    /// cache: it never changes account portrait digests or disk entries.
+    pub(crate) fn set_profile_avatar(&mut self, peer: Peer, big: Option<&File>) {
+        let previous = self.session.avatars.profile_files.get(&peer).copied();
+        let current = big.map(|file| file.id);
+        if previous != current {
+            if let Some(old) = self.session.avatars.profile_files.remove(&peer) {
+                let avatars = &mut self.session.avatars;
+                if let Some(count) = avatars.profile_owners.get_mut(&old) {
+                    *count -= 1;
+                    if *count == 0 {
+                        avatars.profile_owners.remove(&old);
+                        avatars.profile_decoded.remove(&old);
+                        avatars.profile_wanted.remove(&old);
+                        avatars.profile_failed.remove(&old);
+                    }
+                }
+            }
+            if let Some(file) = big {
+                self.session.avatars.profile_files.insert(peer, file.id);
+                *self
+                    .session
+                    .avatars
+                    .profile_owners
+                    .entry(file.id)
+                    .or_default() += 1;
+            }
+        }
+        if let Some(file) = big {
+            self.remember_file(file);
+        }
+    }
+
+    /// Only large avatars opt into downloading/decoding the big TDLib file.
+    /// Also fetch the small file for an immediate fallback if big fails.
+    pub(crate) fn profile_avatar_shown(&mut self, peer: Peer) -> Task<Msg> {
+        let small = self.avatar_shown(peer);
+        let Some(&file_id) = self.session.avatars.profile_files.get(&peer) else {
+            return small;
+        };
+        self.session.avatars.profile_wanted.insert(file_id);
+        let big = if self.session.avatars.touch_profile(file_id)
+            || self.session.avatars.profile_failed.contains(&file_id)
+        {
+            Task::none()
+        } else {
+            self.fetch_profile_avatar(file_id)
+        };
+        Task::batch([small, big])
     }
 
     /// A picture's sensor reported it on screen: fetch it if it was never
@@ -134,13 +232,17 @@ impl App {
     /// picture that fails each time would otherwise be requested from
     /// TDLib over and over without the user ever asking for it.
     pub(super) fn retry_avatar(&mut self, peer: Peer) {
-        let Some(&file_id) = self.session.avatars.files.get(&peer) else {
-            return;
-        };
-        // Only `failed` goes: a download in flight, or one already done,
-        // stays as it is.
-        if let Some(state) = self.session.files.get_mut(&file_id) {
-            state.failed = false;
+        for file_id in [
+            self.session.avatars.files.get(&peer).copied(),
+            self.session.avatars.profile_files.get(&peer).copied(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(state) = self.session.files.get_mut(&file_id) {
+                state.failed = false;
+            }
+            self.session.avatars.profile_failed.remove(&file_id);
         }
     }
 
@@ -154,12 +256,68 @@ impl App {
         }
     }
 
-    /// Called for every finished download.
+    /// Called for every finished download; big photos are decoded only
+    /// after a profile sensor has requested them.
     pub(crate) fn avatar_file_done(&mut self, file_id: i32) -> Task<Msg> {
-        if self.session.avatars.owners.contains_key(&file_id) {
+        let small = if self.session.avatars.owners.contains_key(&file_id) {
             self.decode_avatar(file_id)
         } else {
             Task::none()
+        };
+        let big = if self.session.avatars.profile_wanted.contains(&file_id)
+            && self.session.avatars.profile_owners.contains_key(&file_id)
+        {
+            self.decode_profile_avatar(file_id)
+        } else {
+            Task::none()
+        };
+        Task::batch([small, big])
+    }
+
+    fn fetch_profile_avatar(&mut self, file_id: i32) -> Task<Msg> {
+        match self.session.files.get(&file_id) {
+            Some(f) if f.done => self.decode_profile_avatar(file_id),
+            Some(f) if f.downloading || f.failed => Task::none(),
+            _ => self.request_download(file_id, 1),
+        }
+    }
+
+    fn decode_profile_avatar(&mut self, file_id: i32) -> Task<Msg> {
+        let Some(path) = self.session.files.get(&file_id).map(|f| f.path.clone()) else {
+            return Task::none();
+        };
+        if self.session.avatars.profile_failed.contains(&file_id)
+            || self.session.avatars.profile_decoded.contains_key(&file_id)
+            || !self.session.avatars.profile_decoding.insert(file_id)
+        {
+            return Task::none();
+        }
+        let client_id = self.session.client_id;
+        Task::perform(
+            async move {
+                super::viewer::decode_with_viewer_slot(&super::media::DECODES, move || {
+                    decode_profile(&path)
+                })
+                .await
+                .and_then(|r| r)
+            },
+            move |r| Msg::ProfileAvatarDecoded(client_id, file_id, r),
+        )
+    }
+
+    pub(crate) fn profile_avatar_decoded(&mut self, file_id: i32, result: Result<Vec<u8>, String>) {
+        self.session.avatars.profile_decoding.remove(&file_id);
+        if !self.session.avatars.profile_owners.contains_key(&file_id) {
+            return;
+        }
+        match result {
+            Ok(rgba) => self.session.avatars.store_profile(
+                file_id,
+                image::Handle::from_rgba(PROFILE_SIDE, PROFILE_SIDE, rgba),
+            ),
+            Err(_) => {
+                self.session.avatars.profile_failed.insert(file_id);
+            }
         }
     }
 
@@ -173,14 +331,11 @@ impl App {
         let client_id = self.session.client_id;
         Task::perform(
             async move {
-                let _permit = super::media::DECODES
-                    .acquire()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                tokio::task::spawn_blocking(move || decode_cached(&path))
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|r| r)
+                super::viewer::decode_with_viewer_slot(&super::media::DECODES, move || {
+                    decode_cached(&path)
+                })
+                .await
+                .and_then(|r| r)
             },
             move |r| Msg::AvatarDecoded(client_id, file_id, r),
         )
@@ -194,13 +349,15 @@ impl App {
         match result {
             Ok((rgba, digest)) => {
                 let handle = image::Handle::from_rgba(SIDE, SIDE, rgba);
-                if let Some(Peer::User(id)) = self.session.avatars.owners.get(&file_id)
-                    && self.session.my_id.is_none_or(|my_id| my_id == *id)
-                    && let Some(account) = self
-                        .settings
-                        .accounts
-                        .iter_mut()
-                        .find(|a| a.slot == self.session.slot && a.user_id == Some(*id))
+                if self.session.avatars.owners.contains_key(&file_id)
+                    && let Some(account) = self.settings.accounts.iter_mut().find(|a| {
+                        a.slot == self.session.slot
+                            && a.user_id.is_some_and(|id| {
+                                self.session.my_id.is_none_or(|my_id| my_id == id)
+                                    && self.session.avatars.files.get(&Peer::User(id))
+                                        == Some(&file_id)
+                            })
+                    })
                 {
                     self.account_portraits
                         .insert(self.session.slot, handle.clone());
@@ -222,20 +379,24 @@ impl App {
     /// sensor drives lazy loading: fetched the first time it comes on
     /// screen, and re-fetched if it was since evicted from the cache.
     pub(crate) fn avatar<'a>(&self, peer: Peer, name: &str, size: f32) -> Element<'a, Msg> {
-        let picture: Element<'a, Msg> = if let Some(handle) =
-            self.session.avatars.handle(peer).or_else(|| {
-                let Peer::User(id) = peer else {
-                    return None;
-                };
-                self.account_portraits.get(&self.session.slot).filter(|_| {
-                    self.session.my_id.is_none_or(|my_id| my_id == id)
-                        && self
-                            .settings
-                            .accounts
-                            .iter()
-                            .any(|a| a.slot == self.session.slot && a.user_id == Some(id))
-                })
-            }) {
+        let profile = size > SIDE as f32;
+        let picture: Element<'a, Msg> = if let Some(handle) = (profile
+            .then(|| self.session.avatars.profile_handle(peer))
+            .flatten())
+        .or_else(|| self.session.avatars.handle(peer))
+        .or_else(|| {
+            let Peer::User(id) = peer else {
+                return None;
+            };
+            self.account_portraits.get(&self.session.slot).filter(|_| {
+                self.session.my_id.is_none_or(|my_id| my_id == id)
+                    && self
+                        .settings
+                        .accounts
+                        .iter()
+                        .any(|a| a.slot == self.session.slot && a.user_id == Some(id))
+            })
+        }) {
             image(handle.clone()).width(size).height(size).into()
         } else {
             let id = match peer {
@@ -243,10 +404,21 @@ impl App {
             };
             placeholder(id, name, size)
         };
-        sensor(picture)
-            .key((peer, self.session.avatars.files.get(&peer).copied()))
-            .on_show(move |_| Msg::AvatarShown(peer))
-            .into()
+        if profile {
+            sensor(picture)
+                .key((
+                    peer,
+                    self.session.avatars.files.get(&peer).copied(),
+                    self.session.avatars.profile_files.get(&peer).copied(),
+                ))
+                .on_show(move |_| Msg::ProfileAvatarShown(peer))
+                .into()
+        } else {
+            sensor(picture)
+                .key((peer, self.session.avatars.files.get(&peer).copied()))
+                .on_show(move |_| Msg::AvatarShown(peer))
+                .into()
+        }
     }
 
     /// An inactive account has no live TDLib peer or avatar sensor.
@@ -322,6 +494,32 @@ fn decode_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(rgba.into_raw())
 }
 
+/// HD pictures stay in memory only; the legacy 64 px content-addressed
+/// on-disk entries must remain byte-for-byte compatible with older sessions.
+fn decode_profile(path: &str) -> Result<Vec<u8>, String> {
+    let img = super::media::open_image(path)?;
+    let side = img.width().min(img.height());
+    let img = img
+        .crop_imm(
+            (img.width() - side) / 2,
+            (img.height() - side) / 2,
+            side,
+            side,
+        )
+        .resize_exact(
+            PROFILE_SIDE,
+            PROFILE_SIDE,
+            ::image::imageops::FilterType::Triangle,
+        );
+    let mut rgba = img.into_rgba8();
+    let center = PROFILE_SIDE as f32 / 2.0;
+    for (x, y, pixel) in rgba.enumerate_pixels_mut() {
+        let d = ((x as f32 + 0.5 - center).powi(2) + (y as f32 + 0.5 - center).powi(2)).sqrt();
+        pixel.0[3] = (f32::from(pixel.0[3]) * (center - d + 0.5).clamp(0.0, 1.0)) as u8;
+    }
+    Ok(rgba.into_raw())
+}
+
 /// The picture of `path`, decoded in this session. The file is read once:
 /// its bytes address the entry in the on-disk cache, so a picture decoded
 /// by an earlier session, or decoded for another `file_id` carrying the
@@ -373,5 +571,133 @@ mod tests {
         }
         assert_eq!(avatars.decoded.len(), MAX_CACHED);
         assert!(!avatars.decoded.contains_key(&0), "oldest went first");
+    }
+
+    /// A 96 px profile image must use the big local photo rather than
+    /// enlarging the 64 px thumbnail: narrow alternating bands disappear
+    /// when the thumbnail is downsampled and then enlarged.
+    #[tokio::test]
+    async fn requested_changes_profile_avatar_at_96_preserves_fine_photo_detail() {
+        use iced::advanced::renderer::Headless;
+        use iced::futures::StreamExt;
+        use iced::{Size, Theme, mouse};
+        use iced_runtime::core::renderer::Style;
+        use iced_runtime::user_interface::{Cache, UserInterface};
+        use iced_runtime::{Action, task::into_stream};
+        use serde_json::json;
+
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        struct Photo(std::path::PathBuf);
+        impl Drop for Photo {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let photo = Photo(std::env::temp_dir().join(format!(
+            "telega-profile-detail-{}-{}.png",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )));
+        // At 96 px each band is a pixel wide, but the 64 px decoder cannot
+        // resolve its two-pixel period. The central scan avoids the round edge.
+        let source =
+            ::image::DynamicImage::ImageRgb8(::image::RgbImage::from_fn(192, 192, |x, _| {
+                let value = if (x / 2) % 2 == 0 { 0 } else { 255 };
+                ::image::Rgb([value, value, value])
+            }));
+        source.save(&photo.0).unwrap();
+        let contrast = |rgba: &[u8], side: usize| -> f32 {
+            let y = side / 2;
+            let start = side / 4;
+            let end = side * 3 / 4;
+            let total: u32 = (start..end - 1)
+                .map(|x| {
+                    let a = rgba[(y * side + x) * 4];
+                    let b = rgba[(y * side + x + 1) * 4];
+                    a.abs_diff(b) as u32
+                })
+                .sum();
+            total as f32 / (end - start - 1) as f32
+        };
+        let ideal = source
+            .resize_exact(96, 96, ::image::imageops::FilterType::Triangle)
+            .into_rgba8();
+        let thumbnail = source
+            .resize_exact(64, 64, ::image::imageops::FilterType::Triangle)
+            .resize_exact(96, 96, ::image::imageops::FilterType::Triangle)
+            .into_rgba8();
+        let ideal_detail = contrast(ideal.as_raw(), 96);
+        let thumbnail_detail = contrast(thumbnail.as_raw(), 96);
+        assert!(
+            ideal_detail > thumbnail_detail + 35.0,
+            "synthetic photo must distinguish HD detail from a 64 px upscale"
+        );
+
+        let mut app = super::super::tests::app();
+        let peer = Peer::Chat(829);
+        let small = super::super::sandbox::local_file(28_291, &photo.0);
+        let big = super::super::sandbox::local_file(28_292, &photo.0);
+        super::super::tests::td(
+            &mut app,
+            json!({"@type": "updateChatPhoto", "chat_id": 829, "photo": {
+                "@type": "chatPhotoInfo", "small": small, "big": big,
+                "minithumbnail": null, "has_animation": false, "is_personal": false
+            }}),
+        );
+
+        let mut renderer = super::super::sandbox::renderer();
+        let mut messages = Vec::new();
+        {
+            let mut ui = UserInterface::build(
+                app.avatar(peer, "Photo", 96.0),
+                Size::new(96.0, 96.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            let _ = ui.update(
+                &[iced::Event::Window(iced::window::Event::RedrawRequested(
+                    std::time::Instant::now(),
+                ))],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut iced_runtime::core::clipboard::Null,
+                &mut messages,
+            );
+        }
+        assert!(
+            !messages.is_empty(),
+            "the visible avatar requests its photo"
+        );
+        for message in messages {
+            if let Some(stream) = into_stream(app.update(message)) {
+                for action in stream.collect::<Vec<_>>().await {
+                    if let Action::Output(decoded) = action {
+                        let _ = app.update(decoded);
+                    }
+                }
+            }
+        }
+        let mut pixels = Vec::new();
+        for _ in 0..4 {
+            let mut ui = UserInterface::build(
+                app.avatar(peer, "Photo", 96.0),
+                Size::new(96.0, 96.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            ui.draw(
+                &mut renderer,
+                &Theme::Dark,
+                &Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            pixels = renderer.screenshot(Size::new(96, 96), 1.0, Theme::Dark.palette().background);
+        }
+        let observed = contrast(&pixels, 96);
+        assert!(
+            observed > (ideal_detail + thumbnail_detail) / 2.0,
+            "96 px avatar should retain narrow bands: observed {observed:.1}, \
+             HD reference {ideal_detail:.1}, 64 px upscale {thumbnail_detail:.1}"
+        );
     }
 }

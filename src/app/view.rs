@@ -8,8 +8,12 @@ use std::sync::Arc;
 use tdlib_rs::enums::MessageSender;
 
 use super::avatars::Peer;
-use super::media::{Media, Motion, PHOTO_MAX_H, PHOTO_MAX_W, can_open, human_size};
-use super::pane::{ChatPane, ChatSearch, HISTORY_PADDING, SPACING, SearchPaging, TYPING_ROOM};
+use super::media::{
+    Media, Motion, PHOTO_MAX_H, PHOTO_MAX_W, PhotoKind, PhotoOwner, can_open, human_size,
+};
+use super::pane::{
+    ChatPane, ChatSearch, HISTORY_PADDING, LOADING_ROW_HEIGHT, SPACING, SearchPaging, TYPING_ROOM,
+};
 use super::rich;
 use super::sidebar_view::{DEFAULT_LIST_VIEW, SEARCH_ROW_HEIGHT, search_visible_rows};
 use super::tabs::TAB_BAR;
@@ -75,35 +79,40 @@ impl App {
             }
             container(text("Нет входа в аккаунт")).center(Fill).into()
         } else if main {
-            let body: Element<'_, Msg> = if self.session.settings_open {
-                row![
-                    self.view_chat_list(window, pane, true),
-                    self.view_settings()
-                ]
-                .into()
-            } else if let Some(panel) = pane.list.archive_settings.as_ref() {
-                row![
-                    self.view_chat_list(window, pane, true),
-                    self.view_archive_settings(window, panel)
-                ]
-                .into()
-            } else {
-                row![
-                    self.view_chat_list(window, pane, true),
-                    self.view_chat(window, pane, true)
-                ]
-                .into()
-            };
+            let body = responsive(move |size| {
+                let list_width = (size.width - 72.0 - 240.0).clamp(0.0, 300.0);
+                let body: Element<'_, Msg> = if self.session.settings_open {
+                    row![
+                        self.view_chat_list(window, pane, true, list_width),
+                        self.view_settings()
+                    ]
+                    .into()
+                } else if let Some(panel) = pane.list.archive_settings.as_ref() {
+                    row![
+                        self.view_chat_list(window, pane, true, list_width),
+                        self.view_archive_settings(window, panel)
+                    ]
+                    .into()
+                } else {
+                    row![
+                        self.view_chat_list(window, pane, true, list_width),
+                        self.view_chat(window, pane, true)
+                    ]
+                    .into()
+                };
+                body
+            })
+            .height(Fill);
             column![self.view_main_header(), body].into()
         } else if let Some(panel) = pane.list.archive_settings.as_ref() {
             row![
-                self.view_chat_list(window, pane, false),
+                self.view_chat_list(window, pane, false, 220.0),
                 self.view_archive_settings(window, panel)
             ]
             .into()
         } else {
             row![
-                self.view_chat_list(window, pane, false),
+                self.view_chat_list(window, pane, false, 220.0),
                 self.view_chat(window, pane, false)
             ]
             .into()
@@ -159,7 +168,7 @@ impl App {
                     .and_then(|a| a.user_id)
             })
             .unwrap_or_default();
-        let profile = button(self.avatar(Peer::User(id), name, 30.0))
+        let profile = button(self.avatar(Peer::User(id), name, 36.0))
             .padding([2, 5])
             .style(button::text)
             .on_press(Msg::ToggleAccounts);
@@ -246,9 +255,9 @@ impl App {
                 .style(container::bordered_box);
             pin(float(
                 container(scrollable(popup).height(Length::Shrink))
-                    .max_height((size.height - 48.0).max(0.0)),
+                    .max_height((size.height - 54.0).max(0.0)),
             )
-            .translate(|_, _| Vector::new(6.0, 42.0)))
+            .translate(|_, _| Vector::new(6.0, 48.0)))
             .into()
         })
         .into()
@@ -273,9 +282,9 @@ impl App {
             if cut {
                 label.push('…');
             }
-            // A dot in the chat's color tells tabs apart at a glance.
+            // Reuse the same lazy portrait as the chat list, including initials.
             let mut content = row![
-                text("●").size(10).color(super::look::person_color(chat_id)),
+                self.avatar(Peer::Chat(chat_id), &title, 18.0),
                 text(label).size(13)
             ]
             .spacing(6)
@@ -763,9 +772,6 @@ impl App {
             self.view_bubble(window, pane, &pane.messages[i], prev)
         });
 
-        // A loading label has a fixed row height so its contribution to
-        // scroll content and the popup anchor is identical.
-        const LOADING_ROW_HEIGHT: f32 = 16.0;
         // A plain column: its diff checks widget types. iced's keyed column
         // hands child state to a different widget type when several rows
         // change at once (panicked with "Downcast on stateless state").
@@ -790,11 +796,15 @@ impl App {
                     .height(LOADING_ROW_HEIGHT),
             );
         }
-        let history = scrollable(history)
-            .id(pane.scroll_id.clone())
-            .anchor_bottom()
-            .on_scroll(move |v| on_pane(PaneMsg::Scrolled(v)))
-            .height(Fill);
+        let history = scrollable(super::selectable::Gesture::history(
+            history,
+            window,
+            pane.rectangle.as_ref().map(|r| (r.anchor, r.focus)),
+        ))
+        .id(pane.scroll_id.clone())
+        .anchor_bottom()
+        .on_scroll(move |v| on_pane(PaneMsg::Scrolled(v)))
+        .height(Fill);
 
         // The popup is a sibling of the scrollable, not part of its measured
         // rows. Both children remain in place on toggle, preserving scroll
@@ -852,6 +862,10 @@ impl App {
             if bubble_bottom <= 0.0 || bubble_top >= size.height {
                 return space().into();
             }
+            let selected_menu = pane
+                .selected
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&m.id));
             let x = if m.outgoing {
                 (size.width - 260.0).max(0.0)
             } else if self.shows_sender(m) {
@@ -859,12 +873,13 @@ impl App {
             } else {
                 10.0
             };
-            let menu = container(
-                scrollable(view_menu(window, m, menu, pane.pinned_locally(m.id)))
-                    .height(Length::Shrink)
-                    .width(250),
-            )
-            .max_height(size.height);
+            let actions = if selected_menu {
+                view_selected_menu(window, pane)
+            } else {
+                view_menu(window, m, menu, pane.pinned_locally(m.id))
+            };
+            let menu = container(scrollable(actions).height(Length::Shrink).width(250))
+                .max_height(size.height);
             pin(float(menu).translate(move |bounds, _viewport| {
                 let h = bounds.height;
                 let y = if bubble_bottom + h <= size.height {
@@ -1045,7 +1060,11 @@ impl App {
             .align_x(iced::Alignment::End);
         let highlighted = pane.highlight == Some(m.id);
         let selecting = pane.selected.is_some();
-        let selected = pane.selected.as_ref().is_some_and(|s| s.contains(&m.id));
+        let selected = pane.selected.as_ref().is_some_and(|s| s.contains(&m.id))
+            || pane
+                .rectangle
+                .as_ref()
+                .is_some_and(|r| r.hits.contains(&m.id));
         let own = m.outgoing;
         let bubble = mouse_area(container(body).padding(8).max_width(520).style(
             move |theme: &iced::Theme| {
@@ -1084,6 +1103,13 @@ impl App {
         } else {
             bubble
         };
+        let bubble = super::selectable::Gesture::bubble(
+            bubble,
+            window,
+            m.id,
+            !m.pending && !m.deleted,
+            pane.rectangle.as_ref().map(|r| (r.anchor, r.focus)),
+        );
         let stack: Element<'a, Msg> = if group_incoming {
             let side: Element<'a, Msg> = if run_start {
                 let peer = match &m.sender {
@@ -1420,56 +1446,20 @@ impl App {
         .into()
     }
 
-    fn view_selection_bar(&self, window: WinId, pane: &ChatPane, count: usize) -> Element<'_, Msg> {
-        let on_pane = move |msg| Msg::Pane(window, msg);
-        let mut bar = row![text(format!("Выбрано: {count}")).size(16).width(Fill)]
-            .spacing(6)
-            .align_y(iced::Center);
-        match pane.delete_selection {
-            None => {
-                bar = bar
-                    .push(
-                        button("Копировать")
-                            .style(button::secondary)
-                            .on_press(on_pane(PaneMsg::CopySelection)),
-                    )
-                    .push(
-                        button("Переслать")
-                            .style(button::secondary)
-                            .on_press(on_pane(PaneMsg::ForwardSelection)),
-                    )
-                    .push(
-                        button("Удалить")
-                            .style(button::secondary)
-                            .on_press(on_pane(PaneMsg::DeleteSelection)),
-                    );
-            }
-            Some(None) => bar = bar.push(text("…")),
-            Some(Some(rights)) => {
-                if !rights.delete_for_self && !rights.delete_for_all {
-                    bar = bar.push(text("эти сообщения удалить нельзя").size(13));
-                }
-                if rights.delete_for_self {
-                    bar = bar.push(
-                        button("Удалить у меня")
-                            .style(button::secondary)
-                            .on_press(on_pane(PaneMsg::DeleteSelected { revoke: false })),
-                    );
-                }
-                if rights.delete_for_all {
-                    bar = bar.push(
-                        button("Удалить у всех")
-                            .style(button::danger)
-                            .on_press(on_pane(PaneMsg::DeleteSelected { revoke: true })),
-                    );
-                }
-            }
-        }
-        bar.push(
+    fn view_selection_bar(
+        &self,
+        window: WinId,
+        _pane: &ChatPane,
+        count: usize,
+    ) -> Element<'_, Msg> {
+        row![
+            text(format!("Выбрано: {count}")).size(16).width(Fill),
             button("Отмена")
                 .style(button::secondary)
-                .on_press(on_pane(PaneMsg::ClearSelection)),
-        )
+                .on_press(Msg::Pane(window, PaneMsg::ClearSelection)),
+        ]
+        .spacing(6)
+        .align_y(iced::Center)
         .into()
     }
 
@@ -1917,6 +1907,7 @@ impl App {
     ) -> Element<'a, Msg> {
         let file_id = media.file_id();
         let file = self.session.files.get(&file_id);
+        let epoch = self.photo_epoch(window);
         match media {
             Media::Photo {
                 mini,
@@ -1960,15 +1951,18 @@ impl App {
                             .height(h),
                     );
                 }
-                // Loaded on sight; a click opens the full photo in the system viewer.
+                // Key changes and tree removal do not trigger iced's on_hide;
+                // the owner is also reconciled against the rendered range.
+                let owner = PhotoOwner::Message(m.chat_id, m.id, PhotoKind::Photo);
                 sensor(
                     mouse_area(layers)
                         .interaction(iced::mouse::Interaction::Pointer)
                         .on_press(Msg::ViewPhoto(window, file_id)),
                 )
+                .key((m.chat_id, m.id, file_id, epoch))
                 .anticipate(400)
-                .on_show(move |_| Msg::Pane(window, PaneMsg::MediaVisible(file_id)))
-                .on_hide(Msg::Pane(window, PaneMsg::MediaHidden(file_id)))
+                .on_show(move |_| Msg::Pane(window, PaneMsg::MediaShown(owner, file_id, epoch)))
+                .on_hide(Msg::Pane(window, PaneMsg::MediaGone(owner, file_id, epoch)))
                 .into()
             }
             Media::Document { name, size, .. } => {
@@ -2054,13 +2048,20 @@ impl App {
                 };
                 let sensor = sensor(picture).anticipate(200);
                 match kind {
-                    Motion::Still => sensor
-                        .on_show(move |_| Msg::Pane(window, PaneMsg::MediaVisible(file_id)))
-                        .on_hide(Msg::Ignore)
-                        .into(),
+                    Motion::Still => {
+                        let owner = PhotoOwner::Message(m.chat_id, m.id, PhotoKind::Sticker);
+                        sensor
+                            .key((m.chat_id, m.id, file_id, epoch))
+                            .on_show(move |_| {
+                                Msg::Pane(window, PaneMsg::MediaShown(owner, file_id, epoch))
+                            })
+                            .on_hide(Msg::Pane(window, PaneMsg::MediaGone(owner, file_id, epoch)))
+                            .into()
+                    }
                     motion => {
                         let motion = *motion;
                         sensor
+                            .key((m.chat_id, m.id, file_id))
                             .on_show(move |_| Msg::AnimShow(file_id, motion))
                             .on_hide(Msg::AnimHide(file_id))
                             .into()
@@ -2087,9 +2088,10 @@ impl App {
                 if *spoiler && !pane.revealed.contains(&m.id) {
                     return spoiler_cover(window, m.id, mini.as_ref(), w, h);
                 }
-                let frame = animated
+                let animation_frame = animated
                     .then(|| self.session.playback.frame(file_id))
-                    .flatten()
+                    .flatten();
+                let frame = animation_frame
                     .or_else(|| thumb.and_then(|t| self.session.images.peek(t)))
                     .or(mini.as_ref());
                 // Animations: the previous frame under the current one, so a
@@ -2121,6 +2123,23 @@ impl App {
                         })
                         .into(),
                 };
+                let picture: Element<'_, Msg> = if animated && animation_frame.is_none() {
+                    if let Some(t) = *thumb {
+                        let owner = PhotoOwner::Message(m.chat_id, m.id, PhotoKind::Thumbnail);
+                        sensor(picture)
+                            .key((m.chat_id, m.id, t, epoch))
+                            .anticipate(200)
+                            .on_show(move |_| {
+                                Msg::Pane(window, PaneMsg::MediaShown(owner, t, epoch))
+                            })
+                            .on_hide(Msg::Pane(window, PaneMsg::MediaGone(owner, t, epoch)))
+                            .into()
+                    } else {
+                        picture
+                    }
+                } else {
+                    picture
+                };
                 let mut label = if animated {
                     String::new()
                 } else {
@@ -2151,9 +2170,9 @@ impl App {
                     return self.view_video(video, w, h);
                 }
                 let thumb = *thumb;
-                // Click: videos play right here, GIFs open in the system player.
+                // Videos play here; a GIF click starts its inline animation.
                 let play = if animated {
-                    Msg::PlayVideo(file_id)
+                    Msg::AnimPlay(file_id)
                 } else {
                     Msg::Video(super::video::VideoMsg::Play(
                         window, m.chat_id, m.id, file_id, round,
@@ -2163,19 +2182,26 @@ impl App {
                     .interaction(iced::mouse::Interaction::Pointer)
                     .on_press(play);
                 let sensor = sensor(clickable).anticipate(200);
-                let sensor = if animated {
+                if animated {
                     sensor
+                        .key((m.chat_id, m.id, file_id, thumb))
                         .on_show(move |_| Msg::AnimShow(file_id, Motion::Video))
                         .on_hide(Msg::AnimHide(file_id))
+                        .into()
                 } else {
+                    let owner = PhotoOwner::Message(m.chat_id, m.id, PhotoKind::Thumbnail);
                     sensor
+                        .key((m.chat_id, m.id, file_id, thumb, epoch))
                         .on_show(move |_| match thumb {
-                            Some(t) => Msg::Pane(window, PaneMsg::MediaVisible(t)),
+                            Some(t) => Msg::Pane(window, PaneMsg::MediaShown(owner, t, epoch)),
                             None => Msg::Ignore,
                         })
-                        .on_hide(Msg::Ignore)
-                };
-                sensor.into()
+                        .on_hide(match thumb {
+                            Some(t) => Msg::Pane(window, PaneMsg::MediaGone(owner, t, epoch)),
+                            None => Msg::Ignore,
+                        })
+                        .into()
+                }
             }
         }
     }
@@ -2274,6 +2300,65 @@ fn spoiler_cover<'a>(
 fn mmss(secs: i32) -> String {
     let secs = secs.max(0);
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Actions for a selection are shown only on a selected bubble's right press.
+fn view_selected_menu(window: WinId, pane: &ChatPane) -> Element<'_, Msg> {
+    let action = |label, message| {
+        button(text(label).size(14))
+            .width(Fill)
+            .style(menu_button)
+            .on_press(Msg::Pane(window, message))
+    };
+    let mut items = column![];
+    match pane.delete_selection {
+        None => {
+            let ids: Vec<i64> = pane
+                .selected
+                .as_ref()
+                .map_or_else(Vec::new, |selected| selected.iter().copied().collect());
+            items = items
+                .push(action("Копировать", PaneMsg::CopySelection))
+                .push(action("Переслать", PaneMsg::Forward(ids)))
+                .push(action("Удалить", PaneMsg::DeleteSelection));
+        }
+        Some(None) => items = items.push(text("…").size(14)),
+        Some(Some(rights)) => {
+            if !rights.delete_for_self && !rights.delete_for_all {
+                items = items.push(text("эти сообщения удалить нельзя").size(13));
+            }
+            if rights.delete_for_self {
+                items = items.push(action(
+                    "Удалить у меня",
+                    PaneMsg::DeleteSelected { revoke: false },
+                ));
+            }
+            if rights.delete_for_all {
+                items = items.push(action(
+                    "Удалить у всех",
+                    PaneMsg::DeleteSelected { revoke: true },
+                ));
+            }
+        }
+    }
+    items = items.push(action("Отмена", PaneMsg::CloseMenu));
+    container(items.spacing(2))
+        .padding(4)
+        .width(250)
+        .style(|theme: &iced::Theme| {
+            let palette = theme.extended_palette();
+            let mut surface = palette.background.strong.color;
+            surface.a = 0.88;
+            container::Style {
+                background: Some(surface.into()),
+                text_color: Some(palette.background.base.text),
+                border: iced::border::rounded(7)
+                    .width(1)
+                    .color(palette.background.strongest.color),
+                ..container::Style::default()
+            }
+        })
+        .into()
 }
 
 fn view_menu<'a>(
@@ -2702,5 +2787,451 @@ mod multiline_security_tests {
             super::super::selectable::selected(content, anchor, focus),
             content
         );
+    }
+}
+
+#[cfg(test)]
+mod requested_changes_gesture_tests {
+    use super::*;
+    use iced::{Event, Point, Size, mouse};
+    use iced_runtime::user_interface::{Cache, UserInterface};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const SIZE: Size = Size::new(1000.0, 700.0);
+
+    fn conversation() -> App {
+        let mut app = super::super::tests::app();
+        let window = app.main_window;
+        app.session
+            .chats
+            .insert(1, super::super::tests::chat_item("Private chat", true));
+        app.session.panes.get_mut(&window).unwrap().switch_to(1);
+        let history = [
+            (10, "first message with enough text to reach the pointer"),
+            (11, "second message with enough text to reach the pointer"),
+            (12, "third message with enough text to reach the pointer"),
+        ]
+        .into_iter()
+        .map(|(id, text)| {
+            serde_json::from_value(super::super::tests::message(1, id, text)).unwrap()
+        })
+        .collect();
+        let _ = app.update(Msg::Pane(window, PaneMsg::HistoryLoaded(1, Ok(history))));
+        app
+    }
+
+    struct Pointer {
+        renderer: iced::Renderer,
+        cache: Cache,
+    }
+
+    impl Pointer {
+        fn new() -> Self {
+            Self {
+                renderer: super::super::sandbox::renderer(),
+                cache: Cache::default(),
+            }
+        }
+
+        fn events(&mut self, app: &App, at: Point, events: &[mouse::Event]) -> Vec<Msg> {
+            let mut output = Vec::new();
+            let mut ui = UserInterface::build(
+                app.view(app.main_window),
+                SIZE,
+                std::mem::take(&mut self.cache),
+                &mut self.renderer,
+            );
+            for event in events {
+                let _ = ui.update(
+                    &[Event::Mouse(*event)],
+                    mouse::Cursor::Available(at),
+                    &mut self.renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut output,
+                );
+            }
+            self.cache = ui.into_cache();
+            output
+        }
+
+        fn send(&mut self, app: &mut App, at: Point, event: mouse::Event) {
+            for message in self.events(app, at, std::slice::from_ref(&event)) {
+                let _ = app.update(message);
+            }
+            if matches!(event, mouse::Event::ButtonReleased(mouse::Button::Left)) {
+                // `event::listen_with` delivers this even when a widget captured release.
+                let _ = app.update(Msg::MouseReleased);
+            }
+        }
+
+        fn click(&mut self, app: &mut App, at: Point) {
+            self.send(app, at, mouse::Event::ButtonPressed(mouse::Button::Left));
+            self.send(app, at, mouse::Event::ButtonReleased(mouse::Button::Left));
+        }
+    }
+
+    // Probe laid-out bubbles with real right presses, without dispatching the
+    // probe events to App (and therefore without opening a menu).
+    fn bubbles(app: &App, pointer: &mut Pointer) -> BTreeMap<i64, (f32, f32)> {
+        bubbles_at(app, pointer, 422.0)
+    }
+
+    fn bubbles_at(app: &App, pointer: &mut Pointer, x: f32) -> BTreeMap<i64, (f32, f32)> {
+        let mut hits = BTreeMap::new();
+        for y in (100..610).step_by(2) {
+            let at = Point::new(x, y as f32);
+            for message in pointer.events(
+                app,
+                at,
+                &[mouse::Event::ButtonPressed(mouse::Button::Right)],
+            ) {
+                if let Msg::Pane(_, PaneMsg::OpenMenu(id)) = message {
+                    let range = hits.entry(id).or_insert((y as f32, y as f32));
+                    range.1 = y as f32;
+                }
+            }
+        }
+        for id in [10, 11, 12] {
+            assert!(hits.contains_key(&id), "message {id} must be visible");
+        }
+        hits
+    }
+
+    #[test]
+    fn requested_changes_two_left_clicks_reply_to_the_message_but_one_does_not() {
+        let mut app = conversation();
+        let mut pointer = Pointer::new();
+        let hit = bubbles(&app, &mut pointer);
+        let (top, bottom) = hit[&11];
+        let at = Point::new(422.0, (top + bottom) / 2.0);
+        let window = app.main_window;
+
+        pointer.click(&mut app, at);
+        assert_eq!(app.session.panes[&window].reply_to, None);
+        pointer.click(&mut app, at);
+        let pane = &app.session.panes[&window];
+        assert_eq!(
+            pane.reply_to,
+            Some(11),
+            "the composer must answer the clicked message"
+        );
+        assert!(
+            pane.menu.is_none(),
+            "a double left click does not open actions"
+        );
+    }
+
+    #[test]
+    fn requested_changes_background_rectangle_selects_only_intersected_bubbles_without_menu() {
+        let mut app = conversation();
+        let mut pointer = Pointer::new();
+        let hit = bubbles(&app, &mut pointer);
+        let window = app.main_window;
+        let before = app.session.panes[&window].visible();
+        let start = Point::new(900.0, hit[&10].0 + 2.0);
+        let end = Point::new(422.0, hit[&11].1 - 2.0);
+        assert!(
+            end.y < hit[&12].0,
+            "third bubble must stay outside the rectangle"
+        );
+
+        pointer.send(
+            &mut app,
+            start,
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+        );
+        pointer.send(&mut app, end, mouse::Event::CursorMoved { position: end });
+        pointer.send(
+            &mut app,
+            end,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        );
+        let pane = &app.session.panes[&window];
+        assert_eq!(pane.selected, Some(BTreeSet::from([10, 11])));
+        assert!(
+            pane.menu.is_none(),
+            "release highlights; it does not open actions"
+        );
+        let after = pane.visible();
+        assert_eq!((after.start, after.end), (before.start, before.end));
+        assert_eq!((after.above, after.below), (before.above, before.below));
+
+        pointer.click(&mut app, Point::new(900.0, 500.0));
+        assert!(
+            app.session.panes[&window].selected.is_none(),
+            "a left click on empty history must clear the message selection"
+        );
+    }
+
+    #[test]
+    fn requested_changes_rectangle_retracted_to_its_anchor_selects_nothing() {
+        let mut app = conversation();
+        let mut pointer = Pointer::new();
+        let hit = bubbles(&app, &mut pointer);
+        let window = app.main_window;
+        let start = Point::new(900.0, hit[&10].0 + 2.0);
+        let across = Point::new(422.0, hit[&11].1 - 2.0);
+        let back = Point::new(start.x - 1.0, start.y + 1.0);
+
+        pointer.send(
+            &mut app,
+            start,
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+        );
+        pointer.send(
+            &mut app,
+            across,
+            mouse::Event::CursorMoved { position: across },
+        );
+        pointer.send(&mut app, back, mouse::Event::CursorMoved { position: back });
+        pointer.send(
+            &mut app,
+            back,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        );
+        let pane = &app.session.panes[&window];
+        assert_eq!(
+            pane.selected, None,
+            "moving the rectangle back inside the click threshold must not commit stale hits"
+        );
+        assert!(pane.menu.is_none());
+    }
+
+    #[test]
+    fn requested_changes_right_click_on_selected_message_forwards_the_whole_selection() {
+        let mut app = conversation();
+        let mut pointer = Pointer::new();
+        let hit = bubbles(&app, &mut pointer);
+        let window = app.main_window;
+        // Selection is the precondition of this test; the rectangle gesture
+        // is exercised separately, so a menu failure stays independent of it.
+        for id in [10, 11] {
+            let _ = app.update(Msg::Pane(window, PaneMsg::Select(id)));
+        }
+        assert_eq!(
+            app.session.panes[&window].selected,
+            Some(BTreeSet::from([10, 11]))
+        );
+        assert!(app.session.panes[&window].menu.is_none());
+
+        let (top, bottom) = hit[&11];
+        pointer.send(
+            &mut app,
+            Point::new(422.0, (top + bottom) / 2.0),
+            mouse::Event::ButtonPressed(mouse::Button::Right),
+        );
+        assert!(
+            app.session.panes[&window].menu.is_some(),
+            "only right click opens actions for the selection"
+        );
+
+        // The floating actions live outside the scrollable (ADR 004). Find
+        // its actual button by pointer events, not a fixed menu row offset.
+        let action = (100..610).step_by(3).find_map(|y| {
+            pointer
+                .events(
+                    &app,
+                    Point::new(422.0, y as f32),
+                    &[
+                        mouse::Event::ButtonPressed(mouse::Button::Left),
+                        mouse::Event::ButtonReleased(mouse::Button::Left),
+                    ],
+                )
+                .into_iter()
+                .find(|event| matches!(event, Msg::Pane(_, PaneMsg::Forward(_))))
+        });
+        let action = action.expect("the floating menu exposes a clickable forward action");
+        let _ = app.update(action);
+        assert_eq!(
+            app.session.panes[&window]
+                .forward
+                .as_ref()
+                .map(|(ids, _)| ids.as_slice()),
+            Some([10, 11].as_slice()),
+            "forwarding from the selected bubble's menu must address both messages"
+        );
+    }
+
+    #[test]
+    fn requested_changes_second_press_can_turn_into_text_drag_without_replying() {
+        let mut app = conversation();
+        let mut pointer = Pointer::new();
+        let hit = bubbles(&app, &mut pointer);
+        let window = app.main_window;
+        let (top, bottom) = hit[&11];
+        let y = (top + bottom) / 2.0;
+        let from = Point::new(394.0, y);
+        let to = Point::new(572.0, y);
+
+        pointer.click(&mut app, from);
+        assert_eq!(app.session.panes[&window].reply_to, None);
+        pointer.send(
+            &mut app,
+            from,
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+        );
+        assert_eq!(
+            app.session.panes[&window].reply_to, None,
+            "the second press is not a completed double click"
+        );
+        pointer.send(&mut app, to, mouse::Event::CursorMoved { position: to });
+        pointer.send(
+            &mut app,
+            to,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        );
+        let pane = &app.session.panes[&window];
+        assert_eq!(
+            pane.reply_to, None,
+            "dragging after the second press cancels the double-click reply"
+        );
+        assert!(
+            pane.selected_text().is_some(),
+            "the drag still selects text"
+        );
+        assert!(
+            pane.selected.is_none(),
+            "a text drag does not select bubbles"
+        );
+    }
+
+    #[test]
+    fn requested_changes_dragging_message_text_remains_text_selection() {
+        let mut app = conversation();
+        let mut pointer = Pointer::new();
+        let hit = bubbles(&app, &mut pointer);
+        let window = app.main_window;
+        let (top, bottom) = hit[&11];
+        let y = (top + bottom) / 2.0;
+        let from = Point::new(394.0, y);
+        let to = Point::new(572.0, y);
+
+        pointer.send(
+            &mut app,
+            from,
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+        );
+        assert_eq!(
+            app.session.panes[&window]
+                .text_selection
+                .as_ref()
+                .map(|s| s.message),
+            Some(11),
+            "text press starts text selection, not rectangle selection"
+        );
+        pointer.send(&mut app, to, mouse::Event::CursorMoved { position: to });
+        pointer.send(
+            &mut app,
+            to,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        );
+        let pane = &app.session.panes[&window];
+        assert!(
+            pane.selected_text().is_some(),
+            "dragging across the text selects actual characters"
+        );
+        assert!(
+            pane.selected.is_none(),
+            "text drag must not select message bubbles"
+        );
+    }
+    /// Optional visual proof using the real group fixture and the same iced
+    /// pointer driver as the behavior tests. Explicit run only: writes PNGs.
+    #[test]
+    #[ignore = "writes target/sandbox gesture screenshots; run explicitly"]
+    fn sandbox_requested_changes_group_gestures() {
+        let make_group = || {
+            let mut app = super::super::sandbox::world();
+            super::super::sandbox::open_with(
+                &mut app,
+                1,
+                vec![
+                    super::super::sandbox::msg(
+                        1,
+                        10,
+                        7,
+                        0,
+                        "First group message, available for rectangle selection",
+                    ),
+                    super::super::sandbox::msg(
+                        1,
+                        11,
+                        8,
+                        0,
+                        "Second group message, available for rectangle selection",
+                    ),
+                    super::super::sandbox::msg(
+                        1,
+                        12,
+                        9,
+                        0,
+                        "Third group message remains outside the rectangle",
+                    ),
+                ],
+            );
+            app
+        };
+        let snapshot = |name: &str, app: &mut App| {
+            let window = app.main_window;
+            let pixels = super::super::sandbox::run_frames(
+                app,
+                window,
+                SIZE,
+                4,
+                &mut super::super::sandbox::renderer(),
+            );
+            let path = super::super::sandbox::save(name, SIZE, pixels);
+            println!("{}", path.display());
+        };
+        let mut app = make_group();
+        let mut pointer = Pointer::new();
+        let hits = bubbles_at(&app, &mut pointer, 492.0);
+        let start = Point::new(900.0, hits[&10].0 + 2.0);
+        let across = Point::new(492.0, hits[&11].1 - 2.0);
+        pointer.send(
+            &mut app,
+            start,
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+        );
+        pointer.send(
+            &mut app,
+            across,
+            mouse::Event::CursorMoved { position: across },
+        );
+        assert!(app.session.panes[&app.main_window].rectangle.is_some());
+        snapshot("gesture-group-rectangle-drag", &mut app);
+
+        pointer.send(
+            &mut app,
+            across,
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        );
+        assert_eq!(
+            app.session.panes[&app.main_window].selected,
+            Some(BTreeSet::from([10, 11]))
+        );
+        let hits = bubbles_at(&app, &mut pointer, 492.0);
+        let (top, bottom) = hits[&11];
+        pointer.send(
+            &mut app,
+            Point::new(492.0, (top + bottom) / 2.0),
+            mouse::Event::ButtonPressed(mouse::Button::Right),
+        );
+        assert!(app.session.panes[&app.main_window].menu.is_some());
+        snapshot("gesture-group-selected-menu", &mut app);
+        pointer.click(&mut app, Point::new(900.0, 500.0));
+        assert!(app.session.panes[&app.main_window].selected.is_none());
+        assert!(app.session.panes[&app.main_window].menu.is_none());
+        snapshot("gesture-group-background-deselected", &mut app);
+
+        let mut app = make_group();
+        let mut pointer = Pointer::new();
+        let hits = bubbles_at(&app, &mut pointer, 492.0);
+        let (top, bottom) = hits[&11];
+        let at = Point::new(492.0, (top + bottom) / 2.0);
+        pointer.click(&mut app, at);
+        pointer.click(&mut app, at);
+        assert_eq!(app.session.panes[&app.main_window].reply_to, Some(11));
+        snapshot("gesture-group-double-reply", &mut app);
     }
 }
